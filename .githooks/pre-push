@@ -3,12 +3,12 @@
 
 set -e
 
-echo "Running cargo fmt --check..."
+echo "→ cargo fmt --check..."
 cargo fmt --all -- --check
 echo "  ✓ Formatting OK"
 
-echo "Running cargo test..."
-cargo test --quiet 2>&1 | tail -5
+echo "→ cargo test..."
+cargo test 2>&1 | grep -E "test result|running"
 echo "  ✓ Tests passed"
 
 echo "All checks passed, pushing..."
