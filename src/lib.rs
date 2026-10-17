@@ -4,7 +4,7 @@ use nih_plug_iced::IcedState;
 use std::sync::Arc;
 
 mod editor;
-mod dsp;
+pub mod dsp;
 
 pub const MAX_BANDS: usize = 24;
 const PEAK_METER_DECAY_MS: f64 = 150.0;

@@ -7,13 +7,10 @@ description = "A surgical parametric EQ plugin"
 
 [workspace]
 resolver = "2"
-members = [
-    ".",
-    "xtask",
-]
+members = [".", "xtask"]
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
@@ -22,6 +19,8 @@ atomic_float = "0.1"
 
 [dev-dependencies]
 approx = "0.5"
+proptest = "1.4"
+rustfft = "6.2"
 
 [profile.release]
 lto = "thin"
