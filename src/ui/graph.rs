@@ -1,5 +1,8 @@
-//! EQ curve graph — canvas widget drawing grid, response curve, and band handles.
+//! EQ curve graph — canvas widget drawing grid, response curve, and band
+//! handles. The handles are interactive: grab to move frequency/gain,
+//! scroll over a node to change Q (hold Alt for fine steps).
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use nih_plug::prelude::*;
@@ -7,11 +10,11 @@ use nih_plug_iced::backend::widget::canvas::{
     self, Canvas as IcedCanvas, Cursor, Fill, Frame, Geometry, Path, Program, Stroke,
     Text as CanvasText,
 };
-use nih_plug_iced::{Color, Length, Point, Rectangle};
+use nih_plug_iced::{keyboard, mouse, Color, Length, Point, Rectangle};
 
 use crate::dsp::curve::{
-    band_response_db, db_to_y, freq_to_x, BandSpec, DB_MAX, FREQ_MAX, FREQ_MIN, GRID_DBS,
-    GRID_FREQS,
+    band_response_db, db_to_y, freq_to_x, nearest_grabbable_node, px_to_freq, scroll_q_step,
+    y_to_db, BandSpec, DB_MAX, FREQ_MAX, FREQ_MIN, GRID_DBS, GRID_FREQS,
 };
 use crate::dsp::spectrum::{SpectrumFrame, BINS};
 use crate::{editor, FilterParams, FilterType, MAX_BANDS};
@@ -50,16 +53,68 @@ fn to_px(bounds: Rectangle, freq: f32, db: f32) -> Point {
     }
 }
 
+/// Node positions in canvas-local pixel coordinates `(band_index, x, y)`
+/// for all enabled, active bands.
+fn node_positions(
+    params: &FilterParams,
+    num_active: usize,
+    bounds: Rectangle,
+) -> Vec<(usize, f32, f32)> {
+    (0..num_active)
+        .filter(|&i| params.band_params[i].enable.value())
+        .map(|i| {
+            let p = to_px(
+                bounds,
+                params.band_params[i].freq.value(),
+                params.band_params[i].gain.value(),
+            );
+            (i, p.x, p.y)
+        })
+        .collect()
+}
+
+/// Drag state for the interactive node handles. Only the band index is
+/// stored — the params are reached through the stable `Arc<FilterParams>`.
+#[derive(Debug, Clone, Copy)]
+struct DragState {
+    band: usize,
+}
+
 struct GraphProgram {
     params: Arc<FilterParams>,
+    context: Arc<dyn GuiContext>,
     _peak_meter: Arc<AtomicF32>,
     spectrum_ring: Arc<crate::dsp::spectrum::SpectrumRing>,
     /// Visually-smoothed spectrum bars, shared lock-free (GUI thread writes,
     /// same thread reads; atomic to satisfy Send+Sync on the Arc).
     smoothed: Vec<AtomicF32>,
+    /// Active node drag, if any. GUI-thread only; `Cell` because `GraphView`
+    /// (and thus `&self` program methods) is rebuilt every frame.
+    drag: Cell<Option<DragState>>,
+    /// Node currently under the cursor, for hover highlighting.
+    hover: Cell<Option<usize>>,
+    /// Alt held — fine (4x) scroll steps for Q.
+    fine_scroll: Cell<bool>,
 }
 
 impl GraphProgram {
+    /// Write a plain value to a float param as a complete automation gesture.
+    /// Per-move gestures keep the DAW's undo stack sane and match how single
+    /// clicks on the built-in sliders behave.
+    fn set_plain(&self, param: &FloatParam, plain: f32) {
+        let setter = ParamSetter::new(self.context.as_ref());
+        setter.set_parameter(param, plain);
+    }
+
+    /// Set a band's Q from a normalized value, as a complete gesture.
+    fn set_q_normalized(&self, band: usize, normalized: f32) {
+        let param = &self.params.band_params[band].q;
+        let setter = ParamSetter::new(self.context.as_ref());
+        setter.begin_set_parameter(param);
+        setter.set_parameter_normalized(param, normalized);
+        setter.end_set_parameter(param);
+    }
+
     fn draw_grid(&self, frame: &mut Frame, bounds: Rectangle) {
         let grid = Color::from_rgba(1.0, 1.0, 1.0, 0.06);
         let label = Color::from_rgba(1.0, 1.0, 1.0, 0.25);
@@ -272,7 +327,13 @@ impl GraphProgram {
         }
     }
 
-    fn draw_nodes(&self, frame: &mut Frame, bounds: Rectangle) {
+    fn draw_nodes(
+        &self,
+        frame: &mut Frame,
+        bounds: Rectangle,
+        hover: Option<usize>,
+        dragging: Option<usize>,
+    ) {
         let num_active = self.params.num_bands.value() as usize;
         for i in 0..num_active {
             let bp = &self.params.band_params[i];
@@ -282,25 +343,55 @@ impl GraphProgram {
             let color = editor::band_color(i);
             let center = to_px(bounds, bp.freq.value(), bp.gain.value());
 
+            let is_hover = hover == Some(i);
+            let is_drag = dragging == Some(i);
+            let ring_alpha = if is_drag {
+                0.6
+            } else if is_hover {
+                0.45
+            } else {
+                0.25
+            };
+            let inner_radius = if is_drag { 4.5 } else { 3.5 };
+
             // Outer ring
             frame.fill(
                 &Path::circle(center, 7.0),
-                Fill::from(Color { a: 0.25, ..color }),
+                Fill::from(Color {
+                    a: ring_alpha,
+                    ..color
+                }),
             );
             // Inner dot
-            frame.fill(&Path::circle(center, 3.5), Fill::from(color));
+            frame.fill(&Path::circle(center, inner_radius), Fill::from(color));
+
+            // Frequency + gain readout while dragging
+            if is_drag {
+                let label = format!("{:.0} Hz  {:+.1} dB", bp.freq.value(), bp.gain.value());
+                let text_x = (center.x + 10.0).min(bounds.x + bounds.width - 95.0);
+                frame.fill_text(CanvasText {
+                    content: label,
+                    position: Point::new(text_x, center.y - 16.0),
+                    color: Color { a: 0.9, ..color },
+                    size: 10.0,
+                    ..CanvasText::default()
+                });
+            }
         }
     }
-}
 
-impl GraphProgram {
-    fn draw(&self, bounds: Rectangle) -> Vec<Geometry> {
+    fn draw(
+        &self,
+        bounds: Rectangle,
+        hover: Option<usize>,
+        dragging: Option<usize>,
+    ) -> Vec<Geometry> {
         let mut frame = Frame::new(bounds.size());
         self.draw_grid(&mut frame, bounds);
         self.update_and_draw_spectrum(&mut frame, bounds);
         self.draw_band_curves(&mut frame, bounds);
         self.draw_curve(&mut frame, bounds);
-        self.draw_nodes(&mut frame, bounds);
+        self.draw_nodes(&mut frame, bounds, hover, dragging);
         vec![frame.into_geometry()]
     }
 }
@@ -313,15 +404,25 @@ pub struct Graph {
 impl Graph {
     pub fn new(
         params: Arc<FilterParams>,
+        context: Arc<dyn GuiContext>,
         peak_meter: Arc<AtomicF32>,
         spectrum_ring: Arc<crate::dsp::spectrum::SpectrumRing>,
     ) -> Self {
         Self {
+            // The Cell fields are GUI-thread-only interaction state, but the
+            // program is shared through an Arc inside the editor, which
+            // declares (unsafely, with justification) Send+Sync. Access stays
+            // on the GUI thread — same contract as the slider states.
+            #[allow(clippy::arc_with_non_send_sync)]
             program: Arc::new(GraphProgram {
                 params,
+                context,
                 _peak_meter: peak_meter,
                 spectrum_ring,
                 smoothed: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
+                drag: Cell::new(None),
+                hover: Cell::new(None),
+                fine_scroll: Cell::new(false),
             }),
         }
     }
@@ -330,6 +431,10 @@ impl Graph {
         // Parameters animate every frame (smoothers) and nih-plug redraws the
         // whole tree each frame, so a canvas Cache would freeze the drawing.
         // Geometry for ~160 points is cheap to rebuild — bypass the cache.
+        //
+        // GraphView is likewise rebuilt every frame; all mutable interaction
+        // state lives on the shared GraphProgram behind Cell so drags survive
+        // the rebuild.
         IcedCanvas::new(GraphView {
             program: self.program.clone(),
         })
@@ -339,34 +444,163 @@ impl Graph {
     }
 }
 
+/// Message type used by the editor.
+use crate::editor::Message;
+
 /// Wrapper implementing Program (forwarded to the shared GraphProgram).
+///
+/// Rebuilt every frame — all mutable interaction state lives on the
+/// `GraphProgram` behind interior mutability.
 struct GraphView {
     program: Arc<GraphProgram>,
+}
+
+impl GraphView {
+    fn handle_mouse_event(
+        &self,
+        event: mouse::Event,
+        bounds: Rectangle,
+        cursor: Cursor,
+    ) -> (canvas::event::Status, Option<Message>) {
+        let program = &self.program;
+
+        match event {
+            mouse::Event::ButtonPressed(mouse::Button::Left) => {
+                let Some(pos) = cursor.position_in(&bounds) else {
+                    return (canvas::event::Status::Ignored, None);
+                };
+                let num_active = program.params.num_bands.value() as usize;
+                let nodes = node_positions(&program.params, num_active, bounds);
+                match nearest_grabbable_node(pos.x, pos.y, &nodes) {
+                    Some(hit) => {
+                        program.drag.set(Some(DragState {
+                            band: hit.band_index,
+                        }));
+                        program.hover.set(Some(hit.band_index));
+                        (canvas::event::Status::Captured, None)
+                    }
+                    None => (canvas::event::Status::Ignored, None),
+                }
+            }
+
+            mouse::Event::CursorMoved { position } => {
+                // position is window-absolute; convert to canvas-local.
+                let local_x = position.x - bounds.x;
+                let local_y = position.y - bounds.y;
+
+                if let Some(state) = program.drag.get() {
+                    // Move the grabbed node: x → frequency, y → gain.
+                    let freq = px_to_freq(local_x, bounds.width);
+                    let gain_db = y_to_db((local_y / bounds.height).clamp(0.0, 1.0));
+                    let bp = &program.params.band_params[state.band];
+                    program.set_plain(&bp.freq, freq);
+                    program.set_plain(&bp.gain, gain_db);
+                    (canvas::event::Status::Captured, None)
+                } else {
+                    // Hover highlight when near a node
+                    let num_active = program.params.num_bands.value() as usize;
+                    let nodes = node_positions(&program.params, num_active, bounds);
+                    let new_hover =
+                        nearest_grabbable_node(local_x, local_y, &nodes).map(|hit| hit.band_index);
+                    if new_hover != program.hover.get() {
+                        program.hover.set(new_hover);
+                    }
+                    (canvas::event::Status::Ignored, None)
+                }
+            }
+
+            mouse::Event::ButtonReleased(mouse::Button::Left) => {
+                if program.drag.get().is_some() {
+                    program.drag.set(None);
+                    (canvas::event::Status::Captured, None)
+                } else {
+                    (canvas::event::Status::Ignored, None)
+                }
+            }
+
+            mouse::Event::WheelScrolled { delta } => {
+                let Some(pos) = cursor.position_in(&bounds) else {
+                    return (canvas::event::Status::Ignored, None);
+                };
+                let num_active = program.params.num_bands.value() as usize;
+                let nodes = node_positions(&program.params, num_active, bounds);
+                let Some(hit) = nearest_grabbable_node(pos.x, pos.y, &nodes) else {
+                    return (canvas::event::Status::Ignored, None);
+                };
+
+                let lines_y = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => y,
+                    mouse::ScrollDelta::Pixels { y, .. } => y / 40.0,
+                };
+                if lines_y == 0.0 {
+                    return (canvas::event::Status::Ignored, None);
+                }
+
+                let fine = program.fine_scroll.get();
+                let step = scroll_q_step(fine);
+                let q_param = &program.params.band_params[hit.band_index].q;
+                let q_range = q_param.range();
+                let normalized = q_range.normalize(q_param.value());
+                let new_normalized = (normalized + lines_y.signum() * step).clamp(0.0, 1.0);
+                program.set_q_normalized(hit.band_index, new_normalized);
+                (canvas::event::Status::Captured, None)
+            }
+
+            _ => (canvas::event::Status::Ignored, None),
+        }
+    }
+
+    fn handle_keyboard_event(&self, event: keyboard::Event) {
+        // Track the Alt modifier for fine scroll steps. The canvas receives
+        // raw keyboard events regardless of focus.
+        if let keyboard::Event::ModifiersChanged(modifiers) = event {
+            self.program.fine_scroll.set(modifiers.alt());
+        }
+    }
 }
 
 impl Program<Message> for GraphView {
     fn update(
         &mut self,
-        _event: canvas::Event,
-        _bounds: Rectangle,
-        _cursor: Cursor,
+        event: canvas::Event,
+        bounds: Rectangle,
+        cursor: Cursor,
     ) -> (canvas::event::Status, Option<Message>) {
-        // Node dragging lands in step 3 — drag state will live on GraphView
-        (canvas::event::Status::Ignored, None)
+        match event {
+            canvas::Event::Mouse(mouse_event) => {
+                self.handle_mouse_event(mouse_event, bounds, cursor)
+            }
+            canvas::Event::Keyboard(keyboard_event) => {
+                self.handle_keyboard_event(keyboard_event);
+                (canvas::event::Status::Ignored, None)
+            }
+        }
     }
 
     fn draw(&self, bounds: Rectangle, _cursor: Cursor) -> Vec<Geometry> {
-        self.program.draw(bounds)
+        let hover = self.program.hover.get();
+        let dragging = self.program.drag.get().map(|s| s.band);
+        self.program.draw(bounds, hover, dragging)
     }
 
     fn mouse_interaction(
         &self,
-        _bounds: Rectangle,
-        _cursor: Cursor,
+        bounds: Rectangle,
+        cursor: Cursor,
     ) -> nih_plug_iced::mouse::Interaction {
-        nih_plug_iced::mouse::Interaction::default()
+        let Some(pos) = cursor.position_in(&bounds) else {
+            return nih_plug_iced::mouse::Interaction::default();
+        };
+
+        if self.program.drag.get().is_some() {
+            return nih_plug_iced::mouse::Interaction::Grabbing;
+        }
+
+        let num_active = self.program.params.num_bands.value() as usize;
+        let nodes = node_positions(&self.program.params, num_active, bounds);
+        match nearest_grabbable_node(pos.x, pos.y, &nodes) {
+            Some(_) => nih_plug_iced::mouse::Interaction::Grab,
+            None => nih_plug_iced::mouse::Interaction::default(),
+        }
     }
 }
-
-/// Message type used by the editor — graph only emits these from step 3 on.
-use crate::editor::Message;

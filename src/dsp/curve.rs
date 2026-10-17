@@ -93,6 +93,71 @@ pub const GRID_FREQS: [f32; 13] = [
 /// Grid gains for horizontal lines (0 dB line drawn separately, emphasized).
 pub const GRID_DBS: [f32; 8] = [-24.0, -18.0, -12.0, -6.0, 6.0, 12.0, 18.0, 24.0];
 
+/// Grab radius around a band node, in pixels.
+pub const NODE_GRAB_RADIUS_PX: f32 = 14.0;
+
+/// Normalized Q change per scroll notch (2% of the Q range).
+pub const Q_SCROLL_STEP: f32 = 0.02;
+/// Normalized Q change per scroll notch with a fine modifier held (Alt).
+pub const Q_SCROLL_FINE_STEP: f32 = 0.005;
+
+/// A grabbable band node under the cursor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NodeHit {
+    pub band_index: usize,
+    pub distance_px: f32,
+}
+
+/// Find the grabbable node nearest to a cursor position, within the grab
+/// radius. Node positions are pixel coordinates `(band_index, x, y)`.
+/// Overlapping nodes resolve to the visually nearest one.
+pub fn nearest_grabbable_node(
+    cursor_x: f32,
+    cursor_y: f32,
+    nodes_px: &[(usize, f32, f32)],
+) -> Option<NodeHit> {
+    let mut best: Option<NodeHit> = None;
+    for &(band_index, nx, ny) in nodes_px {
+        let dx = cursor_x - nx;
+        let dy = cursor_y - ny;
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist > NODE_GRAB_RADIUS_PX {
+            continue;
+        }
+        let closer = match best {
+            None => true,
+            Some(b) => dist < b.distance_px,
+        };
+        if closer {
+            best = Some(NodeHit {
+                band_index,
+                distance_px: dist,
+            });
+        }
+    }
+    best
+}
+
+/// Normalized Q step per scroll notch. `fine` (Alt held) is 4x finer.
+pub fn scroll_q_step(fine: bool) -> f32 {
+    if fine {
+        Q_SCROLL_FINE_STEP
+    } else {
+        Q_SCROLL_STEP
+    }
+}
+
+/// Frequency for a pixel x position within a plot of the given width —
+/// the inverse of the `freq_to_x` mapping used for drawing.
+pub fn px_to_freq(px: f32, width_px: f32) -> f32 {
+    let x01 = if width_px > 1.0 {
+        (px / width_px).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    x_to_freq(x01)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +317,65 @@ mod tests {
             curve[idx],
             expected
         );
+    }
+
+    #[test]
+    fn nearest_node_within_radius() {
+        // Node at (100, 150), grab radius 14
+        let nodes = [(2usize, 100.0f32, 150.0f32)];
+        let hit = nearest_grabbable_node(105.0, 148.0, &nodes).unwrap();
+        assert_eq!(hit.band_index, 2);
+        assert!(hit.distance_px <= NODE_GRAB_RADIUS_PX);
+    }
+
+    #[test]
+    fn nearest_node_outside_radius_is_none() {
+        let nodes = [(0usize, 100.0f32, 150.0f32)];
+        // 15 px away diagonally? 10px horizontally + 11px vertically ≈ 14.9 < 14?
+        // Use clearly-far point:
+        assert!(nearest_grabbable_node(130.0, 190.0, &nodes).is_none());
+    }
+
+    #[test]
+    fn nearest_node_edge_exact_radius() {
+        let nodes = [(1usize, 100.0f32, 100.0f32)];
+        // Exactly 14 px right of the node center
+        let hit = nearest_grabbable_node(114.0, 100.0, &nodes).unwrap();
+        assert_eq!(hit.band_index, 1);
+        assert!((hit.distance_px - NODE_GRAB_RADIUS_PX).abs() < 1e-4);
+    }
+
+    #[test]
+    fn nearest_node_picks_closest_of_two() {
+        let nodes = [
+            (0usize, 100.0f32, 100.0f32),
+            (1usize, 106.0f32, 100.0f32), // closer to cursor
+        ];
+        let hit = nearest_grabbable_node(110.0, 100.0, &nodes).unwrap();
+        assert_eq!(hit.band_index, 1);
+        assert!(hit.distance_px < 4.1);
+    }
+
+    #[test]
+    fn px_to_freq_roundtrip() {
+        let width = 800.0f32;
+        for f in [20.0, 100.0, 440.0, 1000.0, 5000.0, 20_000.0] {
+            let px = freq_to_x(f) * width;
+            let back = px_to_freq(px, width);
+            assert!((back - f).abs() / f < 1e-4, "f={} back={}", f, back);
+        }
+    }
+
+    #[test]
+    fn px_to_freq_clamps() {
+        let width = 800.0f32;
+        assert_eq!(px_to_freq(-50.0, width), FREQ_MIN);
+        assert_eq!(px_to_freq(2000.0, width), FREQ_MAX);
+    }
+
+    #[test]
+    fn scroll_q_steps() {
+        assert!((scroll_q_step(false) - 0.02).abs() < 1e-6);
+        assert!((scroll_q_step(true) - 0.005).abs() < 1e-6);
     }
 }
