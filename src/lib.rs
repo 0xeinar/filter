@@ -16,6 +16,10 @@ pub struct Filter {
     peak_meter: Arc<AtomicF32>,
     bands: [dsp::BiquadFilter; MAX_BANDS],
     sample_rate: f32,
+    /// Shared with the GUI for the spectrum display
+    spectrum_ring: Arc<dsp::spectrum::SpectrumRing>,
+    /// Audio-thread-only FFT analyzer (None until initialize)
+    spectrum_analyzer: Option<dsp::spectrum::SpectrumAnalyzer>,
 }
 
 /// Per-band parameters
@@ -141,6 +145,8 @@ impl Default for Filter {
             peak_meter: Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             bands: core::array::from_fn(|_| dsp::BiquadFilter::new()),
             sample_rate: 44100.0,
+            spectrum_ring: Arc::new(dsp::spectrum::SpectrumRing::new()),
+            spectrum_analyzer: None,
         }
     }
 }
@@ -194,6 +200,7 @@ impl Plugin for Filter {
         editor::create(
             self.params.clone(),
             self.peak_meter.clone(),
+            self.spectrum_ring.clone(),
             self.params.editor_state.clone(),
         )
     }
@@ -211,6 +218,7 @@ impl Plugin for Filter {
         for band in &mut self.bands {
             band.update_coefficients(1000.0, 0.0, 1.0, FilterType::Bell, self.sample_rate);
         }
+        self.spectrum_analyzer = Some(dsp::spectrum::SpectrumAnalyzer::new(self.sample_rate));
         true
     }
 
@@ -221,6 +229,21 @@ impl Plugin for Filter {
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let num_active = self.params.num_bands.value() as usize;
+
+        // Spectrum analysis runs on the INPUT signal. We sum channels to mono
+        // into the analyzer's internal scratch via per-block chunked feeding.
+        // Editor-open check: skip the FFT entirely when the GUI is closed.
+        if self.params.editor_state.is_open() {
+            if let (Some(analyzer), Some(first_channel)) =
+                (self.spectrum_analyzer.as_mut(), buffer.as_slice().first())
+            {
+                // Safety: nih-plug guarantees the buffer callback runs on the
+                // audio thread with no allocator use in our code below.
+                // as_slice borrows for this block only.
+                let samples: &[f32] = first_channel;
+                analyzer.push_block(&self.spectrum_ring, samples);
+            }
+        }
 
         for channel_samples in buffer.iter_samples() {
             let mut amplitude = 0.0f32;
