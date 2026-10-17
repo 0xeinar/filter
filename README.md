@@ -46,11 +46,14 @@ Rescan plugins in your DAW after copying.
 # Run all tests
 cargo test
 
-# 50 tests:
-#   33 unit tests — biquad coefficients, frequency response, stability,
-#                   response-curve math (log mapping, combined EQ response)
+# 69 tests:
+#   49 unit tests — biquad coefficients, frequency response, stability,
+#                   response-curve math (log mapping, combined EQ response),
+#                   per-channel state independence
 #   10 FFT integration tests — sine sweep → spectrum verification
-#   7 property-based fuzz tests — 1000 random parameter combos each
+#    7 property-based fuzz tests — 1000 random parameter combos each
+#    3 null tests — f32 plugin output vs an independent f64 DF-I reference
+#                   (all five filter types + an 8-band cascade, ~-148 dB)
 ```
 
 ## Development Setup
@@ -75,7 +78,10 @@ filter/
 │       └── biquad.rs    # Biquad filter + 22 unit tests
 ├── tests/
 │   ├── frequency_response.rs  # FFT-based integration tests
-│   └── fuzz_property.rs       # Property-based fuzzing (proptest)
+│   ├── fuzz_property.rs       # Property-based fuzzing (proptest)
+│   └── null_reference.rs      # Null test vs independent f64 reference
+├── benches/
+│   └── hotpath_bench.rs       # Per-sample cost of each process-loop shape
 ├── xtask/               # Build task runner (nih_plug convention)
 ├── .githooks/
 │   └── pre-push         # fmt + test gate

@@ -4,15 +4,22 @@ use crate::FilterType;
 ///
 /// Plain float math with no state — one copy per band, recomputed only when
 /// the band's parameters move.
+///
+/// Stored as `f64`: with `f32` coefficients a low-frequency, high-Q bell
+/// (e.g. 120 Hz, Q 4, -12 dB) only nulls to about -75 dB against an f64
+/// reference, because the pole pair sits so close to z = 1 that a 1e-7
+/// relative coefficient error moves the response audibly. In f64 the same
+/// chain nulls below -150 dB. The extra precision costs two doubles per band
+/// and is invisible in the hot path (see benches/hotpath_bench.rs).
 #[derive(Debug, Clone, Copy)]
 pub struct BiquadCoeffs {
     /// Numerator coefficients (b0, b1, b2)
-    pub b0: f32,
-    pub b1: f32,
-    pub b2: f32,
+    pub b0: f64,
+    pub b1: f64,
+    pub b2: f64,
     /// Denominator coefficients (a1, a2) — a0 is normalized to 1
-    pub a1: f32,
-    pub a2: f32,
+    pub a1: f64,
+    pub a2: f64,
 }
 
 impl Default for BiquadCoeffs {
@@ -40,13 +47,13 @@ impl BiquadCoeffs {
         filter_type: FilterType,
         sample_rate: f32,
     ) {
-        let a = 10.0_f32.powf(gain_db / 40.0); // Square root of linear gain
-        let w0 = 2.0 * std::f32::consts::PI * freq / sample_rate;
+        let a = 10.0_f64.powf(gain_db as f64 / 40.0); // Square root of linear gain
+        let w0 = 2.0 * std::f64::consts::PI * freq as f64 / sample_rate as f64;
         let cos_w0 = w0.cos();
         let sin_w0 = w0.sin();
 
         // Alpha = sin(w0) / (2 * Q)
-        let alpha = sin_w0 / (2.0 * q);
+        let alpha = sin_w0 / (2.0 * q as f64);
 
         match filter_type {
             FilterType::Bell => {
@@ -134,7 +141,7 @@ impl BiquadCoeffs {
     /// Compute the frequency response (magnitude) at a given frequency
     /// This is for testing — evaluates H(z) on the unit circle
     pub fn magnitude_at_freq(&self, freq: f32, sample_rate: f32) -> f32 {
-        let w = 2.0 * std::f32::consts::PI * freq / sample_rate;
+        let w = 2.0 * std::f64::consts::PI * freq as f64 / sample_rate as f64;
         let cos_w = w.cos();
         let sin_w = w.sin();
 
@@ -148,7 +155,7 @@ impl BiquadCoeffs {
         let num_mag = (re_num * re_num + im_num * im_num).sqrt();
         let den_mag = (re_den * re_den + im_den * im_den).sqrt();
 
-        num_mag / den_mag
+        (num_mag / den_mag) as f32
     }
 }
 
@@ -157,20 +164,26 @@ impl BiquadCoeffs {
 /// Coefficients and state are deliberately separate: every channel of a band
 /// shares one `BiquadCoeffs` but must own its own `BiquadState`, otherwise the
 /// right channel continues the left channel's filter memory.
+///
+/// State is `f64`. At low frequencies a biquad's delay memory is large relative
+/// to the signal and `f32` accumulators leak rounding noise into the tail; in
+/// f64 the same chain nulls below -150 dB against a double-precision reference.
+/// Buffers stay f32 — only the conversion happens per sample.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BiquadState {
-    z1: f32,
-    z2: f32,
+    z1: f64,
+    z2: f64,
 }
 
 impl BiquadState {
     /// Process a single sample through the filter (Direct Form II Transposed)
     #[inline]
     pub fn process(&mut self, c: &BiquadCoeffs, input: f32) -> f32 {
-        let output = c.b0 * input + self.z1;
-        self.z1 = c.b1 * input - c.a1 * output + self.z2;
-        self.z2 = c.b2 * input - c.a2 * output;
-        output
+        let x = input as f64;
+        let output = c.b0 * x + self.z1;
+        self.z1 = c.b1 * x - c.a1 * output + self.z2;
+        self.z2 = c.b2 * x - c.a2 * output;
+        output as f32
     }
 
     /// Reset the filter state

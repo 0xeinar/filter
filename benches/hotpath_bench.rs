@@ -2,10 +2,12 @@
 //!
 //! Measures per-sample cost of:
 //! (a) the pre-fix shape: per-sample smoother next() + update_coefficients + process,
-//!     as the process() loop was structured (per-sample param reads)
-//! (b) coefficients-only cost (isolate the trig work)
-//! (c) the restructured shape: block-smoothed params, per-block coefficient
-//!     updates, per-sample process only
+//! (b) coefficients-only cost (isolate the trig work),
+//! (c) per-host-block coefficient baking (128 samples — the previous shape),
+//! (d) per-sub-block coefficient baking (16 samples — the current shape while
+//!     a band is being automated), and
+//! (e) the fully static case: no smoother work, no coefficient updates at all,
+//!     which is what an untouched EQ costs.
 //!
 //! Run with: cargo bench --bench hotpath_bench
 
@@ -18,7 +20,7 @@ use filter::FilterType;
 
 const SR: f32 = 48_000.0;
 const BLOCK: usize = 128;
-const CHUNK: usize = 64;
+const SUB: usize = 16;
 const BANDS: usize = 8;
 
 struct Params {
@@ -36,6 +38,10 @@ impl Params {
         let q = f32::from_bits(self.q.load(Ordering::Relaxed));
         (black_box(f), black_box(g), black_box(q))
     }
+}
+
+fn cpu(s: f64) -> f64 {
+    s * 48_000.0 * 2.0 * 100.0
 }
 
 fn main() {
@@ -85,56 +91,70 @@ fn main() {
     black_box(&b2);
     let per_update = t1.elapsed().as_secs_f64() / n1 as f64;
 
-    // (c) restructured: per-block coefficient updates + per-sample process,
-    // params block-smoothed (smoothing math folded into the block fill —
-    // approximated here by reading the params once per chunk).
-    let mut bands2: Vec<BiquadFilter> = (0..BANDS).map(|_| BiquadFilter::new()).collect();
-    let t2 = Instant::now();
-    let mut n2 = 0usize;
-    for chunk in input.chunks(BLOCK) {
-        for sub in chunk.chunks(CHUNK) {
-            let (f, g, q) = params.load();
-            for b in bands2.iter_mut().take(BANDS) {
-                b.update_coefficients(f, g, q, FilterType::Bell, SR);
-            }
-            for _s in sub {
-                let mut s = black_box(0.25f32);
-                for b in bands2.iter_mut().take(BANDS) {
-                    s = b.process(s);
+    // Shared body: bake coefficients every `every` samples, process every sample.
+    let bake_and_process = |every: usize, update: bool| -> f64 {
+        let mut chain: Vec<BiquadFilter> = (0..BANDS).map(|_| BiquadFilter::new()).collect();
+        let t = Instant::now();
+        let mut n = 0usize;
+        for chunk in input.chunks(BLOCK) {
+            for sub in chunk.chunks(every) {
+                if update {
+                    let (f, g, q) = params.load();
+                    for b in chain.iter_mut().take(BANDS) {
+                        b.update_coefficients(f, g, q, FilterType::Bell, SR);
+                    }
                 }
-                black_box(s);
-                n2 += 1;
+                for _s in sub {
+                    let mut s = black_box(0.25f32);
+                    for b in chain.iter_mut().take(BANDS) {
+                        s = b.process(s);
+                    }
+                    black_box(s);
+                    n += 1;
+                }
             }
         }
-    }
-    let per_sample_fixed = t2.elapsed().as_secs_f64() / n2 as f64;
+        t.elapsed().as_secs_f64() / n as f64
+    };
+
+    // (c) per-host-block (128) coefficient baking — previous shape.
+    let per_sample_block = bake_and_process(BLOCK, true);
+    // (d) per-sub-block (16) coefficient baking — current shape while automating.
+    let per_sample_sub = bake_and_process(SUB, true);
+    // (e) static: no coefficient updates, filter alone.
+    let per_sample_static = bake_and_process(SUB, false);
 
     println!(
         "== hot path, {} bands, {}-sample host blocks ==",
         BANDS, BLOCK
     );
     println!(
-        "(a) per-sample coeffs (pre-fix shape):  {:>7.2} ns/sample",
-        per_sample_prefix * 1e9
+        "(a) per-sample coeffs (pre-fix shape):  {:>7.2} ns/sample   {:>6.2}% CPU",
+        per_sample_prefix * 1e9,
+        cpu(per_sample_prefix)
     );
     println!(
         "(b) one update_coefficients alone:      {:>7.2} ns",
         per_update * 1e9
     );
     println!(
-        "(c) per-block coeffs (restructured):    {:>7.2} ns/sample",
-        per_sample_fixed * 1e9
+        "(c) per-block coeffs (128):             {:>7.2} ns/sample   {:>6.2}% CPU",
+        per_sample_block * 1e9,
+        cpu(per_sample_block)
     );
     println!(
-        "    -> reduction: {:.1}x",
-        per_sample_prefix / per_sample_fixed
+        "(d) per-sub-block coeffs (16, moving):  {:>7.2} ns/sample   {:>6.2}% CPU",
+        per_sample_sub * 1e9,
+        cpu(per_sample_sub)
     );
     println!(
-        "    CPU load (a) @48kHz stereo: {:.2}%",
-        per_sample_prefix * 48_000.0 * 2.0 * 100.0
+        "(e) static (nothing updating):          {:>7.2} ns/sample   {:>6.2}% CPU",
+        per_sample_static * 1e9,
+        cpu(per_sample_static)
     );
     println!(
-        "    CPU load (c) @48kHz stereo: {:.2}%",
-        per_sample_fixed * 48_000.0 * 2.0 * 100.0
+        "    -> (a) -> (d): {:.1}x   (a) -> (e): {:.1}x",
+        per_sample_prefix / per_sample_sub,
+        per_sample_prefix / per_sample_static
     );
 }

@@ -2,7 +2,9 @@
 //! handles. The handles are interactive: grab to move frequency/gain,
 //! scroll over a node to change Q (hold Alt for fine steps).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use nih_plug::prelude::*;
@@ -43,6 +45,21 @@ fn band_specs(params: &FilterParams, num_active: usize) -> [BandSpec; MAX_BANDS]
             enabled: bp.enable.value(),
         }
     })
+}
+
+/// x position (0..1) of each spectrum bin's upper edge, precomputed once.
+/// Depends only on the FFT bin → frequency mapping, which is fixed.
+fn spectrum_bin_x() -> Vec<f32> {
+    let first_bin = 1.0f32;
+    let last_bin_f = (crate::dsp::spectrum::FFT_SIZE / 2 - 1) as f32;
+    let decades = (last_bin_f / first_bin).log10();
+    (0..BINS)
+        .map(|i| {
+            let edge_bin = (first_bin * 10f32.powf(decades * (i + 1) as f32 / BINS as f32)).round();
+            let edge_hz = edge_bin * 48_000.0 / crate::dsp::spectrum::FFT_SIZE as f32;
+            freq_to_x(edge_hz.min(FREQ_MAX))
+        })
+        .collect()
 }
 
 /// Map a frequency + gain to pixel coordinates within bounds.
@@ -88,6 +105,16 @@ struct GraphProgram {
     /// Visually-smoothed spectrum bars, shared lock-free (GUI thread writes,
     /// same thread reads; atomic to satisfy Send+Sync on the Arc).
     smoothed: Vec<AtomicF32>,
+    /// Precomputed x position (0..1 across the graph) for every spectrum bin.
+    /// The bin → frequency mapping never changes, so this saves a `powf` and a
+    /// `log10` per bin per frame — 192 of them at 60 fps.
+    spec_x: Vec<f32>,
+    /// Cached geometry for the layers that only change when a parameter does
+    /// (grid, band curves, combined curve). Without this, every frame rebuilt
+    /// up to 24 × 120 `band_response_db` evaluations — each with a `powf`,
+    /// two `ln` and a `sqrt` — for a picture that was identical to the last
+    /// frame. The spectrum and nodes stay uncached by design.
+    cache: RefCell<Option<CachedLayers>>,
     /// Active node drag, if any. GUI-thread only; `Cell` because `GraphView`
     /// (and thus `&self` program methods) is rebuilt every frame.
     drag: Cell<Option<DragState>>,
@@ -95,6 +122,36 @@ struct GraphProgram {
     hover: Cell<Option<usize>>,
     /// Alt held — fine (4x) scroll steps for Q.
     fine_scroll: Cell<bool>,
+}
+
+/// Geometry that is only valid for one parameter/bounds state.
+struct CachedLayers {
+    key: u64,
+    grid: Geometry,
+    curves: Geometry,
+}
+
+impl CachedLayers {
+    /// Hash everything the cached layers are drawn from: the active bands'
+    /// plain values, plus the canvas bounds (pixel mapping depends on both
+    /// size and origin).
+    fn key_for(params: &FilterParams, bounds: Rectangle) -> u64 {
+        let mut h = DefaultHasher::new();
+        let num_active = params.num_bands.value() as usize;
+        num_active.hash(&mut h);
+        for i in 0..num_active {
+            let bp = &params.band_params[i];
+            bp.freq.value().to_bits().hash(&mut h);
+            bp.gain.value().to_bits().hash(&mut h);
+            bp.q.value().to_bits().hash(&mut h);
+            bp.filter_type.value().hash(&mut h);
+            bp.enable.value().hash(&mut h);
+        }
+        for v in [bounds.x, bounds.y, bounds.width, bounds.height] {
+            v.to_bits().hash(&mut h);
+        }
+        h.finish()
+    }
 }
 
 impl GraphProgram {
@@ -184,45 +241,30 @@ impl GraphProgram {
         const FALL: f32 = 0.08;
         let mut path_pts: Vec<Point> = Vec::with_capacity(BINS + 2);
 
-        let mut cur_vals = [0.0f32; BINS];
+        // Map: bin i → precomputed x position (log, same as curve); dB → y
+        // with -90 dB at the bottom and 0 dB at 3/4 height. Values above 0 dB
+        // clamp.
+        let db_floor = -90.0f32;
+        path_pts.push(Point::new(bounds.x, bounds.y + bounds.height));
         for (i, slot) in self.smoothed.iter().enumerate() {
             let cur = slot.load(std::sync::atomic::Ordering::Relaxed);
             let target = latest.db[i];
             let k = if target > cur { RISE } else { FALL };
             let next = cur + (target - cur) * k;
             slot.store(next, std::sync::atomic::Ordering::Relaxed);
-            cur_vals[i] = next;
-        }
 
-        // Map: band i → x position (log, same as curve); dB → y with -90 dB at
-        // the bottom and 0 dB at 3/4 height. Values above 0 dB clamp.
-        let db_floor = -90.0f32;
-        for (i, &db) in cur_vals.iter().enumerate() {
-            // Band i covers bins up to round(10^(decades*(i+1)/96)) — its upper
-            // edge frequency in the bin domain. For x placement, use the same
-            // log spacing as the EQ curve: x = i/(BINS-1) is NOT correct since
-            // bands span bin 1..511, i.e. 46.9 Hz..24 kHz at 48k. Close enough
-            // visually to use freq-of-upper-edge mapped through freq_to_x.
-            // Recompute the upper edge frequency like compute_frame does:
-            let first_bin = 1.0f32;
-            let last_bin_f = (crate::dsp::spectrum::FFT_SIZE / 2 - 1) as f32;
-            let decades = (last_bin_f / first_bin).log10();
-            let edge_bin =
-                (first_bin * 10f32.powf(decades * (i + 1) as f32 / BINS as f32)).round() as usize;
-            let edge_hz = edge_bin as f32 * 48_000.0 / crate::dsp::spectrum::FFT_SIZE as f32;
-            let x01 = freq_to_x(edge_hz.min(FREQ_MAX));
-            let y01 = ((db - db_floor) / (0.0 - db_floor)).clamp(0.0, 1.0) * 0.75;
-            let x = bounds.x + x01 * bounds.width;
+            let y01 = ((next - db_floor) / (0.0 - db_floor)).clamp(0.0, 1.0) * 0.75;
+            let x = bounds.x + self.spec_x[i] * bounds.width;
             let y = bounds.y + bounds.height * (1.0 - y01);
             path_pts.push(Point::new(x, y));
         }
 
-        // Close down to the bottom-right corner and bottom-left
+        // Close down to the bottom-right corner; the bottom-left corner is the
+        // first point.
         path_pts.push(Point::new(
             bounds.x + bounds.width,
             bounds.y + bounds.height,
         ));
-        path_pts.push(Point::new(bounds.x, bounds.y + bounds.height));
 
         let area = Path::new(|p| {
             p.move_to(path_pts[0]);
@@ -234,8 +276,8 @@ impl GraphProgram {
         frame.fill(&area, Fill::from(Color::from_rgba(0.35, 0.85, 0.6, 0.10)));
         // Faint top edge stroke
         let line = Path::new(|p| {
-            p.move_to(path_pts[0]);
-            for &pt in &path_pts[1..path_pts.len() - 2] {
+            p.move_to(path_pts[1]);
+            for &pt in &path_pts[2..path_pts.len() - 1] {
                 p.line_to(pt);
             }
         });
@@ -295,10 +337,10 @@ impl GraphProgram {
 
     fn draw_band_curves(&self, frame: &mut Frame, bounds: Rectangle) {
         let num_active = self.params.num_bands.value() as usize;
+        let specs = band_specs(&self.params, num_active);
         const POINTS: usize = 120;
 
-        for i in 0..num_active {
-            let spec = band_specs(&self.params, num_active)[i];
+        for (i, spec) in specs.iter().enumerate().take(num_active) {
             if !spec.enabled {
                 continue;
             }
@@ -310,7 +352,7 @@ impl GraphProgram {
                 for j in 0..POINTS {
                     let x01 = j as f32 / (POINTS - 1) as f32;
                     let freq = FREQ_MIN * (FREQ_MAX / FREQ_MIN).powf(x01);
-                    let db = band_response_db(&spec, freq);
+                    let db = band_response_db(spec, freq);
                     let pt = to_px(bounds, freq, db.clamp(-DB_MAX - 6.0, DB_MAX + 6.0));
                     if first {
                         p.move_to(pt);
@@ -386,13 +428,42 @@ impl GraphProgram {
         hover: Option<usize>,
         dragging: Option<usize>,
     ) -> Vec<Geometry> {
-        let mut frame = Frame::new(bounds.size());
-        self.draw_grid(&mut frame, bounds);
-        self.update_and_draw_spectrum(&mut frame, bounds);
-        self.draw_band_curves(&mut frame, bounds);
-        self.draw_curve(&mut frame, bounds);
-        self.draw_nodes(&mut frame, bounds, hover, dragging);
-        vec![frame.into_geometry()]
+        // The grid, per-band curves and the combined curve only change when a
+        // parameter (or the canvas geometry) does. nih-plug redraws the whole
+        // editor every frame with `always_redraw`, but the EQ picture is
+        // usually static — so keep those layers and rebuild them on change
+        // only. Rebuilding cost the trig-heavy `band_response_db` up to 24 ×
+        // 120 times per frame.
+        let key = CachedLayers::key_for(&self.params, bounds);
+        let mut cache = self.cache.borrow_mut();
+        if !matches!(&*cache, Some(c) if c.key == key) {
+            let mut grid_frame = Frame::new(bounds.size());
+            self.draw_grid(&mut grid_frame, bounds);
+            let mut curves_frame = Frame::new(bounds.size());
+            self.draw_band_curves(&mut curves_frame, bounds);
+            self.draw_curve(&mut curves_frame, bounds);
+            *cache = Some(CachedLayers {
+                key,
+                grid: grid_frame.into_geometry(),
+                curves: curves_frame.into_geometry(),
+            });
+        }
+
+        // The spectrum moves continuously; the nodes move while dragging.
+        let mut spectrum_frame = Frame::new(bounds.size());
+        self.update_and_draw_spectrum(&mut spectrum_frame, bounds);
+        let mut nodes_frame = Frame::new(bounds.size());
+        self.draw_nodes(&mut nodes_frame, bounds, hover, dragging);
+
+        let cached = cache
+            .as_ref()
+            .expect("cache was just populated in this same call");
+        vec![
+            cached.grid.clone(),
+            spectrum_frame.into_geometry(),
+            cached.curves.clone(),
+            nodes_frame.into_geometry(),
+        ]
     }
 }
 
@@ -420,6 +491,8 @@ impl Graph {
                 _peak_meter: peak_meter,
                 spectrum_ring,
                 smoothed: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
+                spec_x: spectrum_bin_x(),
+                cache: RefCell::new(None),
                 drag: Cell::new(None),
                 hover: Cell::new(None),
                 fine_scroll: Cell::new(false),
