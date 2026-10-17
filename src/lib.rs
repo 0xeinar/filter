@@ -41,6 +41,12 @@ const MAX_CHANNELS: usize = 2;
 /// host-driven; 128 is the standard upper bound. Larger host blocks are
 /// processed in multiple iterations by iter_blocks.
 const MAX_BLOCK: usize = 128;
+/// Coefficients are re-baked at most every `COEFF_BLOCK` samples while a band
+/// is being automated. 16 samples = 0.33 ms @48 kHz, i.e. below the ~1 ms
+/// threshold where a staircase becomes audible on a fast gain sweep. Bands
+/// that are not moving cost nothing: their smoother is not advanced and their
+/// coefficients are not recomputed.
+const COEFF_BLOCK: usize = 16;
 
 /// Per-band parameters
 #[derive(Params)]
@@ -301,141 +307,158 @@ impl Plugin for Filter {
         let mut coeffs_changed = [false; MAX_BANDS];
 
         for (_block_offset, mut block) in buffer.iter_blocks(MAX_BLOCK) {
-            let block_len = block.samples();
-            let num_channels = block.channels();
+            // Sub-block loop: coefficients are re-baked every COEFF_BLOCK
+            // samples instead of once per host block, so an automation glide is
+            // quantized at 0.33 ms rather than 2.7 ms. A static EQ pays for
+            // nothing here — see the `moving` check below.
+            for sub_offset in (0..block.samples()).step_by(COEFF_BLOCK) {
+                let block_len = (block.samples() - sub_offset).min(COEFF_BLOCK);
+                let num_channels = block.channels();
 
-            // --- 1. Advance smoothers once per block, per band ---
-            let mut any_band_active = false;
-            // Multiple parallel fixed-size arrays are indexed by band here;
-            // iterator adapters can't express that cleanly.
-            #[allow(clippy::needless_range_loop)]
-            for band_idx in 0..num_active {
-                let bp = &self.params.band_params[band_idx];
-                let enabled = bp.enable.value();
-                let ftype = FilterType::from_i32(bp.filter_type.value());
+                // --- 1. Advance smoothers once per sub-block, per band ---
+                let mut any_band_active = false;
+                // Multiple parallel fixed-size arrays are indexed by band here;
+                // iterator adapters can't express that cleanly.
+                #[allow(clippy::needless_range_loop)]
+                for band_idx in 0..num_active {
+                    let bp = &self.params.band_params[band_idx];
+                    let enabled = bp.enable.value();
+                    let ftype = FilterType::from_i32(bp.filter_type.value());
 
-                // Rising edge: the smoother idled while the band was off, so
-                // snap it to the current value instead of gliding in from a
-                // stale one.
-                if enabled && !self.band_enabled[band_idx] {
-                    bp.freq.smoothed.reset(bp.freq.value());
-                    bp.gain.smoothed.reset(bp.gain.value());
-                    bp.q.smoothed.reset(bp.q.value());
-                }
-
-                self.band_types[band_idx] = ftype;
-                self.band_enabled[band_idx] = enabled;
-
-                if enabled {
-                    any_band_active = true;
-                    bp.freq
-                        .smoothed
-                        .next_block(&mut freq_block[..block_len], block_len);
-                    bp.gain
-                        .smoothed
-                        .next_block(&mut gain_block[..block_len], block_len);
-                    bp.q.smoothed
-                        .next_block(&mut q_block[..block_len], block_len);
-
-                    // Detect real movement: smoother reached its target AND the
-                    // target itself hasn't changed since we last baked it.
-                    let freq_stable = !bp.freq.smoothed.is_smoothing()
-                        && self.last_baked_freq[band_idx] == bp.freq.value();
-                    let gain_stable = !bp.gain.smoothed.is_smoothing()
-                        && self.last_baked_gain[band_idx] == bp.gain.value();
-                    let q_stable = !bp.q.smoothed.is_smoothing()
-                        && self.last_baked_q[band_idx] == bp.q.value();
-
-                    coeffs_changed[band_idx] = !(freq_stable && gain_stable && q_stable)
-                        || self.last_baked_type[band_idx] != ftype;
-                } else {
-                    coeffs_changed[band_idx] = false;
-                }
-            }
-
-            // --- 2. Recompute coefficients where needed (per block, per
-            // band — shared by all channels). Baked from the block-smoothed
-            // values so parameter glides stay sample-accurate in bulk.
-            #[allow(clippy::needless_range_loop)]
-            for band_idx in 0..num_active {
-                if !self.band_enabled[band_idx] || !coeffs_changed[band_idx] {
-                    continue;
-                }
-                let baked_freq = freq_block[block_len - 1];
-                let baked_gain = gain_block[block_len - 1];
-                let baked_q = q_block[block_len - 1];
-                self.band_coeffs[band_idx].update(
-                    baked_freq,
-                    baked_gain,
-                    baked_q,
-                    self.band_types[band_idx],
-                    self.sample_rate,
-                );
-                self.last_baked_freq[band_idx] = baked_freq;
-                self.last_baked_gain[band_idx] = baked_gain;
-                self.last_baked_q[band_idx] = baked_q;
-                self.last_baked_type[band_idx] = self.band_types[band_idx];
-            }
-
-            // --- 3. Process every channel with the SAME coefficients ---
-            // Each channel owns its own filter state (z1/z2); sharing one
-            // state between L and R made the right channel continue the left
-            // channel's filter memory. The block-smoothed parameter values
-            // interpolate over the block: sample-accurate glide without
-            // per-sample coefficient math.
-            for channel_idx in 0..num_channels {
-                let Some(channel_samples) = block.get_mut(channel_idx) else {
-                    continue;
-                };
-                // Defensive: host layouts beyond MAX_CHANNELS would panic on
-                // the state indexing below. The plugin declares mono/stereo
-                // only, so this should never trigger — but an audio-thread
-                // panic is far worse than a skipped channel.
-                if channel_idx >= MAX_CHANNELS {
-                    continue;
-                }
-                let is_primary = channel_idx == 0;
-                let states = &mut self.band_states[channel_idx];
-
-                let meter_open = is_primary && self.params.editor_state.is_open();
-                for sample in channel_samples.iter_mut() {
-                    let mut s = *sample;
-
-                    if any_band_active {
-                        // Zip gives bounds-check-free iteration over the
-                        // active band prefix; the enable flags ride along so
-                        // disabled bands are skipped without re-indexing.
-                        for ((state, coeffs), enabled) in states
-                            .iter_mut()
-                            .zip(self.band_coeffs.iter())
-                            .zip(self.band_enabled.iter())
-                            .take(num_active)
-                        {
-                            if !*enabled {
-                                continue;
-                            }
-                            s = state.process(coeffs, s);
-                        }
+                    // Rising edge: the smoother idled while the band was off, so
+                    // snap it to the current value instead of gliding in from a
+                    // stale one.
+                    if enabled && !self.band_enabled[band_idx] {
+                        bp.freq.smoothed.reset(bp.freq.value());
+                        bp.gain.smoothed.reset(bp.gain.value());
+                        bp.q.smoothed.reset(bp.q.value());
                     }
 
-                    *sample = s;
+                    self.band_types[band_idx] = ftype;
+                    self.band_enabled[band_idx] = enabled;
 
-                    // Peak meter: updated per sample (same decay rate as
-                    // before) from the first channel. The old code averaged
-                    // |L| and |R| per frame; |L| alone is within a hair for a
-                    // peak-hold meter and keeps the hot path single-channel.
-                    if meter_open {
-                        let amplitude = s.abs();
-                        let current_peak =
-                            self.peak_meter.load(std::sync::atomic::Ordering::Relaxed);
-                        let new_peak = if amplitude > current_peak {
-                            amplitude
-                        } else {
-                            current_peak * self.peak_meter_decay_weight
-                                + amplitude * (1.0 - self.peak_meter_decay_weight)
-                        };
-                        self.peak_meter
-                            .store(new_peak, std::sync::atomic::Ordering::Relaxed);
+                    if enabled {
+                        any_band_active = true;
+                        // A band only needs work when a smoother is still
+                        // gliding or the target/type moved since the last bake.
+                        // Static bands skip both the smoother fill and the trig.
+                        let moving = bp.freq.smoothed.is_smoothing()
+                            || bp.gain.smoothed.is_smoothing()
+                            || bp.q.smoothed.is_smoothing()
+                            || self.last_baked_freq[band_idx] != bp.freq.value()
+                            || self.last_baked_gain[band_idx] != bp.gain.value()
+                            || self.last_baked_q[band_idx] != bp.q.value()
+                            || self.last_baked_type[band_idx] != ftype;
+
+                        if !moving {
+                            coeffs_changed[band_idx] = false;
+                            continue;
+                        }
+
+                        bp.freq
+                            .smoothed
+                            .next_block(&mut freq_block[..block_len], block_len);
+                        bp.gain
+                            .smoothed
+                            .next_block(&mut gain_block[..block_len], block_len);
+                        bp.q.smoothed
+                            .next_block(&mut q_block[..block_len], block_len);
+                        coeffs_changed[band_idx] = true;
+                    } else {
+                        coeffs_changed[band_idx] = false;
+                    }
+                }
+
+                // --- 2. Recompute coefficients where needed (per sub-block,
+                // per band — shared by all channels). Baked from the
+                // block-smoothed values so parameter glides stay sample-accurate
+                // in bulk.
+                #[allow(clippy::needless_range_loop)]
+                for band_idx in 0..num_active {
+                    if !self.band_enabled[band_idx] || !coeffs_changed[band_idx] {
+                        continue;
+                    }
+                    let baked_freq = freq_block[block_len - 1];
+                    let baked_gain = gain_block[block_len - 1];
+                    let baked_q = q_block[block_len - 1];
+                    self.band_coeffs[band_idx].update(
+                        baked_freq,
+                        baked_gain,
+                        baked_q,
+                        self.band_types[band_idx],
+                        self.sample_rate,
+                    );
+                    self.last_baked_freq[band_idx] = baked_freq;
+                    self.last_baked_gain[band_idx] = baked_gain;
+                    self.last_baked_q[band_idx] = baked_q;
+                    self.last_baked_type[band_idx] = self.band_types[band_idx];
+                }
+
+                // --- 3. Process every channel with the SAME coefficients ---
+                // Each channel owns its own filter state (z1/z2); sharing one
+                // state between L and R made the right channel continue the left
+                // channel's filter memory. The sub-block-smoothed parameter
+                // values interpolate over the samples: sample-accurate glide
+                // without per-sample coefficient math.
+                for channel_idx in 0..num_channels {
+                    let Some(full_channel) = block.get_mut(channel_idx) else {
+                        continue;
+                    };
+                    // Defensive: host layouts beyond MAX_CHANNELS would panic on
+                    // the state indexing below. The plugin declares mono/stereo
+                    // only, so this should never trigger — but an audio-thread
+                    // panic is far worse than a skipped channel.
+                    if channel_idx >= MAX_CHANNELS {
+                        continue;
+                    }
+                    let Some(channel_samples) =
+                        full_channel.get_mut(sub_offset..sub_offset + block_len)
+                    else {
+                        continue;
+                    };
+                    let is_primary = channel_idx == 0;
+                    let states = &mut self.band_states[channel_idx];
+
+                    let meter_open = is_primary && self.params.editor_state.is_open();
+                    for sample in channel_samples.iter_mut() {
+                        let mut s = *sample;
+
+                        if any_band_active {
+                            // Zip gives bounds-check-free iteration over the
+                            // active band prefix; the enable flags ride along so
+                            // disabled bands are skipped without re-indexing.
+                            for ((state, coeffs), enabled) in states
+                                .iter_mut()
+                                .zip(self.band_coeffs.iter())
+                                .zip(self.band_enabled.iter())
+                                .take(num_active)
+                            {
+                                if !*enabled {
+                                    continue;
+                                }
+                                s = state.process(coeffs, s);
+                            }
+                        }
+
+                        *sample = s;
+
+                        // Peak meter: updated per sample (same decay rate as
+                        // before) from the first channel. The old code averaged
+                        // |L| and |R| per frame; |L| alone is within a hair for a
+                        // peak-hold meter and keeps the hot path single-channel.
+                        if meter_open {
+                            let amplitude = s.abs();
+                            let current_peak =
+                                self.peak_meter.load(std::sync::atomic::Ordering::Relaxed);
+                            let new_peak = if amplitude > current_peak {
+                                amplitude
+                            } else {
+                                current_peak * self.peak_meter_decay_weight
+                                    + amplitude * (1.0 - self.peak_meter_decay_weight)
+                            };
+                            self.peak_meter
+                                .store(new_peak, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             }
