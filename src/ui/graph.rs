@@ -13,6 +13,7 @@ use crate::dsp::curve::{
     band_response_db, db_to_y, freq_to_x, BandSpec, DB_MAX, FREQ_MAX, FREQ_MIN, GRID_DBS,
     GRID_FREQS,
 };
+use crate::dsp::spectrum::{SpectrumFrame, BINS};
 use crate::{editor, FilterParams, FilterType, MAX_BANDS};
 
 /// Height of the graph area in points.
@@ -52,6 +53,10 @@ fn to_px(bounds: Rectangle, freq: f32, db: f32) -> Point {
 struct GraphProgram {
     params: Arc<FilterParams>,
     _peak_meter: Arc<AtomicF32>,
+    spectrum_ring: Arc<crate::dsp::spectrum::SpectrumRing>,
+    /// Visually-smoothed spectrum bars, shared lock-free (GUI thread writes,
+    /// same thread reads; atomic to satisfy Send+Sync on the Arc).
+    smoothed: Vec<AtomicF32>,
 }
 
 impl GraphProgram {
@@ -110,6 +115,80 @@ impl GraphProgram {
                 Point::new(bounds.x + bounds.width, y0),
             ),
             Fill::from(Color::from_rgba(1.0, 1.0, 1.0, 0.14)),
+        );
+    }
+
+    /// Update the smoothed spectrum from the ring and draw it as a filled
+    /// area along the bottom of the graph. dB range: -90..0 mapped to
+    /// graph height fraction 0..0.75 (0 dB at 3/4 height, linear in dB).
+    fn update_and_draw_spectrum(&self, frame: &mut Frame, bounds: Rectangle) {
+        let latest: SpectrumFrame = self.spectrum_ring.read_newest();
+
+        // Rise fast, fall slow (classic analyzer ballistics)
+        const RISE: f32 = 0.55;
+        const FALL: f32 = 0.08;
+        let mut path_pts: Vec<Point> = Vec::with_capacity(BINS + 2);
+
+        let mut cur_vals = [0.0f32; BINS];
+        for (i, slot) in self.smoothed.iter().enumerate() {
+            let cur = slot.load(std::sync::atomic::Ordering::Relaxed);
+            let target = latest.db[i];
+            let k = if target > cur { RISE } else { FALL };
+            let next = cur + (target - cur) * k;
+            slot.store(next, std::sync::atomic::Ordering::Relaxed);
+            cur_vals[i] = next;
+        }
+
+        // Map: band i → x position (log, same as curve); dB → y with -90 dB at
+        // the bottom and 0 dB at 3/4 height. Values above 0 dB clamp.
+        let db_floor = -90.0f32;
+        for (i, &db) in cur_vals.iter().enumerate() {
+            // Band i covers bins up to round(10^(decades*(i+1)/96)) — its upper
+            // edge frequency in the bin domain. For x placement, use the same
+            // log spacing as the EQ curve: x = i/(BINS-1) is NOT correct since
+            // bands span bin 1..511, i.e. 46.9 Hz..24 kHz at 48k. Close enough
+            // visually to use freq-of-upper-edge mapped through freq_to_x.
+            // Recompute the upper edge frequency like compute_frame does:
+            let first_bin = 1.0f32;
+            let last_bin_f = (crate::dsp::spectrum::FFT_SIZE / 2 - 1) as f32;
+            let decades = (last_bin_f / first_bin).log10();
+            let edge_bin =
+                (first_bin * 10f32.powf(decades * (i + 1) as f32 / BINS as f32)).round() as usize;
+            let edge_hz = edge_bin as f32 * 48_000.0 / crate::dsp::spectrum::FFT_SIZE as f32;
+            let x01 = freq_to_x(edge_hz.min(FREQ_MAX));
+            let y01 = ((db - db_floor) / (0.0 - db_floor)).clamp(0.0, 1.0) * 0.75;
+            let x = bounds.x + x01 * bounds.width;
+            let y = bounds.y + bounds.height * (1.0 - y01);
+            path_pts.push(Point::new(x, y));
+        }
+
+        // Close down to the bottom-right corner and bottom-left
+        path_pts.push(Point::new(
+            bounds.x + bounds.width,
+            bounds.y + bounds.height,
+        ));
+        path_pts.push(Point::new(bounds.x, bounds.y + bounds.height));
+
+        let area = Path::new(|p| {
+            p.move_to(path_pts[0]);
+            for &pt in &path_pts[1..] {
+                p.line_to(pt);
+            }
+            p.close();
+        });
+        frame.fill(&area, Fill::from(Color::from_rgba(0.35, 0.85, 0.6, 0.10)));
+        // Faint top edge stroke
+        let line = Path::new(|p| {
+            p.move_to(path_pts[0]);
+            for &pt in &path_pts[1..path_pts.len() - 2] {
+                p.line_to(pt);
+            }
+        });
+        frame.stroke(
+            &line,
+            Stroke::default()
+                .with_color(Color::from_rgba(0.35, 0.85, 0.6, 0.25))
+                .with_width(1.0),
         );
     }
 
@@ -218,6 +297,7 @@ impl GraphProgram {
     fn draw(&self, bounds: Rectangle) -> Vec<Geometry> {
         let mut frame = Frame::new(bounds.size());
         self.draw_grid(&mut frame, bounds);
+        self.update_and_draw_spectrum(&mut frame, bounds);
         self.draw_band_curves(&mut frame, bounds);
         self.draw_curve(&mut frame, bounds);
         self.draw_nodes(&mut frame, bounds);
@@ -231,11 +311,17 @@ pub struct Graph {
 }
 
 impl Graph {
-    pub fn new(params: Arc<FilterParams>, peak_meter: Arc<AtomicF32>) -> Self {
+    pub fn new(
+        params: Arc<FilterParams>,
+        peak_meter: Arc<AtomicF32>,
+        spectrum_ring: Arc<crate::dsp::spectrum::SpectrumRing>,
+    ) -> Self {
         Self {
             program: Arc::new(GraphProgram {
                 params,
                 _peak_meter: peak_meter,
+                spectrum_ring,
+                smoothed: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
             }),
         }
     }

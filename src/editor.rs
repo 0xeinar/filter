@@ -4,6 +4,7 @@ use nih_plug_iced::widgets as nih_widgets;
 use nih_plug_iced::*;
 use std::sync::Arc;
 
+use crate::dsp::spectrum::SpectrumRing;
 use crate::ui;
 use crate::FilterParams;
 use crate::FilterType;
@@ -18,9 +19,10 @@ pub fn default_state() -> Arc<IcedState> {
 pub fn create(
     params: Arc<FilterParams>,
     peak_meter: Arc<AtomicF32>,
+    spectrum_ring: Arc<SpectrumRing>,
     editor_state: Arc<IcedState>,
 ) -> Option<Box<dyn Editor>> {
-    create_iced_editor::<FilterEditor>(editor_state, (params, peak_meter))
+    create_iced_editor::<FilterEditor>(editor_state, (params, peak_meter, spectrum_ring))
 }
 
 mod colors {
@@ -105,13 +107,13 @@ pub enum Message {
 impl IcedEditor for FilterEditor {
     type Executor = executor::Default;
     type Message = Message;
-    type InitializationFlags = (Arc<FilterParams>, Arc<AtomicF32>);
+    type InitializationFlags = (Arc<FilterParams>, Arc<AtomicF32>, Arc<SpectrumRing>);
 
     fn new(
-        (params, peak_meter): Self::InitializationFlags,
+        (params, peak_meter, spectrum_ring): Self::InitializationFlags,
         context: Arc<dyn GuiContext>,
     ) -> (Self, Command<Self::Message>) {
-        let graph = ui::Graph::new(params.clone(), peak_meter.clone());
+        let graph = ui::Graph::new(params.clone(), peak_meter.clone(), spectrum_ring);
         let editor = FilterEditor {
             params,
             context,

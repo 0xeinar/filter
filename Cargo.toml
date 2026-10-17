@@ -16,11 +16,11 @@ crate-type = ["cdylib", "rlib"]
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
 nih_plug_iced = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["opengl_canvas"] }
 atomic_float = "0.1"
+rustfft = "6.2"
 
 [dev-dependencies]
 approx = "0.5"
 proptest = "1.4"
-rustfft = "6.2"
 
 [profile.release]
 lto = "thin"
