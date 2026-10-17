@@ -18,6 +18,10 @@ nih_plug_iced = { git = "https://github.com/robbert-vdh/nih-plug.git", features 
 atomic_float = "0.1"
 rustfft = "6.2"
 
+[[bench]]
+name = "hotpath_bench"
+harness = false
+
 [dev-dependencies]
 approx = "0.5"
 proptest = "1.4"

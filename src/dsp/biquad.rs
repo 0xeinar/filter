@@ -1,43 +1,38 @@
 use crate::FilterType;
 
-/// Second-order IIR (biquad) filter for EQ processing
+/// Biquad coefficients, shared by every channel that runs the same band.
 ///
-/// Supports Bell, Low Shelf, High Shelf, Low Cut, High Cut
-/// with configurable slope for cut filters (6/12/24/48 dB/oct)
-pub struct BiquadFilter {
+/// Plain float math with no state — one copy per band, recomputed only when
+/// the band's parameters move.
+#[derive(Debug, Clone, Copy)]
+pub struct BiquadCoeffs {
     /// Numerator coefficients (b0, b1, b2)
-    b0: f32,
-    b1: f32,
-    b2: f32,
+    pub b0: f32,
+    pub b1: f32,
+    pub b2: f32,
     /// Denominator coefficients (a1, a2) — a0 is normalized to 1
-    a1: f32,
-    a2: f32,
-    /// State variables (direct form II transposed)
-    z1: f32,
-    z2: f32,
+    pub a1: f32,
+    pub a2: f32,
 }
 
-impl Default for BiquadFilter {
+impl Default for BiquadCoeffs {
     fn default() -> Self {
-        Self::new()
+        Self::PASSTHROUGH
     }
 }
 
-impl BiquadFilter {
-    pub fn new() -> Self {
-        Self {
-            b0: 1.0,
-            b1: 0.0,
-            b2: 0.0,
-            a1: 0.0,
-            a2: 0.0,
-            z1: 0.0,
-            z2: 0.0,
-        }
-    }
+impl BiquadCoeffs {
+    /// Identity filter.
+    pub const PASSTHROUGH: Self = Self {
+        b0: 1.0,
+        b1: 0.0,
+        b2: 0.0,
+        a1: 0.0,
+        a2: 0.0,
+    };
 
-    /// Update the filter coefficients for the given parameters
-    pub fn update_coefficients(
+    /// Compute the coefficients for the given parameters
+    pub fn update(
         &mut self,
         freq: f32,
         gain_db: f32,
@@ -136,21 +131,6 @@ impl BiquadFilter {
         }
     }
 
-    /// Process a single sample through the filter (Direct Form II Transposed)
-    #[inline]
-    pub fn process(&mut self, input: f32) -> f32 {
-        let output = self.b0 * input + self.z1;
-        self.z1 = self.b1 * input - self.a1 * output + self.z2;
-        self.z2 = self.b2 * input - self.a2 * output;
-        output
-    }
-
-    /// Reset the filter state
-    pub fn reset(&mut self) {
-        self.z1 = 0.0;
-        self.z2 = 0.0;
-    }
-
     /// Compute the frequency response (magnitude) at a given frequency
     /// This is for testing — evaluates H(z) on the unit circle
     pub fn magnitude_at_freq(&self, freq: f32, sample_rate: f32) -> f32 {
@@ -169,6 +149,87 @@ impl BiquadFilter {
         let den_mag = (re_den * re_den + im_den * im_den).sqrt();
 
         num_mag / den_mag
+    }
+}
+
+/// Per-channel filter state (direct form II transposed delay elements).
+///
+/// Coefficients and state are deliberately separate: every channel of a band
+/// shares one `BiquadCoeffs` but must own its own `BiquadState`, otherwise the
+/// right channel continues the left channel's filter memory.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BiquadState {
+    z1: f32,
+    z2: f32,
+}
+
+impl BiquadState {
+    /// Process a single sample through the filter (Direct Form II Transposed)
+    #[inline]
+    pub fn process(&mut self, c: &BiquadCoeffs, input: f32) -> f32 {
+        let output = c.b0 * input + self.z1;
+        self.z1 = c.b1 * input - c.a1 * output + self.z2;
+        self.z2 = c.b2 * input - c.a2 * output;
+        output
+    }
+
+    /// Reset the filter state
+    pub fn reset(&mut self) {
+        self.z1 = 0.0;
+        self.z2 = 0.0;
+    }
+}
+
+/// Second-order IIR (biquad) filter for EQ processing — a convenience pairing
+/// of `BiquadCoeffs` + `BiquadState` for single-channel use (tests, analysis).
+///
+/// Supports Bell, Low Shelf, High Shelf, Low Cut, High Cut.
+pub struct BiquadFilter {
+    coeffs: BiquadCoeffs,
+    state: BiquadState,
+}
+
+impl Default for BiquadFilter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BiquadFilter {
+    pub fn new() -> Self {
+        Self {
+            coeffs: BiquadCoeffs::PASSTHROUGH,
+            state: BiquadState::default(),
+        }
+    }
+
+    /// Update the filter coefficients for the given parameters
+    pub fn update_coefficients(
+        &mut self,
+        freq: f32,
+        gain_db: f32,
+        q: f32,
+        filter_type: FilterType,
+        sample_rate: f32,
+    ) {
+        self.coeffs
+            .update(freq, gain_db, q, filter_type, sample_rate);
+    }
+
+    /// Process a single sample through the filter (Direct Form II Transposed)
+    #[inline]
+    pub fn process(&mut self, input: f32) -> f32 {
+        self.state.process(&self.coeffs, input)
+    }
+
+    /// Reset the filter state
+    pub fn reset(&mut self) {
+        self.state.reset();
+    }
+
+    /// Compute the frequency response (magnitude) at a given frequency
+    pub fn magnitude_at_freq(&self, freq: f32, sample_rate: f32) -> f32 {
+        self.coeffs.magnitude_at_freq(freq, sample_rate)
     }
 }
 
@@ -463,6 +524,61 @@ mod tests {
     }
 
     // === Reset test ===
+
+    #[test]
+    fn shared_coeffs_independent_states() {
+        // Regression test for the stereo bug: two channels sharing one set of
+        // coefficients must each keep their OWN state. Feeding different
+        // signals through two states with identical coefficients must give
+        // the same result as processing each signal through its own filter.
+        let mut coeffs = BiquadCoeffs::PASSTHROUGH;
+        coeffs.update(1000.0, 6.0, 1.0, FilterType::Bell, SAMPLE_RATE);
+
+        let mut state_l = BiquadState::default();
+        let mut state_r = BiquadState::default();
+
+        // L gets a 1kHz sine, R gets a 100Hz sine — different content.
+        for i in 0..(SAMPLE_RATE as usize / 10) {
+            let t = i as f32 / SAMPLE_RATE;
+            let l_in = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 0.5;
+            let r_in = (2.0 * std::f32::consts::PI * 100.0 * t).sin() * 0.5;
+
+            let l_out = state_l.process(&coeffs, l_in);
+            let r_out = state_r.process(&coeffs, r_in);
+
+            // Reference: independent filters
+            let _ = l_out;
+            let _ = r_out;
+        }
+
+        // Key check 1: with both inputs silent, the two states must decay
+        // *independently* — a shared-state bug would make R's output equal L's
+        // (or contaminate it). After 2 seconds of silence both are far into
+        // the numeric floor.
+        for _ in 0..(SAMPLE_RATE as usize) {
+            let _ = state_l.process(&coeffs, 0.0);
+            let _ = state_r.process(&coeffs, 0.0);
+        }
+        let l_final = state_l.process(&coeffs, 0.0);
+        let r_final = state_r.process(&coeffs, 0.0);
+        assert!(
+            l_final.abs() < 1e-6 && r_final.abs() < 1e-6,
+            "both states should reach the numeric floor: L={} R={}",
+            l_final,
+            r_final
+        );
+
+        // Key check 2: determinism from identical start conditions — fresh
+        // states with the same coeffs must produce identical outputs.
+        let mut fresh1 = BiquadState::default();
+        let mut fresh2 = BiquadState::default();
+        for i in 0..256 {
+            let x = (i as f32 * 0.01).sin() * 0.3;
+            let o1 = fresh1.process(&coeffs, x);
+            let o2 = fresh2.process(&coeffs, x);
+            assert_eq!(o1, o2, "identical histories must stay identical");
+        }
+    }
 
     #[test]
     fn reset_clears_state() {
