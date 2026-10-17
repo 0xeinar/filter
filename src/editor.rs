@@ -4,9 +4,12 @@ use nih_plug_iced::widgets as nih_widgets;
 use nih_plug_iced::*;
 use std::sync::Arc;
 
+use crate::ui;
 use crate::FilterParams;
 use crate::FilterType;
 use crate::MAX_BANDS;
+
+pub use colors::band_color;
 
 pub fn default_state() -> Arc<IcedState> {
     IcedState::from_size(900, 500)
@@ -70,6 +73,7 @@ struct FilterEditor {
     params: Arc<FilterParams>,
     context: Arc<dyn GuiContext>,
     peak_meter: Arc<AtomicF32>,
+    graph: ui::Graph,
     num_bands_slider_state: nih_widgets::param_slider::State,
     // Wrap in UnsafeCell to allow disjoint mutable access by index
     freq_slider_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
@@ -84,6 +88,7 @@ unsafe impl Sync for FilterEditor {}
 impl FilterEditor {
     /// Get a mutable reference to a slider state by index.
     /// Safety: Caller must ensure no two calls with the same index are active simultaneously.
+    #[allow(clippy::mut_from_ref)] // false positive: UnsafeCell::get() is the intended API
     unsafe fn slider_state(
         states: &[std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
         i: usize,
@@ -93,7 +98,7 @@ impl FilterEditor {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum Message {
+pub enum Message {
     ParamUpdate(nih_widgets::ParamMessage),
 }
 
@@ -106,10 +111,12 @@ impl IcedEditor for FilterEditor {
         (params, peak_meter): Self::InitializationFlags,
         context: Arc<dyn GuiContext>,
     ) -> (Self, Command<Self::Message>) {
+        let graph = ui::Graph::new(params.clone(), peak_meter.clone());
         let editor = FilterEditor {
             params,
             context,
             peak_meter,
+            graph,
             num_bands_slider_state: Default::default(),
             freq_slider_states: core::array::from_fn(|_| {
                 std::cell::UnsafeCell::new(Default::default())
@@ -171,7 +178,7 @@ impl IcedEditor for FilterEditor {
 
         for i in 0..num_bands {
             let band_color = colors::band_color(i);
-            let ftype = FilterType::from_i32(self.params.band_params[i].filter_type.value() as i32);
+            let ftype = FilterType::from_i32(self.params.band_params[i].filter_type.value());
 
             // Safety: Each index i is unique in this loop iteration
             let freq_slider = unsafe {
@@ -219,7 +226,8 @@ impl IcedEditor for FilterEditor {
         let content = Column::new()
             .spacing(8)
             .push(header)
-            .push(Space::with_height(12.into()))
+            .push(self.graph.view())
+            .push(Space::with_height(8.into()))
             .push(bands_col)
             .push(Space::with_height(8.into()))
             .push(

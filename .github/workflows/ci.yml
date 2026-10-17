@@ -15,7 +15,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-    
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,7 +28,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo -S -p '' apt-get update
-          sudo -S -p '' apt-get install -y libasound2-dev libgl-dev libxcb1-dev
+          sudo -S -p '' apt-get install -y libasound2-dev libgl-dev libxcb1-dev \
+            libxcursor-dev libxrandr-dev libxi-dev libxkbcommon-dev \
+            libwayland-dev libx11-dev pkg-config \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxcb-icccm4-dev libx11-xcb-dev libxcb-dri2-0-dev \
+            libxcb-util-dev
 
       - name: Check formatting
         run: cargo fmt --all -- --check
