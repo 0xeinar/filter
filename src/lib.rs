@@ -54,7 +54,7 @@ pub struct FilterParams {
 }
 
 #[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterType {
     Bell = 0,
     LowShelf = 1,
@@ -64,6 +64,15 @@ pub enum FilterType {
 }
 
 impl FilterType {
+    /// All filter types, in enum order — used by the UI pick list.
+    pub const ALL: [FilterType; 5] = [
+        Self::Bell,
+        Self::LowShelf,
+        Self::HighShelf,
+        Self::LowCut,
+        Self::HighCut,
+    ];
+
     pub fn from_i32(v: i32) -> Self {
         match v {
             0 => Self::Bell,
@@ -83,6 +92,12 @@ impl FilterType {
             Self::LowCut => "Low Cut",
             Self::HighCut => "High Cut",
         }
+    }
+}
+
+impl std::fmt::Display for FilterType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
     }
 }
 

@@ -1,5 +1,5 @@
 use atomic_float::AtomicF32;
-use nih_plug::prelude::{util, Editor, GuiContext};
+use nih_plug::prelude::{util, Editor, GuiContext, ParamSetter};
 use nih_plug_iced::widgets as nih_widgets;
 use nih_plug_iced::*;
 use std::sync::Arc;
@@ -45,6 +45,12 @@ mod colors {
         b: 0.5,
         a: 1.0,
     };
+    pub const TEXT_FAINT: Color = Color {
+        r: 0.32,
+        g: 0.32,
+        b: 0.32,
+        a: 1.0,
+    };
 
     pub fn band_color(i: usize) -> Color {
         const PALETTE: [[f32; 3]; 12] = [
@@ -81,6 +87,7 @@ struct FilterEditor {
     freq_slider_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
     gain_slider_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
     q_slider_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
+    type_pick_states: [std::cell::UnsafeCell<pick_list::State<FilterType>>; MAX_BANDS],
 }
 
 // Safety: We only ever access one index at a time, and each index is unique
@@ -97,11 +104,47 @@ impl FilterEditor {
     ) -> &mut nih_widgets::param_slider::State {
         &mut *states[i].get()
     }
+
+    /// Get a mutable reference to a pick list state by index.
+    /// Safety: Caller must ensure no two calls with the same index are active simultaneously.
+    #[allow(clippy::mut_from_ref)] // false positive: UnsafeCell::get() is the intended API
+    unsafe fn pick_state(
+        states: &[std::cell::UnsafeCell<pick_list::State<FilterType>>; MAX_BANDS],
+        i: usize,
+    ) -> &mut pick_list::State<FilterType> {
+        &mut *states[i].get()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum Message {
     ParamUpdate(nih_widgets::ParamMessage),
+    /// Band `index` changed filter type.
+    TypeChanged(usize, FilterType),
+    /// Band `index` enabled/disabled.
+    EnableChanged(usize, bool),
+}
+
+impl FilterEditor {
+    /// Set a band's filter type as a single automation gesture.
+    fn set_band_type(&mut self, index: usize, filter_type: FilterType) -> Command<Message> {
+        let param = &self.params.band_params[index].filter_type;
+        let setter = ParamSetter::new(self.context.as_ref());
+        setter.begin_set_parameter(param);
+        setter.set_parameter(param, filter_type as i32);
+        setter.end_set_parameter(param);
+        Command::none()
+    }
+
+    /// Enable/disable a band as a single automation gesture.
+    fn set_band_enable(&mut self, index: usize, enabled: bool) -> Command<Message> {
+        let param = &self.params.band_params[index].enable;
+        let setter = ParamSetter::new(self.context.as_ref());
+        setter.begin_set_parameter(param);
+        setter.set_parameter(param, enabled);
+        setter.end_set_parameter(param);
+        Command::none()
+    }
 }
 
 impl IcedEditor for FilterEditor {
@@ -134,6 +177,9 @@ impl IcedEditor for FilterEditor {
             q_slider_states: core::array::from_fn(|_| {
                 std::cell::UnsafeCell::new(Default::default())
             }),
+            type_pick_states: core::array::from_fn(|_| {
+                std::cell::UnsafeCell::new(pick_list::State::default())
+            }),
         };
         (editor, Command::none())
     }
@@ -149,6 +195,12 @@ impl IcedEditor for FilterEditor {
     ) -> Command<Self::Message> {
         match message {
             Message::ParamUpdate(message) => self.handle_param_message(message),
+            Message::TypeChanged(index, filter_type) => {
+                let _ = self.set_band_type(index, filter_type);
+            }
+            Message::EnableChanged(index, enabled) => {
+                let _ = self.set_band_enable(index, enabled);
+            }
         }
         Command::none()
     }
@@ -185,7 +237,9 @@ impl IcedEditor for FilterEditor {
 
         for i in 0..num_bands {
             let band_color = colors::band_color(i);
-            let ftype = FilterType::from_i32(self.params.band_params[i].filter_type.value());
+            let bp = &self.params.band_params[i];
+            let ftype = FilterType::from_i32(bp.filter_type.value());
+            let enabled = bp.enable.value();
 
             // Safety: Each index i is unique in this loop iteration
             let freq_slider = unsafe {
@@ -212,18 +266,45 @@ impl IcedEditor for FilterEditor {
                 .map(Message::ParamUpdate)
             };
 
+            // Safety: Each index i is unique in this loop iteration
+            let type_pick = unsafe {
+                PickList::new(
+                    Self::pick_state(&self.type_pick_states, i),
+                    &FilterType::ALL,
+                    Some(ftype),
+                    move |t| Message::TypeChanged(i, t),
+                )
+                .text_size(11)
+                .width(Length::Units(86))
+            };
+
+            let enable_toggle = Toggler::new(enabled, String::new(), move |on| {
+                Message::EnableChanged(i, on)
+            })
+            .size(14);
+
+            let text_color = if enabled {
+                colors::TEXT_DIM
+            } else {
+                colors::TEXT_FAINT
+            };
+
             let band_row = Row::new()
                 .spacing(8)
                 .align_items(Alignment::Center)
                 .push(Text::new(format!("{} ", i + 1)).size(12).color(band_color))
-                .push(
-                    Text::new(format!("{:10} ", ftype.name()))
-                        .size(11)
-                        .color(colors::TEXT_DIM),
-                )
+                .push(type_pick)
+                .push(enable_toggle)
                 .push(freq_slider)
                 .push(gain_slider)
-                .push(q_slider);
+                .push(q_slider)
+                // Dim the whole row when the band is disabled
+                .push(Column::new().width(Length::Fill))
+                .push(
+                    Text::new(if enabled { "on" } else { "off" })
+                        .size(11)
+                        .color(text_color),
+                );
 
             bands_col = bands_col.push(band_row);
         }
