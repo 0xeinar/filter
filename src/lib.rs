@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 pub mod dsp;
 mod editor;
+pub mod ui;
 
 pub const MAX_BANDS: usize = 24;
 const PEAK_METER_DECAY_MS: f64 = 150.0;
@@ -37,7 +38,7 @@ pub struct BandParams {
 }
 
 #[derive(Params)]
-struct FilterParams {
+pub struct FilterParams {
     #[persist = "editor-state"]
     editor_state: Arc<IcedState>,
 
@@ -206,7 +207,7 @@ impl Plugin for Filter {
         self.peak_meter_decay_weight = 0.25f64
             .powf((buffer_config.sample_rate as f64 * PEAK_METER_DECAY_MS / 1000.0).recip())
             as f32;
-        self.sample_rate = buffer_config.sample_rate as f32;
+        self.sample_rate = buffer_config.sample_rate;
         for band in &mut self.bands {
             band.update_coefficients(1000.0, 0.0, 1.0, FilterType::Bell, self.sample_rate);
         }
@@ -233,9 +234,8 @@ impl Plugin for Filter {
                         let freq = self.params.band_params[i].freq.smoothed.next();
                         let gain = self.params.band_params[i].gain.smoothed.next();
                         let q = self.params.band_params[i].q.smoothed.next();
-                        let ftype = FilterType::from_i32(
-                            self.params.band_params[i].filter_type.value() as i32,
-                        );
+                        let ftype =
+                            FilterType::from_i32(self.params.band_params[i].filter_type.value());
 
                         self.bands[i].update_coefficients(freq, gain, q, ftype, self.sample_rate);
                         s = self.bands[i].process(s);

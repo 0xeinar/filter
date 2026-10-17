@@ -46,8 +46,9 @@ Rescan plugins in your DAW after copying.
 # Run all tests
 cargo test
 
-# 39 tests:
-#   22 unit tests — biquad coefficients, frequency response, stability
+# 50 tests:
+#   33 unit tests — biquad coefficients, frequency response, stability,
+#                   response-curve math (log mapping, combined EQ response)
 #   10 FFT integration tests — sine sweep → spectrum verification
 #   7 property-based fuzz tests — 1000 random parameter combos each
 ```

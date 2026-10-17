@@ -17,6 +17,12 @@ pub struct BiquadFilter {
     z2: f32,
 }
 
+impl Default for BiquadFilter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BiquadFilter {
     pub fn new() -> Self {
         Self {
