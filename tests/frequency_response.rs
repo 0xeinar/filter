@@ -1,7 +1,7 @@
 /// FFT-based frequency response tests
 /// Generates sine sweeps through the filter and verifies the output spectrum
-use filter::{FilterType, dsp::BiquadFilter};
-use rustfft::{FftPlanner, num_complex::Complex};
+use filter::{dsp::BiquadFilter, FilterType};
+use rustfft::{num_complex::Complex, FftPlanner};
 
 const SAMPLE_RATE: f32 = 44100.0;
 const FFT_SIZE: usize = 8192;
@@ -21,10 +21,7 @@ fn magnitude_spectrum(signal: &[f32]) -> Vec<f32> {
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(FFT_SIZE);
 
-    let mut buffer: Vec<Complex<f32>> = signal
-        .iter()
-        .map(|&s| Complex::new(s, 0.0))
-        .collect();
+    let mut buffer: Vec<Complex<f32>> = signal.iter().map(|&s| Complex::new(s, 0.0)).collect();
     buffer.resize(FFT_SIZE, Complex::new(0.0, 0.0));
 
     fft.process(&mut buffer);
@@ -216,8 +213,16 @@ fn fft_cascade_multiple_bands() {
     let gain_1k = measure_gain_change(&input, &output, 1000.0);
     let gain_5k = measure_gain_change(&input, &output, 5000.0);
 
-    assert!(gain_1k > 4.0, "1kHz should be boosted: got {:.1}dB", gain_1k);
-    assert!(gain_5k > 4.0, "5kHz should be boosted: got {:.1}dB", gain_5k);
+    assert!(
+        gain_1k > 4.0,
+        "1kHz should be boosted: got {:.1}dB",
+        gain_1k
+    );
+    assert!(
+        gain_5k > 4.0,
+        "5kHz should be boosted: got {:.1}dB",
+        gain_5k
+    );
 }
 
 #[test]
@@ -243,7 +248,8 @@ fn fft_passthrough_preserves_spectrum() {
         assert!(
             gain_change.abs() < 0.5,
             "Passthrough at {}Hz: expected <0.5dB change, got {:.1}dB",
-            freq, gain_change
+            freq,
+            gain_change
         );
     }
 }

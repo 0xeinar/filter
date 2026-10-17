@@ -3,8 +3,8 @@ use nih_plug::prelude::*;
 use nih_plug_iced::IcedState;
 use std::sync::Arc;
 
-mod editor;
 pub mod dsp;
+mod editor;
 
 pub const MAX_BANDS: usize = 24;
 const PEAK_METER_DECAY_MS: f64 = 150.0;
@@ -100,7 +100,10 @@ impl Default for BandParams {
             gain: FloatParam::new(
                 "Gain",
                 0.0,
-                FloatRange::Linear { min: -24.0, max: 24.0 },
+                FloatRange::Linear {
+                    min: -24.0,
+                    max: 24.0,
+                },
             )
             .with_smoother(SmoothingStyle::Linear(20.0))
             .with_unit(" dB")
@@ -145,7 +148,14 @@ impl Default for FilterParams {
     fn default() -> Self {
         Self {
             editor_state: editor::default_state(),
-            num_bands: IntParam::new("Bands", 0, IntRange::Linear { min: 0, max: MAX_BANDS as i32 }),
+            num_bands: IntParam::new(
+                "Bands",
+                0,
+                IntRange::Linear {
+                    min: 0,
+                    max: MAX_BANDS as i32,
+                },
+            ),
             band_params: core::array::from_fn(|_| BandParams::default()),
         }
     }
@@ -245,7 +255,8 @@ impl Plugin for Filter {
                     current_peak * self.peak_meter_decay_weight
                         + amplitude * (1.0 - self.peak_meter_decay_weight)
                 };
-                self.peak_meter.store(new_peak, std::sync::atomic::Ordering::Relaxed);
+                self.peak_meter
+                    .store(new_peak, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -268,10 +279,8 @@ impl ClapPlugin for Filter {
 
 impl Vst3Plugin for Filter {
     const VST3_CLASS_ID: [u8; 16] = *b"FilterEQEinar01\0";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
-        Vst3SubCategory::Fx,
-        Vst3SubCategory::Eq,
-    ];
+    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
+        &[Vst3SubCategory::Fx, Vst3SubCategory::Eq];
 }
 
 nih_export_clap!(Filter);

@@ -1,6 +1,6 @@
 /// Property-based tests using proptest
 /// Fuzzes the filter with random parameters to find crashes/instabilities
-use filter::{FilterType, dsp::BiquadFilter};
+use filter::{dsp::BiquadFilter, FilterType};
 use proptest::prelude::*;
 
 const SAMPLE_RATE: f32 = 44100.0;

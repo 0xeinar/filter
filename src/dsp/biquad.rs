@@ -184,7 +184,10 @@ mod tests {
         assert!(
             (actual_db - expected_db).abs() < tolerance,
             "At {} Hz: expected {:.1} dB, got {:.1} dB (tolerance ±{:.1} dB)",
-            freq, expected_db, actual_db, tolerance
+            freq,
+            expected_db,
+            actual_db,
+            tolerance
         );
     }
 
@@ -230,8 +233,16 @@ mod tests {
         // One octave away: should be much less
         let mag_500 = filter.magnitude_at_freq(500.0, SAMPLE_RATE);
         let mag_2000 = filter.magnitude_at_freq(2000.0, SAMPLE_RATE);
-        assert!(db_from_linear(mag_500) < 2.0, "High-Q bell should be narrow: at 500Hz got {:.1} dB", db_from_linear(mag_500));
-        assert!(db_from_linear(mag_2000) < 2.0, "High-Q bell should be narrow: at 2000Hz got {:.1} dB", db_from_linear(mag_2000));
+        assert!(
+            db_from_linear(mag_500) < 2.0,
+            "High-Q bell should be narrow: at 500Hz got {:.1} dB",
+            db_from_linear(mag_500)
+        );
+        assert!(
+            db_from_linear(mag_2000) < 2.0,
+            "High-Q bell should be narrow: at 2000Hz got {:.1} dB",
+            db_from_linear(mag_2000)
+        );
     }
 
     #[test]
@@ -292,7 +303,11 @@ mod tests {
         filter.update_coefficients(1000.0, 0.0, 0.707, FilterType::LowCut, SAMPLE_RATE);
         // Well below cutoff: significant attenuation
         let mag_100 = filter.magnitude_at_freq(100.0, SAMPLE_RATE);
-        assert!(mag_100 < 0.1, "Low cut at 100Hz should be heavily attenuated, got mag={:.3}", mag_100);
+        assert!(
+            mag_100 < 0.1,
+            "Low cut at 100Hz should be heavily attenuated, got mag={:.3}",
+            mag_100
+        );
     }
 
     #[test]
@@ -311,7 +326,11 @@ mod tests {
         filter.update_coefficients(1000.0, 0.0, 0.707, FilterType::HighCut, SAMPLE_RATE);
         // Well above cutoff: significant attenuation
         let mag_10000 = filter.magnitude_at_freq(10000.0, SAMPLE_RATE);
-        assert!(mag_10000 < 0.1, "High cut at 10kHz should be heavily attenuated, got mag={:.3}", mag_10000);
+        assert!(
+            mag_10000 < 0.1,
+            "High cut at 10kHz should be heavily attenuated, got mag={:.3}",
+            mag_10000
+        );
     }
 
     #[test]
@@ -331,7 +350,11 @@ mod tests {
         // Process 10 seconds of silence — should stay at 0
         for _ in 0..(SAMPLE_RATE as usize * 10) {
             let out = filter.process(0.0);
-            assert!(out.abs() < 1e-10, "Filter should not produce output from silence: got {}", out);
+            assert!(
+                out.abs() < 1e-10,
+                "Filter should not produce output from silence: got {}",
+                out
+            );
         }
     }
 
@@ -346,7 +369,11 @@ mod tests {
             let out = filter.process(0.0);
             max_val = max_val.max(out.abs());
         }
-        assert!(max_val < 10.0, "Filter should decay after impulse, max was {:.3}", max_val);
+        assert!(
+            max_val < 10.0,
+            "Filter should decay after impulse, max was {:.3}",
+            max_val
+        );
     }
 
     #[test]
@@ -361,7 +388,11 @@ mod tests {
             let out = filter.process(input);
             max_val = max_val.max(out.abs());
         }
-        assert!(max_val < 10.0, "Filter with Q=20 should remain stable, max was {:.3}", max_val);
+        assert!(
+            max_val < 10.0,
+            "Filter with Q=20 should remain stable, max was {:.3}",
+            max_val
+        );
     }
 
     #[test]
@@ -376,8 +407,15 @@ mod tests {
             let out = filter.process(input);
             max_val = max_val.max(out.abs());
         }
-        assert!(max_val.is_finite(), "Filter near nyquist should not produce NaN/Inf");
-        assert!(max_val < 100.0, "Filter near nyquist should remain stable, max was {:.3}", max_val);
+        assert!(
+            max_val.is_finite(),
+            "Filter near nyquist should not produce NaN/Inf"
+        );
+        assert!(
+            max_val < 100.0,
+            "Filter near nyquist should remain stable, max was {:.3}",
+            max_val
+        );
     }
 
     // === Processing tests ===
@@ -410,7 +448,12 @@ mod tests {
                 output_max = output_max.max(out.abs());
             }
         }
-        assert!(output_max > input_level, "Bell boost should increase amplitude: input={}, output={}", input_level, output_max);
+        assert!(
+            output_max > input_level,
+            "Bell boost should increase amplitude: input={}, output={}",
+            input_level,
+            output_max
+        );
     }
 
     // === Reset test ===
@@ -427,7 +470,11 @@ mod tests {
         // After reset, processing silence should give silence
         for _ in 0..100 {
             let out = filter.process(0.0);
-            assert!(out.abs() < 1e-10, "After reset, silence in should give silence out: got {}", out);
+            assert!(
+                out.abs() < 1e-10,
+                "After reset, silence in should give silence out: got {}",
+                out
+            );
         }
     }
 
@@ -448,8 +495,12 @@ mod tests {
         // and ~+6dB at 5kHz (only filter2 contributes)
         // This tests that the filters can be chained
         let mag_1000 = filter1.magnitude_at_freq(1000.0, SAMPLE_RATE)
-                      * filter2.magnitude_at_freq(1000.0, SAMPLE_RATE);
+            * filter2.magnitude_at_freq(1000.0, SAMPLE_RATE);
         let total_db = db_from_linear(mag_1000);
-        assert!(total_db > 5.0, "Two bells should boost more than one at 1kHz, got {:.1} dB", total_db);
+        assert!(
+            total_db > 5.0,
+            "Two bells should boost more than one at 1kHz, got {:.1} dB",
+            total_db
+        );
     }
 }

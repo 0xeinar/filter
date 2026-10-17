@@ -22,19 +22,47 @@ pub fn create(
 
 mod colors {
     use nih_plug_iced::Color;
-    pub const BG: Color = Color { r: 0.102, g: 0.102, b: 0.118, a: 1.0 };
-    pub const TEXT: Color = Color { r: 0.8, g: 0.8, b: 0.8, a: 1.0 };
-    pub const TEXT_DIM: Color = Color { r: 0.5, g: 0.5, b: 0.5, a: 1.0 };
+    pub const BG: Color = Color {
+        r: 0.102,
+        g: 0.102,
+        b: 0.118,
+        a: 1.0,
+    };
+    pub const TEXT: Color = Color {
+        r: 0.8,
+        g: 0.8,
+        b: 0.8,
+        a: 1.0,
+    };
+    pub const TEXT_DIM: Color = Color {
+        r: 0.5,
+        g: 0.5,
+        b: 0.5,
+        a: 1.0,
+    };
 
     pub fn band_color(i: usize) -> Color {
         const PALETTE: [[f32; 3]; 12] = [
-            [0.3, 0.6, 1.0], [1.0, 0.4, 0.3], [0.3, 0.9, 0.4],
-            [1.0, 0.8, 0.2], [0.8, 0.3, 0.9], [1.0, 0.5, 0.0],
-            [0.0, 0.8, 0.8], [1.0, 0.3, 0.6], [0.5, 0.8, 0.2],
-            [0.6, 0.4, 1.0], [0.9, 0.6, 0.3], [0.4, 1.0, 0.6],
+            [0.3, 0.6, 1.0],
+            [1.0, 0.4, 0.3],
+            [0.3, 0.9, 0.4],
+            [1.0, 0.8, 0.2],
+            [0.8, 0.3, 0.9],
+            [1.0, 0.5, 0.0],
+            [0.0, 0.8, 0.8],
+            [1.0, 0.3, 0.6],
+            [0.5, 0.8, 0.2],
+            [0.6, 0.4, 1.0],
+            [0.9, 0.6, 0.3],
+            [0.4, 1.0, 0.6],
         ];
         let c = PALETTE[i % 12];
-        Color { r: c[0], g: c[1], b: c[2], a: 1.0 }
+        Color {
+            r: c[0],
+            g: c[1],
+            b: c[2],
+            a: 1.0,
+        }
     }
 }
 
@@ -83,9 +111,15 @@ impl IcedEditor for FilterEditor {
             context,
             peak_meter,
             num_bands_slider_state: Default::default(),
-            freq_slider_states: core::array::from_fn(|_| std::cell::UnsafeCell::new(Default::default())),
-            gain_slider_states: core::array::from_fn(|_| std::cell::UnsafeCell::new(Default::default())),
-            q_slider_states: core::array::from_fn(|_| std::cell::UnsafeCell::new(Default::default())),
+            freq_slider_states: core::array::from_fn(|_| {
+                std::cell::UnsafeCell::new(Default::default())
+            }),
+            gain_slider_states: core::array::from_fn(|_| {
+                std::cell::UnsafeCell::new(Default::default())
+            }),
+            q_slider_states: core::array::from_fn(|_| {
+                std::cell::UnsafeCell::new(Default::default())
+            }),
         };
         (editor, Command::none())
     }
@@ -106,7 +140,7 @@ impl IcedEditor for FilterEditor {
     }
 
     fn view(&mut self) -> Element<'_, Self::Message> {
-        use nih_plug_iced::{Column, Row, Text, Space, Alignment, Length};
+        use nih_plug_iced::{Alignment, Column, Length, Row, Space, Text};
 
         let num_bands = self.params.num_bands.value() as usize;
 
@@ -168,7 +202,11 @@ impl IcedEditor for FilterEditor {
                 .spacing(8)
                 .align_items(Alignment::Center)
                 .push(Text::new(format!("{} ", i + 1)).size(12).color(band_color))
-                .push(Text::new(format!("{:10} ", ftype.name())).size(11).color(colors::TEXT_DIM))
+                .push(
+                    Text::new(format!("{:10} ", ftype.name()))
+                        .size(11)
+                        .color(colors::TEXT_DIM),
+                )
                 .push(freq_slider)
                 .push(gain_slider)
                 .push(q_slider);
@@ -176,9 +214,7 @@ impl IcedEditor for FilterEditor {
             bands_col = bands_col.push(band_row);
         }
 
-        let peak_db = util::gain_to_db(
-            self.peak_meter.load(std::sync::atomic::Ordering::Relaxed),
-        );
+        let peak_db = util::gain_to_db(self.peak_meter.load(std::sync::atomic::Ordering::Relaxed));
 
         let content = Column::new()
             .spacing(8)
