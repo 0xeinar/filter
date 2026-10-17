@@ -14,13 +14,33 @@ pub struct Filter {
     params: Arc<FilterParams>,
     peak_meter_decay_weight: f32,
     peak_meter: Arc<AtomicF32>,
-    bands: [dsp::BiquadFilter; MAX_BANDS],
+    /// Per-band coefficients — shared by every channel running that band.
+    band_coeffs: [dsp::BiquadCoeffs; MAX_BANDS],
+    /// Per-channel filter state. Channel 0 uses `band_states[0]`,
+    /// channel 1 uses `band_states[1]`, etc.
+    band_states: [[dsp::BiquadState; MAX_BANDS]; MAX_CHANNELS],
     sample_rate: f32,
     /// Shared with the GUI for the spectrum display
     spectrum_ring: Arc<dsp::spectrum::SpectrumRing>,
     /// Audio-thread-only FFT analyzer (None until initialize)
     spectrum_analyzer: Option<dsp::spectrum::SpectrumAnalyzer>,
+    /// Audio-thread snapshots of band type/enable for the current block.
+    band_types: [FilterType; MAX_BANDS],
+    band_enabled: [bool; MAX_BANDS],
+    /// Last values baked into the current coefficients — lets process()
+    /// skip recomputation when nothing moved.
+    last_baked_freq: [f32; MAX_BANDS],
+    last_baked_gain: [f32; MAX_BANDS],
+    last_baked_q: [f32; MAX_BANDS],
+    last_baked_type: [FilterType; MAX_BANDS],
 }
+
+/// Maximum audio channels the plugin processes (stereo layout + mono).
+const MAX_CHANNELS: usize = 2;
+/// Maximum host block size we'll bake coefficients for. nih-plug buffers are
+/// host-driven; 128 is the standard upper bound. Larger host blocks are
+/// processed in multiple iterations by iter_blocks.
+const MAX_BLOCK: usize = 128;
 
 /// Per-band parameters
 #[derive(Params)]
@@ -158,10 +178,19 @@ impl Default for Filter {
             params: Arc::new(FilterParams::default()),
             peak_meter_decay_weight: 1.0,
             peak_meter: Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
-            bands: core::array::from_fn(|_| dsp::BiquadFilter::new()),
+            band_coeffs: core::array::from_fn(|_| dsp::BiquadCoeffs::PASSTHROUGH),
+            band_states: core::array::from_fn(|_| {
+                core::array::from_fn(|_| dsp::BiquadState::default())
+            }),
             sample_rate: 44100.0,
             spectrum_ring: Arc::new(dsp::spectrum::SpectrumRing::new()),
             spectrum_analyzer: None,
+            band_types: [FilterType::Bell; MAX_BANDS],
+            band_enabled: [false; MAX_BANDS],
+            last_baked_freq: [1000.0; MAX_BANDS],
+            last_baked_gain: [0.0; MAX_BANDS],
+            last_baked_q: [1.0; MAX_BANDS],
+            last_baked_type: [FilterType::Bell; MAX_BANDS],
         }
     }
 }
@@ -230,8 +259,8 @@ impl Plugin for Filter {
             .powf((buffer_config.sample_rate as f64 * PEAK_METER_DECAY_MS / 1000.0).recip())
             as f32;
         self.sample_rate = buffer_config.sample_rate;
-        for band in &mut self.bands {
-            band.update_coefficients(1000.0, 0.0, 1.0, FilterType::Bell, self.sample_rate);
+        for band in &mut self.band_coeffs {
+            band.update(1000.0, 0.0, 1.0, FilterType::Bell, self.sample_rate);
         }
         self.spectrum_analyzer = Some(dsp::spectrum::SpectrumAnalyzer::new(self.sample_rate));
         true
@@ -260,41 +289,155 @@ impl Plugin for Filter {
             }
         }
 
-        for channel_samples in buffer.iter_samples() {
-            let mut amplitude = 0.0f32;
-            let num_samples = channel_samples.len();
+        // Scratch for block-smoothed parameter values (audio-thread only).
+        // MAX here is a compile-time bound; only `block_len` entries are used.
+        let mut freq_block = [0.0f32; MAX_BLOCK];
+        let mut gain_block = [0.0f32; MAX_BLOCK];
+        let mut q_block = [0.0f32; MAX_BLOCK];
 
-            for sample in channel_samples {
-                let mut s = *sample;
+        // Per-band coefficient-change snapshot. A band's coefficients are only
+        // recomputed when its smoothed freq/gain/q actually moved (or its
+        // type/enable changed), so a static EQ costs ~zero per block.
+        let mut coeffs_changed = [false; MAX_BANDS];
 
-                for i in 0..num_active {
-                    if self.params.band_params[i].enable.value() {
-                        let freq = self.params.band_params[i].freq.smoothed.next();
-                        let gain = self.params.band_params[i].gain.smoothed.next();
-                        let q = self.params.band_params[i].q.smoothed.next();
-                        let ftype =
-                            FilterType::from_i32(self.params.band_params[i].filter_type.value());
+        for (_block_offset, mut block) in buffer.iter_blocks(MAX_BLOCK) {
+            let block_len = block.samples();
+            let num_channels = block.channels();
 
-                        self.bands[i].update_coefficients(freq, gain, q, ftype, self.sample_rate);
-                        s = self.bands[i].process(s);
-                    }
+            // --- 1. Advance smoothers once per block, per band ---
+            let mut any_band_active = false;
+            // Multiple parallel fixed-size arrays are indexed by band here;
+            // iterator adapters can't express that cleanly.
+            #[allow(clippy::needless_range_loop)]
+            for band_idx in 0..num_active {
+                let bp = &self.params.band_params[band_idx];
+                let enabled = bp.enable.value();
+                let ftype = FilterType::from_i32(bp.filter_type.value());
+
+                // Rising edge: the smoother idled while the band was off, so
+                // snap it to the current value instead of gliding in from a
+                // stale one.
+                if enabled && !self.band_enabled[band_idx] {
+                    bp.freq.smoothed.reset(bp.freq.value());
+                    bp.gain.smoothed.reset(bp.gain.value());
+                    bp.q.smoothed.reset(bp.q.value());
                 }
 
-                *sample = s;
-                amplitude += s.abs();
+                self.band_types[band_idx] = ftype;
+                self.band_enabled[band_idx] = enabled;
+
+                if enabled {
+                    any_band_active = true;
+                    bp.freq
+                        .smoothed
+                        .next_block(&mut freq_block[..block_len], block_len);
+                    bp.gain
+                        .smoothed
+                        .next_block(&mut gain_block[..block_len], block_len);
+                    bp.q.smoothed
+                        .next_block(&mut q_block[..block_len], block_len);
+
+                    // Detect real movement: smoother reached its target AND the
+                    // target itself hasn't changed since we last baked it.
+                    let freq_stable = !bp.freq.smoothed.is_smoothing()
+                        && self.last_baked_freq[band_idx] == bp.freq.value();
+                    let gain_stable = !bp.gain.smoothed.is_smoothing()
+                        && self.last_baked_gain[band_idx] == bp.gain.value();
+                    let q_stable = !bp.q.smoothed.is_smoothing()
+                        && self.last_baked_q[band_idx] == bp.q.value();
+
+                    coeffs_changed[band_idx] = !(freq_stable && gain_stable && q_stable)
+                        || self.last_baked_type[band_idx] != ftype;
+                } else {
+                    coeffs_changed[band_idx] = false;
+                }
             }
 
-            if self.params.editor_state.is_open() {
-                amplitude = (amplitude / num_samples as f32).abs();
-                let current_peak = self.peak_meter.load(std::sync::atomic::Ordering::Relaxed);
-                let new_peak = if amplitude > current_peak {
-                    amplitude
-                } else {
-                    current_peak * self.peak_meter_decay_weight
-                        + amplitude * (1.0 - self.peak_meter_decay_weight)
+            // --- 2. Recompute coefficients where needed (per block, per
+            // band — shared by all channels). Baked from the block-smoothed
+            // values so parameter glides stay sample-accurate in bulk.
+            #[allow(clippy::needless_range_loop)]
+            for band_idx in 0..num_active {
+                if !self.band_enabled[band_idx] || !coeffs_changed[band_idx] {
+                    continue;
+                }
+                let baked_freq = freq_block[block_len - 1];
+                let baked_gain = gain_block[block_len - 1];
+                let baked_q = q_block[block_len - 1];
+                self.band_coeffs[band_idx].update(
+                    baked_freq,
+                    baked_gain,
+                    baked_q,
+                    self.band_types[band_idx],
+                    self.sample_rate,
+                );
+                self.last_baked_freq[band_idx] = baked_freq;
+                self.last_baked_gain[band_idx] = baked_gain;
+                self.last_baked_q[band_idx] = baked_q;
+                self.last_baked_type[band_idx] = self.band_types[band_idx];
+            }
+
+            // --- 3. Process every channel with the SAME coefficients ---
+            // Each channel owns its own filter state (z1/z2); sharing one
+            // state between L and R made the right channel continue the left
+            // channel's filter memory. The block-smoothed parameter values
+            // interpolate over the block: sample-accurate glide without
+            // per-sample coefficient math.
+            for channel_idx in 0..num_channels {
+                let Some(channel_samples) = block.get_mut(channel_idx) else {
+                    continue;
                 };
-                self.peak_meter
-                    .store(new_peak, std::sync::atomic::Ordering::Relaxed);
+                // Defensive: host layouts beyond MAX_CHANNELS would panic on
+                // the state indexing below. The plugin declares mono/stereo
+                // only, so this should never trigger — but an audio-thread
+                // panic is far worse than a skipped channel.
+                if channel_idx >= MAX_CHANNELS {
+                    continue;
+                }
+                let is_primary = channel_idx == 0;
+                let states = &mut self.band_states[channel_idx];
+
+                let meter_open = is_primary && self.params.editor_state.is_open();
+                for sample in channel_samples.iter_mut() {
+                    let mut s = *sample;
+
+                    if any_band_active {
+                        // Zip gives bounds-check-free iteration over the
+                        // active band prefix; the enable flags ride along so
+                        // disabled bands are skipped without re-indexing.
+                        for ((state, coeffs), enabled) in states
+                            .iter_mut()
+                            .zip(self.band_coeffs.iter())
+                            .zip(self.band_enabled.iter())
+                            .take(num_active)
+                        {
+                            if !*enabled {
+                                continue;
+                            }
+                            s = state.process(coeffs, s);
+                        }
+                    }
+
+                    *sample = s;
+
+                    // Peak meter: updated per sample (same decay rate as
+                    // before) from the first channel. The old code averaged
+                    // |L| and |R| per frame; |L| alone is within a hair for a
+                    // peak-hold meter and keeps the hot path single-channel.
+                    if meter_open {
+                        let amplitude = s.abs();
+                        let current_peak =
+                            self.peak_meter.load(std::sync::atomic::Ordering::Relaxed);
+                        let new_peak = if amplitude > current_peak {
+                            amplitude
+                        } else {
+                            current_peak * self.peak_meter_decay_weight
+                                + amplitude * (1.0 - self.peak_meter_decay_weight)
+                        };
+                        self.peak_meter
+                            .store(new_peak, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
             }
         }
 
