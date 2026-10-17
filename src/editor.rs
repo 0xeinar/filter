@@ -113,7 +113,12 @@ impl IcedEditor for FilterEditor {
         (params, peak_meter, spectrum_ring): Self::InitializationFlags,
         context: Arc<dyn GuiContext>,
     ) -> (Self, Command<Self::Message>) {
-        let graph = ui::Graph::new(params.clone(), peak_meter.clone(), spectrum_ring);
+        let graph = ui::Graph::new(
+            params.clone(),
+            context.clone(),
+            peak_meter.clone(),
+            spectrum_ring,
+        );
         let editor = FilterEditor {
             params,
             context,
