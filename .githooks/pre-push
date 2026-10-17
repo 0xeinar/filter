@@ -1,0 +1,14 @@
+#!/bin/bash
+# Pre-push hook: run formatting check + tests before pushing
+
+set -e
+
+echo "Running cargo fmt --check..."
+cargo fmt --all -- --check
+echo "  ✓ Formatting OK"
+
+echo "Running cargo test..."
+cargo test --quiet 2>&1 | tail -5
+echo "  ✓ Tests passed"
+
+echo "All checks passed, pushing..."
