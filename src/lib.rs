@@ -173,7 +173,10 @@ impl Default for BandParams {
                 IntRange::Linear { min: 0, max: 4 },
             ),
 
-            enable: BoolParam::new("Enable", false),
+            // A band is audible the moment it exists. Bands are created from
+            // the graph by clicking, or by raising the band count — either way
+            // an inactive new band is just confusing.
+            enable: BoolParam::new("Enable", true),
         }
     }
 }
