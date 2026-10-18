@@ -93,6 +93,35 @@ pub const GRID_FREQS: [f32; 13] = [
 /// Grid gains for horizontal lines (0 dB line drawn separately, emphasized).
 pub const GRID_DBS: [f32; 8] = [-24.0, -18.0, -12.0, -6.0, 6.0, 12.0, 18.0, 24.0];
 
+/// Number of log-spaced points used to average the curve for auto-gain.
+pub const AUTO_GAIN_POINTS: usize = 48;
+
+/// Mean *power* gain of the current curve over the audio band, in dB,
+/// weighted uniformly in log frequency (i.e. pink noise).
+///
+/// Averaging dB values would be wrong: energy sums linearly, so +12 dB over
+/// half the octaves raises the level by about 9 dB, not 6. Measured on pink
+/// noise, the dB-average under-predicts such a shelf by ~3.8 dB — the
+/// `tests/auto_gain.rs` integration test is what caught that.
+pub fn mean_response_db(bands: &[BandSpec; MAX_BANDS], num_active: usize) -> f32 {
+    let mut total = 0.0f64;
+    for i in 0..AUTO_GAIN_POINTS {
+        // Half-step offset so the endpoints are not weighted double.
+        let t = (i as f32 + 0.5) / AUTO_GAIN_POINTS as f32;
+        let freq = FREQ_MIN * (FREQ_MAX / FREQ_MIN).powf(t);
+        let db = combined_response_db(bands, num_active, freq) as f64;
+        total += 10f64.powf(db / 10.0);
+    }
+    (10.0 * (total / AUTO_GAIN_POINTS as f64).log10()) as f32
+}
+
+/// Gain compensation in dB that keeps the overall level roughly unchanged:
+/// the negative of the curve's mean gain, clamped to ±18 dB so a pathological
+/// setting cannot slam the output.
+pub fn auto_gain_compensation_db(bands: &[BandSpec; MAX_BANDS], num_active: usize) -> f32 {
+    -mean_response_db(bands, num_active).clamp(-18.0, 18.0)
+}
+
 /// Which bands move when band `removed` is deleted from a bank of
 /// `num_active` bands: the tail shifts down one slot, as `(from, to)` pairs in
 /// ascending order. Applying them in this order is safe because each write
@@ -175,6 +204,77 @@ pub fn px_to_freq(px: f32, width_px: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::FilterType;
+
+    fn specs(bands: &[(f32, f32, f32, FilterType)]) -> [BandSpec; MAX_BANDS] {
+        core::array::from_fn(|i| match bands.get(i) {
+            Some(&(freq, gain, q, t)) => BandSpec {
+                freq,
+                gain_db: gain,
+                q,
+                filter_type: t,
+                enabled: true,
+            },
+            None => BandSpec {
+                freq: 1000.0,
+                gain_db: 0.0,
+                q: 1.0,
+                filter_type: FilterType::Bell,
+                enabled: false,
+            },
+        })
+    }
+
+    #[test]
+    fn flat_curve_needs_no_compensation() {
+        let b = specs(&[]);
+        assert_eq!(auto_gain_compensation_db(&b, 0), 0.0);
+        assert!(mean_response_db(&b, 0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn compensation_inverts_a_broad_boost() {
+        // A +12 dB low shelf over most of the band pulls the mean up; the
+        // compensation has to pull it back down by roughly the same amount.
+        let b = specs(&[(500.0, 12.0, 0.707, FilterType::LowShelf)]);
+        let mean = mean_response_db(&b, 1);
+        let comp = auto_gain_compensation_db(&b, 1);
+        assert!(mean > 3.0, "expected a clear mean boost, got {mean:.2} dB");
+        assert!(
+            (comp + mean).abs() < 1e-5,
+            "compensation {comp:.2} dB should cancel the mean {mean:.2} dB"
+        );
+    }
+
+    #[test]
+    fn wide_shelf_is_measured_by_energy_not_by_db_average() {
+        // +12 dB below 500 Hz covers ~46% of the octaves in 20 Hz..20 kHz.
+        // Energy-wise that is 0.54*1 + 0.46*15.85 = 7.9x, i.e. ~9 dB, not the
+        // 5.6 dB a dB-average would give.
+        let b = specs(&[(500.0, 12.0, 0.707, FilterType::LowShelf)]);
+        let mean = mean_response_db(&b, 1);
+        assert!(
+            (mean - 9.0).abs() < 1.5,
+            "expected ~9 dB of level change, got {mean:.2} dB"
+        );
+    }
+
+    #[test]
+    fn compensation_pushes_a_broad_cut_up() {
+        let b = specs(&[(8000.0, -9.0, 0.707, FilterType::HighShelf)]);
+        assert!(auto_gain_compensation_db(&b, 1) > 0.0);
+    }
+
+    #[test]
+    fn compensation_is_clamped() {
+        // Deep, wide cuts stacked up would otherwise ask for a huge make-up.
+        let b = specs(&[
+            (80.0, -24.0, 0.5, FilterType::LowShelf),
+            (800.0, -24.0, 0.5, FilterType::Bell),
+            (8000.0, -24.0, 0.5, FilterType::HighShelf),
+        ]);
+        let comp = auto_gain_compensation_db(&b, 3);
+        assert!((-18.0..=18.0).contains(&comp), "got {comp}");
+    }
 
     #[test]
     fn compaction_plan_shifts_the_tail_down() {

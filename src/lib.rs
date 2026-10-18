@@ -33,6 +33,17 @@ pub struct Filter {
     last_baked_gain: [f32; MAX_BANDS],
     last_baked_q: [f32; MAX_BANDS],
     last_baked_type: [FilterType; MAX_BANDS],
+    /// Smoothed bypass crossfade: 0 = processed, 1 = fully dry.
+    bypass_mix: Smoother<f32>,
+    /// Current bypass smoother target (0 or 1), so the ramp is not restarted
+    /// on every sub-block.
+    bypass_target: f32,
+    /// Current auto-gain compensation in dB (0 when auto-gain is off).
+    comp_db: f32,
+    /// A band moved since the compensation was last computed.
+    comp_dirty: bool,
+    /// Samples since the last compensation update (recompute throttle).
+    comp_samples: u32,
 }
 
 /// Maximum audio channels the plugin processes (stereo layout + mono).
@@ -47,6 +58,9 @@ const MAX_BLOCK: usize = 128;
 /// that are not moving cost nothing: their smoother is not advanced and their
 /// coefficients are not recomputed.
 const COEFF_BLOCK: usize = 16;
+
+/// How often auto-gain may recompute while a band is moving.
+const AUTO_GAIN_INTERVAL_MS: f64 = 30.0;
 
 /// Per-band parameters
 #[derive(Params)]
@@ -75,8 +89,46 @@ pub struct FilterParams {
     #[id = "num-bands"]
     pub num_bands: IntParam,
 
+    /// Post-EQ output trim. Sits after every band, before the bypass mix.
+    #[id = "output-gain"]
+    pub output_gain: FloatParam,
+
+    /// Compensate the average level change of the current EQ curve, so A/B
+    /// against bypass is a fair loudness comparison.
+    #[id = "auto-gain"]
+    pub auto_gain: BoolParam,
+
+    /// Hard bypass with a short crossfade; filter state keeps running so
+    /// un-bypassing is seamless.
+    #[id = "bypass"]
+    pub bypass: BoolParam,
+
     #[nested(array, group = "Bands")]
     pub band_params: [BandParams; MAX_BANDS],
+}
+
+/// Snapshot of the current band parameters as pure specs, for the GUI curve
+/// and for auto-gain. Bands past `num_active` come back disabled.
+pub fn band_specs(params: &FilterParams, num_active: usize) -> [dsp::curve::BandSpec; MAX_BANDS] {
+    core::array::from_fn(|i| {
+        if i >= num_active {
+            return dsp::curve::BandSpec {
+                freq: 1000.0,
+                gain_db: 0.0,
+                q: 1.0,
+                filter_type: FilterType::Bell,
+                enabled: false,
+            };
+        }
+        let bp = &params.band_params[i];
+        dsp::curve::BandSpec {
+            freq: bp.freq.value(),
+            gain_db: bp.gain.value(),
+            q: bp.q.value(),
+            filter_type: FilterType::from_i32(bp.filter_type.value()),
+            enabled: bp.enable.value(),
+        }
+    })
 }
 
 #[repr(i32)]
@@ -200,6 +252,11 @@ impl Default for Filter {
             last_baked_gain: [0.0; MAX_BANDS],
             last_baked_q: [1.0; MAX_BANDS],
             last_baked_type: [FilterType::Bell; MAX_BANDS],
+            bypass_mix: Smoother::new(SmoothingStyle::Linear(20.0)),
+            bypass_target: 0.0,
+            comp_db: 0.0,
+            comp_dirty: true,
+            comp_samples: 0,
         }
     }
 }
@@ -216,6 +273,21 @@ impl Default for FilterParams {
                     max: MAX_BANDS as i32,
                 },
             ),
+            output_gain: FloatParam::new(
+                "Output",
+                0.0,
+                FloatRange::Linear {
+                    min: -24.0,
+                    max: 24.0,
+                },
+            )
+            .with_smoother(SmoothingStyle::Linear(20.0))
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(2)),
+
+            auto_gain: BoolParam::new("Auto Gain", false),
+            bypass: BoolParam::new("Bypass", false),
+
             band_params: core::array::from_fn(|_| BandParams::default()),
         }
     }
@@ -271,6 +343,9 @@ impl Plugin for Filter {
         for band in &mut self.band_coeffs {
             band.update(1000.0, 0.0, 1.0, FilterType::Bell, self.sample_rate);
         }
+        self.bypass_mix
+            .reset(if self.params.bypass.value() { 1.0 } else { 0.0 });
+        self.comp_dirty = true;
         self.spectrum_analyzer = Some(dsp::spectrum::SpectrumAnalyzer::new(self.sample_rate));
         true
     }
@@ -303,6 +378,25 @@ impl Plugin for Filter {
         let mut freq_block = [0.0f32; MAX_BLOCK];
         let mut gain_block = [0.0f32; MAX_BLOCK];
         let mut q_block = [0.0f32; MAX_BLOCK];
+        let mut out_gain_block = [0.0f32; MAX_BLOCK];
+        let mut bypass_block = [0.0f32; MAX_BLOCK];
+
+        // Auto-gain: track the curve's mean level so A/B against bypass is
+        // fair. Recomputed at most every AUTO_GAIN_INTERVAL_MS while a band is
+        // moving — each evaluation is a few dozen magnitude calculations, far
+        // too expensive to run per sub-block.
+        if self.params.auto_gain.value() {
+            let interval =
+                (self.sample_rate as f64 * AUTO_GAIN_INTERVAL_MS / 1000.0).max(1.0) as u32;
+            if self.comp_dirty && self.comp_samples >= interval {
+                let specs = band_specs(&self.params, num_active);
+                self.comp_db = dsp::curve::auto_gain_compensation_db(&specs, num_active);
+                self.comp_dirty = false;
+                self.comp_samples = 0;
+            }
+        } else {
+            self.comp_db = 0.0;
+        }
 
         // Per-band coefficient-change snapshot. A band's coefficients are only
         // recomputed when its smoothed freq/gain/q actually moved (or its
@@ -372,6 +466,28 @@ impl Plugin for Filter {
                     }
                 }
 
+                // --- 1b. Output stage for this sub-block: one dB -> linear
+                // conversion per 16 samples (0.33 ms) keeps `powf` out of the
+                // per-sample path, and the bypass crossfade is advanced once
+                // for both channels.
+                self.params
+                    .output_gain
+                    .smoothed
+                    .next_block(&mut out_gain_block[..block_len], block_len);
+                let out_lin = util::db_to_gain(out_gain_block[block_len - 1] + self.comp_db);
+
+                // Only re-target on an actual change: `set_target` restarts the
+                // ramp, so calling it every sub-block would reset the glide.
+                let bypass_target = if self.params.bypass.value() { 1.0 } else { 0.0 };
+                if bypass_target != self.bypass_target {
+                    self.bypass_mix.set_target(self.sample_rate, bypass_target);
+                    self.bypass_target = bypass_target;
+                }
+                self.bypass_mix
+                    .next_block(&mut bypass_block[..block_len], block_len);
+
+                self.comp_samples = self.comp_samples.saturating_add(block_len as u32);
+
                 // --- 2. Recompute coefficients where needed (per sub-block,
                 // per band — shared by all channels). Baked from the
                 // block-smoothed values so parameter glides stay sample-accurate
@@ -395,6 +511,7 @@ impl Plugin for Filter {
                     self.last_baked_gain[band_idx] = baked_gain;
                     self.last_baked_q[band_idx] = baked_q;
                     self.last_baked_type[band_idx] = self.band_types[band_idx];
+                    self.comp_dirty = true;
                 }
 
                 // --- 3. Process every channel with the SAME coefficients ---
@@ -423,8 +540,11 @@ impl Plugin for Filter {
                     let states = &mut self.band_states[channel_idx];
 
                     let meter_open = is_primary && self.params.editor_state.is_open();
-                    for sample in channel_samples.iter_mut() {
-                        let mut s = *sample;
+                    for (sample_idx, sample) in channel_samples.iter_mut().enumerate() {
+                        // Keep the dry signal for the bypass crossfade, and keep
+                        // filtering while bypassed so un-bypassing is seamless.
+                        let dry = *sample;
+                        let mut s = dry;
 
                         if any_band_active {
                             // Zip gives bounds-check-free iteration over the
@@ -443,14 +563,15 @@ impl Plugin for Filter {
                             }
                         }
 
-                        *sample = s;
+                        let out = dsp::output_stage(dry, s, out_lin, bypass_block[sample_idx]);
+                        *sample = out;
 
                         // Peak meter: updated per sample (same decay rate as
                         // before) from the first channel. The old code averaged
                         // |L| and |R| per frame; |L| alone is within a hair for a
                         // peak-hold meter and keeps the hot path single-channel.
                         if meter_open {
-                            let amplitude = s.abs();
+                            let amplitude = out.abs();
                             let current_peak =
                                 self.peak_meter.load(std::sync::atomic::Ordering::Relaxed);
                             let new_peak = if amplitude > current_peak {
