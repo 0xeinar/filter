@@ -176,15 +176,21 @@ impl GraphProgram {
         let grid = Color::from_rgba(1.0, 1.0, 1.0, 0.06);
         let label = Color::from_rgba(1.0, 1.0, 1.0, 0.25);
 
+        // Grid lines are stroked, not filled: filling a zero-area `Path::line`
+        // tessellates to nothing, so the original `frame.fill` drew no lines at
+        // all — only the labels. (Found by the headless draw test: the grid
+        // layer had 12 text runs and 0 mesh vertices.)
+        let hairline = Stroke::default().with_color(grid).with_width(1.0);
+
         // Vertical frequency lines + labels
         for &f in &GRID_FREQS {
             let x = bounds.x + freq_to_x(f) * bounds.width;
-            frame.fill(
+            frame.stroke(
                 &Path::line(
                     Point::new(x, bounds.y),
                     Point::new(x, bounds.y + bounds.height),
                 ),
-                Fill::from(grid),
+                hairline,
             );
             let text = if f >= 1000.0 {
                 format!("{}k", f / 1000.0)
@@ -203,12 +209,12 @@ impl GraphProgram {
         // Horizontal dB lines + labels (0 dB drawn separately, emphasized)
         for &db in &GRID_DBS {
             let y = bounds.y + db_to_y(db) * bounds.height;
-            frame.fill(
+            frame.stroke(
                 &Path::line(
                     Point::new(bounds.x, y),
                     Point::new(bounds.x + bounds.width, y),
                 ),
-                Fill::from(grid),
+                hairline,
             );
             frame.fill_text(CanvasText {
                 content: format!("{:+}", db),
@@ -221,12 +227,14 @@ impl GraphProgram {
 
         // 0 dB line, brighter
         let y0 = bounds.y + db_to_y(0.0) * bounds.height;
-        frame.fill(
+        frame.stroke(
             &Path::line(
                 Point::new(bounds.x, y0),
                 Point::new(bounds.x + bounds.width, y0),
             ),
-            Fill::from(Color::from_rgba(1.0, 1.0, 1.0, 0.14)),
+            Stroke::default()
+                .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.14))
+                .with_width(1.0),
         );
     }
 
@@ -675,5 +683,430 @@ impl Program<Message> for GraphView {
             Some(_) => nih_plug_iced::mouse::Interaction::Grab,
             None => nih_plug_iced::mouse::Interaction::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Headless tests for the canvas draw path.
+    //!
+    //! The editor cannot be opened in CI, but `Program::draw()` is pure: it
+    //! turns parameters into a `Vec<Geometry>`, and `Geometry::into_primitive()`
+    //! exposes the meshes and text runs iced will rasterize. These tests drive
+    //! the real `GraphProgram::draw` and assert on what actually comes out, so a
+    //! layer that stops being drawn, a curve drawn at the wrong gain, or a stale
+    //! cache is a test failure rather than something only an eyeball would catch.
+
+    use super::*;
+    use crate::dsp::spectrum::SpectrumRing;
+    use crate::BandParams;
+    use atomic_float::AtomicF32;
+    use iced_graphics::Primitive;
+    use nih_plug::prelude::util;
+
+    struct NullGuiContext;
+
+    impl GuiContext for NullGuiContext {
+        fn plugin_api(&self) -> PluginApi {
+            PluginApi::Standalone
+        }
+        fn request_resize(&self) -> bool {
+            false
+        }
+        unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
+        unsafe fn raw_set_parameter_normalized(&self, _param: ParamPtr, _normalized: f32) {}
+        unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
+        fn get_state(&self) -> PluginState {
+            PluginState {
+                version: String::new(),
+                params: Default::default(),
+                fields: Default::default(),
+            }
+        }
+        fn set_state(&self, _state: PluginState) {}
+    }
+
+    fn bounds() -> Rectangle {
+        Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 900.0,
+            height: GRAPH_HEIGHT,
+        }
+    }
+
+    /// A band with explicit values. `BandParams::default()` hardcodes 1 kHz /
+    /// 0 dB / Q 1 and the parameter setters are crate-private in nih-plug, so
+    /// tests build params with the values already in place.
+    fn band(freq: f32, gain: f32, q: f32, ftype: FilterType, enabled: bool) -> BandParams {
+        BandParams {
+            freq: FloatParam::new(
+                "Freq",
+                freq,
+                FloatRange::Skewed {
+                    min: 20.0,
+                    max: 20_000.0,
+                    factor: FloatRange::skew_factor(-2.5),
+                },
+            )
+            .with_smoother(SmoothingStyle::Logarithmic(20.0)),
+            gain: FloatParam::new(
+                "Gain",
+                gain,
+                FloatRange::Linear {
+                    min: -24.0,
+                    max: 24.0,
+                },
+            )
+            .with_smoother(SmoothingStyle::Linear(20.0)),
+            q: FloatParam::new(
+                "Q",
+                q,
+                FloatRange::Skewed {
+                    min: 0.1,
+                    max: 20.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_smoother(SmoothingStyle::Logarithmic(20.0)),
+            filter_type: IntParam::new("Type", ftype as i32, IntRange::Linear { min: 0, max: 4 }),
+            enable: BoolParam::new("Enable", enabled),
+        }
+    }
+
+    fn test_params(bands: &[(f32, f32, f32, FilterType)]) -> Arc<FilterParams> {
+        let mut band_params: [BandParams; MAX_BANDS] =
+            core::array::from_fn(|_| BandParams::default());
+        for (i, &(freq, gain, q, ftype)) in bands.iter().enumerate() {
+            band_params[i] = band(freq, gain, q, ftype, true);
+        }
+        Arc::new(FilterParams {
+            num_bands: IntParam::new(
+                "Bands",
+                bands.len() as i32,
+                IntRange::Linear {
+                    min: 0,
+                    max: MAX_BANDS as i32,
+                },
+            ),
+            band_params,
+            ..FilterParams::default()
+        })
+    }
+
+    fn test_program_with(params: Arc<FilterParams>) -> GraphProgram {
+        GraphProgram {
+            params,
+            context: Arc::new(NullGuiContext),
+            _peak_meter: Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
+            spectrum_ring: Arc::new(SpectrumRing::new()),
+            smoothed: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
+            spec_x: spectrum_bin_x(),
+            cache: RefCell::new(None),
+            drag: Cell::new(None),
+            hover: Cell::new(None),
+            fine_scroll: Cell::new(false),
+        }
+    }
+
+    fn test_program(bands: &[(f32, f32, f32, FilterType)]) -> GraphProgram {
+        test_program_with(test_params(bands))
+    }
+
+    /// Every vertex of every mesh in a primitive tree, as
+    /// `(x, y, r, g, b, a)` — linear-space colour, exactly what the renderer
+    /// receives.
+    fn vertices(primitive: &Primitive, out: &mut Vec<[f32; 6]>) {
+        match primitive {
+            Primitive::Mesh2D { buffers, .. } => {
+                for v in &buffers.vertices {
+                    out.push([
+                        v.position[0],
+                        v.position[1],
+                        v.color[0],
+                        v.color[1],
+                        v.color[2],
+                        v.color[3],
+                    ]);
+                }
+            }
+            Primitive::Group { primitives } => {
+                for p in primitives {
+                    vertices(p, out);
+                }
+            }
+            Primitive::Clip { content, .. } | Primitive::Translate { content, .. } => {
+                vertices(content, out)
+            }
+            Primitive::Cached { cache } => vertices(cache, out),
+            _ => {}
+        }
+    }
+
+    /// Every triangle in a primitive tree, expanded from the index buffer so
+    /// the dump can be rasterized without reimplementing iced's mesh handling.
+    fn triangles(primitive: &Primitive, out: &mut Vec<[[f32; 6]; 3]>) {
+        match primitive {
+            Primitive::Mesh2D { buffers, .. } => {
+                for idx in buffers.indices.chunks_exact(3) {
+                    let mut tri = [[0.0f32; 6]; 3];
+                    for (k, &i) in idx.iter().enumerate() {
+                        let v = buffers.vertices[i as usize];
+                        tri[k] = [
+                            v.position[0],
+                            v.position[1],
+                            v.color[0],
+                            v.color[1],
+                            v.color[2],
+                            v.color[3],
+                        ];
+                    }
+                    out.push(tri);
+                }
+            }
+            Primitive::Group { primitives } => {
+                for p in primitives {
+                    triangles(p, out);
+                }
+            }
+            Primitive::Clip { content, .. } | Primitive::Translate { content, .. } => {
+                triangles(content, out)
+            }
+            Primitive::Cached { cache } => triangles(cache, out),
+            _ => {}
+        }
+    }
+
+    /// Every text run in a primitive tree.
+    fn texts(primitive: &Primitive, out: &mut Vec<String>) {
+        match primitive {
+            Primitive::Text { content, .. } => out.push(content.clone()),
+            Primitive::Group { primitives } => {
+                for p in primitives {
+                    texts(p, out);
+                }
+            }
+            Primitive::Clip { content, .. } | Primitive::Translate { content, .. } => {
+                texts(content, out)
+            }
+            Primitive::Cached { cache } => texts(cache, out),
+            _ => {}
+        }
+    }
+
+    fn layer_vertices(layers: &[Geometry], index: usize) -> Vec<[f32; 6]> {
+        let mut out = Vec::new();
+        vertices(&layers[index].clone().into_primitive(), &mut out);
+        out
+    }
+
+    #[test]
+    fn draws_grid_spectrum_curves_and_nodes() {
+        let program = test_program(&[(1_000.0, 12.0, 1.0, FilterType::Bell)]);
+        let layers = program.draw(bounds(), None, None);
+
+        // Grid | spectrum | curves | nodes — the order the renderer composites.
+        assert_eq!(layers.len(), 4, "expected four canvas layers");
+
+        let mut labels = Vec::new();
+        texts(&layers[0].clone().into_primitive(), &mut labels);
+        for expected in ["20", "10k", "-24", "+24"] {
+            assert!(
+                labels.iter().any(|l| l == expected),
+                "grid is missing the {expected} label; got {labels:?}"
+            );
+        }
+
+        // Regression guard: `frame.fill()` on a `Path::line` tessellates to
+        // nothing, so grid lines silently disappeared while their labels kept
+        // drawing. The grid layer must contain mesh geometry, not just text.
+        assert!(
+            !layer_vertices(&layers, 0).is_empty(),
+            "grid layer has text but no mesh — grid lines are not being drawn"
+        );
+        assert!(
+            !layer_vertices(&layers, 1).is_empty(),
+            "spectrum layer has no geometry"
+        );
+        assert!(
+            !layer_vertices(&layers, 2).is_empty(),
+            "curve layer has no geometry"
+        );
+        assert!(
+            !layer_vertices(&layers, 3).is_empty(),
+            "node layer has no geometry for an enabled band"
+        );
+    }
+
+    #[test]
+    fn nodes_layer_is_empty_without_bands() {
+        let program = test_program(&[]);
+        let layers = program.draw(bounds(), None, None);
+        assert!(
+            layer_vertices(&layers, 3).is_empty(),
+            "no bands should draw no nodes"
+        );
+    }
+
+    #[test]
+    fn curve_peak_lands_on_the_band_gain() {
+        // A single +12 dB bell at 1 kHz: the drawn curve must pass through
+        // (+12 dB, 1 kHz) in pixel space. This is what catches an inverted y
+        // axis, a stale cache or a curve built from the wrong values.
+        let program = test_program(&[(1_000.0, 12.0, 1.0, FilterType::Bell)]);
+        let b = bounds();
+        let layers = program.draw(b, None, None);
+        let verts = layer_vertices(&layers, 2);
+
+        let expected_x = b.x + freq_to_x(1_000.0) * b.width;
+        let expected_y = b.y + db_to_y(12.0) * b.height;
+
+        let nearest = verts
+            .iter()
+            .map(|v| ((v[0] - expected_x).abs(), (v[1] - expected_y).abs()))
+            .filter(|(dx, _)| *dx < 3.0)
+            .map(|(_, dy)| dy)
+            .fold(f32::INFINITY, f32::min);
+
+        assert!(
+            nearest < 3.0,
+            "curve does not pass through the +12 dB point at 1 kHz: \
+             closest vertex within 3 px horizontally is {nearest:.1} px away vertically"
+        );
+    }
+
+    #[test]
+    fn cache_reuses_layers_until_a_parameter_changes() {
+        let program = test_program(&[(1_000.0, 12.0, 1.0, FilterType::Bell)]);
+        let b = bounds();
+
+        // Two draws with unchanged params must reuse the cached layers and
+        // produce byte-identical geometry.
+        let first = layer_vertices(&program.draw(b, None, None), 2);
+        let second = layer_vertices(&program.draw(b, None, None), 2);
+        assert_eq!(first, second, "unchanged params must redraw identically");
+
+        // A different gain has to produce a different curve: if the cache key
+        // ever stops covering the band values, this is what fails.
+        let flipped = test_program(&[(1_000.0, -12.0, 1.0, FilterType::Bell)]);
+        let third = layer_vertices(&flipped.draw(b, None, None), 2);
+        assert_ne!(
+            first, third,
+            "curve layer does not respond to the band gain"
+        );
+    }
+
+    #[test]
+    fn cache_key_tracks_params_and_bounds() {
+        let b = bounds();
+        let base =
+            CachedLayers::key_for(&test_params(&[(1_000.0, 12.0, 1.0, FilterType::Bell)]), b);
+        assert_eq!(
+            base,
+            CachedLayers::key_for(&test_params(&[(1_000.0, 12.0, 1.0, FilterType::Bell)]), b),
+            "identical params must produce the same key"
+        );
+        assert_ne!(
+            base,
+            CachedLayers::key_for(&test_params(&[(2_000.0, 12.0, 1.0, FilterType::Bell)]), b),
+            "freq not tracked"
+        );
+        assert_ne!(
+            base,
+            CachedLayers::key_for(&test_params(&[(1_000.0, 12.0, 3.0, FilterType::Bell)]), b),
+            "q not tracked"
+        );
+        assert_ne!(
+            base,
+            CachedLayers::key_for(
+                &test_params(&[(1_000.0, 12.0, 1.0, FilterType::LowShelf)]),
+                b
+            ),
+            "filter type not tracked"
+        );
+        assert_ne!(
+            base,
+            CachedLayers::key_for(&test_params(&[]), b),
+            "band count not tracked"
+        );
+
+        let mut resized = b;
+        resized.width += 1.0;
+        assert_ne!(
+            base,
+            CachedLayers::key_for(
+                &test_params(&[(1_000.0, 12.0, 1.0, FilterType::Bell)]),
+                resized
+            ),
+            "canvas bounds not tracked"
+        );
+    }
+
+    /// Not an assertion — dumps the four layers as JSON for visual inspection
+    /// (`FILTER_CANVAS_DUMP=/tmp/layers.json cargo test -- --nocapture`).
+    #[test]
+    fn dump_layers_for_visual_inspection() {
+        let Some(path) = std::env::var_os("FILTER_CANVAS_DUMP") else {
+            return;
+        };
+        let program = test_program(&[
+            (100.0, 4.0, 1.0, FilterType::LowShelf),
+            (1_000.0, 12.0, 1.6, FilterType::Bell),
+            (6_000.0, -8.0, 2.0, FilterType::Bell),
+        ]);
+        let b = bounds();
+        let layers = program.draw(b, None, None);
+
+        let mut json = String::from("{\n");
+        json += &format!(
+            "  \"bounds\": [{}, {}, {}, {}],\n",
+            b.x, b.y, b.width, b.height
+        );
+        json += "  \"layers\": [\n";
+        for (i, layer) in layers.iter().enumerate() {
+            let primitive = layer.clone().into_primitive();
+            let mut tris = Vec::new();
+            triangles(&primitive, &mut tris);
+            let mut labels = Vec::new();
+            texts(&primitive, &mut labels);
+
+            json += &format!(
+                "    {{\"triangles\": [{}], \"texts\": [{}]}}",
+                tris.iter()
+                    .map(|t| format!(
+                        "[[{:.2},{:.2},{:.5},{:.5},{:.5},{:.5}],\
+                         [{:.2},{:.2},{:.5},{:.5},{:.5},{:.5}],\
+                         [{:.2},{:.2},{:.5},{:.5},{:.5},{:.5}]]",
+                        t[0][0],
+                        t[0][1],
+                        t[0][2],
+                        t[0][3],
+                        t[0][4],
+                        t[0][5],
+                        t[1][0],
+                        t[1][1],
+                        t[1][2],
+                        t[1][3],
+                        t[1][4],
+                        t[1][5],
+                        t[2][0],
+                        t[2][1],
+                        t[2][2],
+                        t[2][3],
+                        t[2][4],
+                        t[2][5],
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                labels
+                    .iter()
+                    .map(|t| format!("\"{t}\""))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            json += if i + 1 == layers.len() { "\n" } else { ",\n" };
+        }
+        json += "  ]\n}\n";
+        std::fs::write(path, json).expect("failed to write canvas dump");
     }
 }
