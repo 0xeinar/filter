@@ -21,16 +21,35 @@ is a model, not a measurement, so it is accurate to roughly ±1.5 dB on typical
 curves rather than exact; `tests/auto_gain.rs` measures real pink noise through
 the real biquads to keep it honest.
 
+## Layout
+
+The editor is laid out Pro-Q style: graph on top, a strip of numbered band
+chips under it, then a panel for **one** band at a time.
+
+| Region | Height |
+|---|---|
+| Header (Bands, Out, Auto gain, Bypass) | 28 |
+| Graph | 300 |
+| Band chips | 24 |
+| Selected-band panel | 66 |
+| Peak readout | 14 |
+
+Every region has an explicit height, so the layout is a constant — 24 bands
+occupy exactly as much space as one. (The previous design had one row per band
+at ~24 px; past five bands it ran off the bottom of the window.)
+
 ## Graph interaction
 
 | Action | Result |
 |---|---|
 | Click empty graph | Create a band at that frequency (Bell, 0 dB, enabled) |
 | Click-drag | Set the new band's gain in the same gesture |
+| Click a node | Select it — the panel below edits that band |
+| Click a chip | Select that band from the strip |
 | Drag a node | Frequency (x) and gain (y) |
 | Scroll over a node | Q (hold Alt for fine steps) |
 | Double-click a node | Gain back to 0 dB |
-| Right-click a node | Delete the band; later bands shift down |
+| Right-click a node | Delete the band; later bands shift down, selection follows |
 
 ## Build
 
@@ -67,11 +86,14 @@ Rescan plugins in your DAW after copying.
 # Run all tests
 cargo test
 
-# 95 tests:
-#   72 unit tests — biquad coefficients, frequency response, stability,
+# 116 tests:
+#   93 unit tests — biquad coefficients, frequency response, stability,
 #                   response-curve math (log mapping, combined EQ response),
-#                   per-channel state independence, and the canvas draw path
-#                   (layers, curve position in pixel space, cache invalidation)
+#                   per-channel state independence, band selection and
+#                   delete-compaction bookkeeping, the editor's fixed-height
+#                   layout budget, and the canvas draw path (layers, curve
+#                   position in pixel space, cache invalidation, selection
+#                   ring, click-to-select)
 #    3 loudness tests — auto-gain vs measured pink-noise level change
 #   10 FFT integration tests — sine sweep → spectrum verification
 #    7 property-based fuzz tests — 1000 random parameter combos each
