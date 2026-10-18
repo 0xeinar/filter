@@ -46,14 +46,18 @@ Rescan plugins in your DAW after copying.
 # Run all tests
 cargo test
 
-# 69 tests:
-#   49 unit tests — biquad coefficients, frequency response, stability,
+# 75 tests:
+#   55 unit tests — biquad coefficients, frequency response, stability,
 #                   response-curve math (log mapping, combined EQ response),
-#                   per-channel state independence
+#                   per-channel state independence, and the canvas draw path
+#                   (layers, curve position in pixel space, cache invalidation)
 #   10 FFT integration tests — sine sweep → spectrum verification
 #    7 property-based fuzz tests — 1000 random parameter combos each
-#    3 null tests — f32 plugin output vs an independent f64 DF-I reference
+#    3 null tests — plugin output vs an independent f64 DF-I reference
 #                   (all five filter types + an 8-band cascade, ~-148 dB)
+
+# Optional: dump the GUI's canvas geometry for offline rasterization
+FILTER_CANVAS_DUMP=/tmp/layers.json cargo test --lib dump_layers_for_visual_inspection
 ```
 
 ## Development Setup
