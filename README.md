@@ -11,6 +11,17 @@ A surgical parametric EQ plugin built in Rust. Inspired by FabFilter Pro-Q — d
 - **CLAP + VST3** — works in Ableton, Bitwig, Reaper, FL Studio
 - **Sample-accurate automation**
 
+## Graph interaction
+
+| Action | Result |
+|---|---|
+| Click empty graph | Create a band at that frequency (Bell, 0 dB, enabled) |
+| Click-drag | Set the new band's gain in the same gesture |
+| Drag a node | Frequency (x) and gain (y) |
+| Scroll over a node | Q (hold Alt for fine steps) |
+| Double-click a node | Gain back to 0 dB |
+| Right-click a node | Delete the band; later bands shift down |
+
 ## Build
 
 ```bash
@@ -46,8 +57,8 @@ Rescan plugins in your DAW after copying.
 # Run all tests
 cargo test
 
-# 75 tests:
-#   55 unit tests — biquad coefficients, frequency response, stability,
+# 81 tests:
+#   61 unit tests — biquad coefficients, frequency response, stability,
 #                   response-curve math (log mapping, combined EQ response),
 #                   per-channel state independence, and the canvas draw path
 #                   (layers, curve position in pixel space, cache invalidation)

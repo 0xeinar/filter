@@ -93,6 +93,19 @@ pub const GRID_FREQS: [f32; 13] = [
 /// Grid gains for horizontal lines (0 dB line drawn separately, emphasized).
 pub const GRID_DBS: [f32; 8] = [-24.0, -18.0, -12.0, -6.0, 6.0, 12.0, 18.0, 24.0];
 
+/// Which bands move when band `removed` is deleted from a bank of
+/// `num_active` bands: the tail shifts down one slot, as `(from, to)` pairs in
+/// ascending order. Applying them in this order is safe because each write
+/// targets a slot whose source has not been overwritten yet.
+pub fn compaction_plan(removed: usize, num_active: usize) -> Vec<(usize, usize)> {
+    if removed >= num_active {
+        return Vec::new();
+    }
+    (removed + 1..num_active)
+        .map(|from| (from, from - 1))
+        .collect()
+}
+
 /// Grab radius around a band node, in pixels.
 pub const NODE_GRAB_RADIUS_PX: f32 = 14.0;
 
@@ -162,6 +175,21 @@ pub fn px_to_freq(px: f32, width_px: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::FilterType;
+
+    #[test]
+    fn compaction_plan_shifts_the_tail_down() {
+        assert_eq!(compaction_plan(0, 3), vec![(1, 0), (2, 1)]);
+        assert_eq!(compaction_plan(1, 3), vec![(2, 1)]);
+        assert!(
+            compaction_plan(2, 3).is_empty(),
+            "deleting the last band moves nothing"
+        );
+        assert!(
+            compaction_plan(9, 3).is_empty(),
+            "out-of-range delete is a no-op"
+        );
+        assert!(compaction_plan(0, 1).is_empty());
+    }
 
     fn spec(freq: f32, gain: f32, q: f32, t: FilterType) -> BandSpec {
         BandSpec {

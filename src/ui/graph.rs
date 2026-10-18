@@ -1,11 +1,19 @@
 //! EQ curve graph — canvas widget drawing grid, response curve, and band
-//! handles. The handles are interactive: grab to move frequency/gain,
-//! scroll over a node to change Q (hold Alt for fine steps).
+//! handles.
+//!
+//! Interaction:
+//! - click empty graph: create a band at that frequency (0 dB, Bell, enabled)
+//!   and grab it, so the same click-drag also sets its gain
+//! - drag a node: frequency (x) and gain (y)
+//! - scroll over a node: Q (Alt = fine)
+//! - double-click a node: gain back to 0 dB
+//! - right-click a node: delete the band and compact the remaining bands
 
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use nih_plug::prelude::*;
 use nih_plug_iced::backend::widget::canvas::{
@@ -23,6 +31,10 @@ use crate::{editor, FilterParams, FilterType, MAX_BANDS};
 
 /// Height of the graph area in points.
 pub const GRAPH_HEIGHT: f32 = 300.0;
+
+/// Two clicks on the same node inside this window count as a double-click
+/// (resets the band's gain to 0 dB).
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 /// Collect the current band parameters as pure `BandSpec` values.
 fn band_specs(params: &FilterParams, num_active: usize) -> [BandSpec; MAX_BANDS] {
@@ -122,6 +134,9 @@ struct GraphProgram {
     hover: Cell<Option<usize>>,
     /// Alt held — fine (4x) scroll steps for Q.
     fine_scroll: Cell<bool>,
+    /// Last click `(band, instant)` — used to detect a double-click on a node
+    /// (reset its gain) without needing iced's event stream to expose one.
+    last_click: Cell<Option<(usize, std::time::Instant)>>,
 }
 
 /// Geometry that is only valid for one parameter/bounds state.
@@ -161,6 +176,62 @@ impl GraphProgram {
     fn set_plain(&self, param: &FloatParam, plain: f32) {
         let setter = ParamSetter::new(self.context.as_ref());
         setter.set_parameter(param, plain);
+    }
+
+    /// Write a parameter as a complete automation gesture (begin → set → end),
+    /// so the host records one clean undo step per parameter instead of a
+    /// loose value change.
+    fn set_gesture<P: Param>(&self, param: &P, value: P::Plain) {
+        let setter = ParamSetter::new(self.context.as_ref());
+        setter.begin_set_parameter(param);
+        setter.set_parameter(param, value);
+        setter.end_set_parameter(param);
+    }
+
+    /// Copy every parameter of band `from` into band `to`.
+    fn copy_band(&self, from: usize, to: usize) {
+        let src = &self.params.band_params[from];
+        let dst = &self.params.band_params[to];
+        self.set_gesture(&dst.freq, src.freq.value());
+        self.set_gesture(&dst.gain, src.gain.value());
+        self.set_gesture(&dst.q, src.q.value());
+        self.set_gesture(&dst.filter_type, src.filter_type.value());
+        self.set_gesture(&dst.enable, src.enable.value());
+    }
+
+    /// Append a band at `freq` with 0 dB gain and a neutral Q, enabled.
+    ///
+    /// The band's parameters are written *before* the count is raised so the
+    /// audio thread never sees a half-initialised band. Returns the new band's
+    /// index, or `None` when the bank is full.
+    fn create_band(&self, freq: f32, gain_db: f32) -> Option<usize> {
+        let num_active = self.params.num_bands.value() as usize;
+        if num_active >= MAX_BANDS {
+            return None;
+        }
+        let bp = &self.params.band_params[num_active];
+        self.set_gesture(&bp.freq, freq.clamp(FREQ_MIN, FREQ_MAX));
+        self.set_gesture(&bp.gain, gain_db.clamp(-DB_MAX, DB_MAX));
+        self.set_gesture(&bp.q, 1.0);
+        self.set_gesture(&bp.filter_type, FilterType::Bell as i32);
+        self.set_gesture(&bp.enable, true);
+        self.set_gesture(&self.params.num_bands, num_active as i32 + 1);
+        Some(num_active)
+    }
+
+    /// Delete band `index` and compact the remaining bands down one slot.
+    ///
+    /// The tail is shifted first and the count lowered last, so no band is ever
+    /// visible twice or lost mid-update.
+    fn delete_band(&self, index: usize) {
+        let num_active = self.params.num_bands.value() as usize;
+        if index >= num_active {
+            return;
+        }
+        for (from, to) in crate::dsp::curve::compaction_plan(index, num_active) {
+            self.copy_band(from, to);
+        }
+        self.set_gesture(&self.params.num_bands, num_active as i32 - 1);
     }
 
     /// Set a band's Q from a normalized value, as a complete gesture.
@@ -504,6 +575,7 @@ impl Graph {
                 drag: Cell::new(None),
                 hover: Cell::new(None),
                 fine_scroll: Cell::new(false),
+                last_click: Cell::new(None),
             }),
         }
     }
@@ -554,10 +626,61 @@ impl GraphView {
                 let nodes = node_positions(&program.params, num_active, bounds);
                 match nearest_grabbable_node(pos.x, pos.y, &nodes) {
                     Some(hit) => {
+                        // Double-click a node: back to 0 dB (PLAN's "reset to
+                        // flat"). iced doesn't hand the canvas a double-click
+                        // event, so time the clicks here.
+                        let now = Instant::now();
+                        let is_double = matches!(
+                            program.last_click.get(),
+                            Some((band, at))
+                                if band == hit.band_index && now.duration_since(at) < DOUBLE_CLICK
+                        );
+                        if is_double {
+                            let gain = &program.params.band_params[hit.band_index].gain;
+                            program.set_plain(gain, 0.0);
+                            program.last_click.set(None);
+                            return (canvas::event::Status::Captured, None);
+                        }
+
+                        program.last_click.set(Some((hit.band_index, now)));
                         program.drag.set(Some(DragState {
                             band: hit.band_index,
                         }));
                         program.hover.set(Some(hit.band_index));
+                        (canvas::event::Status::Captured, None)
+                    }
+                    None => {
+                        // Click on empty graph: create a band at that frequency
+                        // (0 dB, so the curve does not jump) and immediately
+                        // start dragging it — a click-drag also sets the gain.
+                        let freq = px_to_freq(pos.x, bounds.width);
+                        match program.create_band(freq, 0.0) {
+                            Some(band) => {
+                                let now = Instant::now();
+                                program.drag.set(Some(DragState { band }));
+                                program.hover.set(Some(band));
+                                program.last_click.set(Some((band, now)));
+                                (canvas::event::Status::Captured, None)
+                            }
+                            None => (canvas::event::Status::Ignored, None),
+                        }
+                    }
+                }
+            }
+
+            // Right-click a node: delete that band and compact the rest.
+            mouse::Event::ButtonPressed(mouse::Button::Right) => {
+                let Some(pos) = cursor.position_in(&bounds) else {
+                    return (canvas::event::Status::Ignored, None);
+                };
+                let num_active = program.params.num_bands.value() as usize;
+                let nodes = node_positions(&program.params, num_active, bounds);
+                match nearest_grabbable_node(pos.x, pos.y, &nodes) {
+                    Some(hit) => {
+                        program.delete_band(hit.band_index);
+                        program.drag.set(None);
+                        program.hover.set(None);
+                        program.last_click.set(None);
                         (canvas::event::Status::Captured, None)
                     }
                     None => (canvas::event::Status::Ignored, None),
@@ -681,7 +804,8 @@ impl Program<Message> for GraphView {
         let nodes = node_positions(&self.program.params, num_active, bounds);
         match nearest_grabbable_node(pos.x, pos.y, &nodes) {
             Some(_) => nih_plug_iced::mouse::Interaction::Grab,
-            None => nih_plug_iced::mouse::Interaction::default(),
+            // Crosshair over empty space: this is where a click creates a band.
+            None => nih_plug_iced::mouse::Interaction::Crosshair,
         }
     }
 }
@@ -703,10 +827,50 @@ mod tests {
     use atomic_float::AtomicF32;
     use iced_graphics::Primitive;
     use nih_plug::prelude::util;
+    use nih_plug::prelude::Param;
+
+    /// Records the normalized values the draw/interaction code writes to the
+    /// host, so tests can assert on *what* the GUI asks the host to do.
+    #[derive(Default)]
+    struct TestGuiContext {
+        writes: std::sync::Mutex<Vec<f32>>,
+    }
+
+    impl TestGuiContext {
+        fn writes(&self) -> Vec<f32> {
+            self.writes.lock().unwrap().clone()
+        }
+    }
 
     struct NullGuiContext;
 
-    impl GuiContext for NullGuiContext {
+    macro_rules! stub_gui_context {
+        ($ty:ty) => {
+            impl GuiContext for $ty {
+                fn plugin_api(&self) -> PluginApi {
+                    PluginApi::Standalone
+                }
+                fn request_resize(&self) -> bool {
+                    false
+                }
+                unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
+                unsafe fn raw_set_parameter_normalized(&self, _param: ParamPtr, _normalized: f32) {}
+                unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
+                fn get_state(&self) -> PluginState {
+                    PluginState {
+                        version: String::new(),
+                        params: Default::default(),
+                        fields: Default::default(),
+                    }
+                }
+                fn set_state(&self, _state: PluginState) {}
+            }
+        };
+    }
+
+    stub_gui_context!(NullGuiContext);
+
+    impl GuiContext for TestGuiContext {
         fn plugin_api(&self) -> PluginApi {
             PluginApi::Standalone
         }
@@ -714,7 +878,9 @@ mod tests {
             false
         }
         unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
-        unsafe fn raw_set_parameter_normalized(&self, _param: ParamPtr, _normalized: f32) {}
+        unsafe fn raw_set_parameter_normalized(&self, _param: ParamPtr, normalized: f32) {
+            self.writes.lock().unwrap().push(normalized);
+        }
         unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
         fn get_state(&self) -> PluginState {
             PluginState {
@@ -794,10 +960,11 @@ mod tests {
         })
     }
 
-    fn test_program_with(params: Arc<FilterParams>) -> GraphProgram {
+    #[allow(clippy::arc_with_non_send_sync)] // GUI-thread-only, same contract as Graph::new
+    fn test_program_with(params: Arc<FilterParams>, context: Arc<dyn GuiContext>) -> GraphProgram {
         GraphProgram {
             params,
-            context: Arc::new(NullGuiContext),
+            context,
             _peak_meter: Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             spectrum_ring: Arc::new(SpectrumRing::new()),
             smoothed: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
@@ -806,11 +973,12 @@ mod tests {
             drag: Cell::new(None),
             hover: Cell::new(None),
             fine_scroll: Cell::new(false),
+            last_click: Cell::new(None),
         }
     }
 
     fn test_program(bands: &[(f32, f32, f32, FilterType)]) -> GraphProgram {
-        test_program_with(test_params(bands))
+        test_program_with(test_params(bands), Arc::new(NullGuiContext))
     }
 
     /// Every vertex of every mesh in a primitive tree, as
@@ -1040,6 +1208,169 @@ mod tests {
             ),
             "canvas bounds not tracked"
         );
+    }
+
+    fn click_at(
+        view: &GraphView,
+        b: Rectangle,
+        x: f32,
+        y: f32,
+        button: mouse::Button,
+    ) -> canvas::event::Status {
+        let cursor = Cursor::Available(Point::new(x, y));
+        let (status, _) = view.handle_mouse_event(mouse::Event::ButtonPressed(button), b, cursor);
+        status
+    }
+
+    #[test]
+    fn clicking_empty_graph_creates_a_band_at_that_frequency() {
+        let ctx = Arc::new(TestGuiContext::default());
+        let (view, program) = {
+            #[allow(clippy::arc_with_non_send_sync)]
+            let p = Arc::new(test_program_with(test_params(&[]), ctx.clone()));
+            (GraphView { program: p.clone() }, p)
+        };
+        let b = bounds();
+        let x = b.x + freq_to_x(1_000.0) * b.width;
+        let y = b.y + b.height * 0.5;
+
+        assert_eq!(
+            click_at(&view, b, x, y, mouse::Button::Left),
+            canvas::event::Status::Captured
+        );
+
+        let writes = ctx.writes();
+        assert_eq!(writes.len(), 6, "5 band params + the band count");
+        assert!(
+            (writes[4] - 1.0).abs() < 1e-6,
+            "created band must be enabled"
+        );
+        assert!(
+            (writes[5] - 1.0 / MAX_BANDS as f32).abs() < 1e-4,
+            "band count must be raised to 1, got normalized {}",
+            writes[5]
+        );
+        let expected_freq = program.params.band_params[0]
+            .freq
+            .preview_normalized(1_000.0);
+        assert!(
+            (writes[0] - expected_freq).abs() < 2e-3,
+            "band should be created at the click frequency"
+        );
+        assert!(
+            program.drag.get().is_some(),
+            "a freshly created band should be grabbed so the same click-drag sets its gain"
+        );
+    }
+
+    #[test]
+    fn right_clicking_a_node_deletes_it_and_compacts_the_tail() {
+        let ctx = Arc::new(TestGuiContext::default());
+        let (view, program) = {
+            #[allow(clippy::arc_with_non_send_sync)]
+            let p = Arc::new(test_program_with(
+                test_params(&[
+                    (1_000.0, 6.0, 1.0, FilterType::Bell),
+                    (5_000.0, -6.0, 1.0, FilterType::Bell),
+                ]),
+                ctx.clone(),
+            ));
+            (GraphView { program: p.clone() }, p)
+        };
+        let b = bounds();
+        let x = b.x + freq_to_x(5_000.0) * b.width;
+        let y = b.y + db_to_y(-6.0) * b.height;
+
+        assert_eq!(
+            click_at(&view, b, x, y, mouse::Button::Right),
+            canvas::event::Status::Captured
+        );
+
+        let writes = ctx.writes();
+        assert_eq!(
+            writes.len(),
+            1,
+            "deleting the last band only lowers the count"
+        );
+        assert!(
+            (writes[0] - 1.0 / MAX_BANDS as f32).abs() < 1e-4,
+            "band count must drop to 1"
+        );
+        assert!(program.drag.get().is_none());
+    }
+
+    #[test]
+    fn deleting_a_middle_band_copies_the_tail_down_before_lowering_the_count() {
+        let ctx = Arc::new(TestGuiContext::default());
+        let program = test_program_with(
+            test_params(&[
+                (100.0, 1.0, 1.0, FilterType::Bell),
+                (1_000.0, 2.0, 1.0, FilterType::Bell),
+                (5_000.0, 3.0, 1.0, FilterType::Bell),
+            ]),
+            ctx.clone(),
+        );
+        program.delete_band(1);
+
+        let writes = ctx.writes();
+        assert_eq!(writes.len(), 6, "one band copied (5 params) + the count");
+        // The copied frequency must be the third band's 5 kHz, not the deleted one.
+        let expected = program.params.band_params[1]
+            .freq
+            .preview_normalized(5_000.0);
+        assert!(
+            (writes[0] - expected).abs() < 1e-4,
+            "tail band was not copied into the freed slot"
+        );
+        assert!(
+            (writes[5] - 2.0 / MAX_BANDS as f32).abs() < 1e-4,
+            "band count must drop to 2"
+        );
+    }
+
+    #[test]
+    fn double_clicking_a_node_resets_its_gain() {
+        let ctx = Arc::new(TestGuiContext::default());
+        let (view, _program) = {
+            #[allow(clippy::arc_with_non_send_sync)]
+            let p = Arc::new(test_program_with(
+                test_params(&[(1_000.0, 12.0, 1.0, FilterType::Bell)]),
+                ctx.clone(),
+            ));
+            (GraphView { program: p.clone() }, p)
+        };
+        let b = bounds();
+        let x = b.x + freq_to_x(1_000.0) * b.width;
+        let y = b.y + db_to_y(12.0) * b.height;
+
+        assert_eq!(
+            click_at(&view, b, x, y, mouse::Button::Left),
+            canvas::event::Status::Captured
+        );
+        let before = ctx.writes().len();
+        assert_eq!(before, 0, "a single click on a node only starts a drag");
+
+        assert_eq!(
+            click_at(&view, b, x, y, mouse::Button::Left),
+            canvas::event::Status::Captured
+        );
+        let writes = ctx.writes();
+        assert_eq!(writes.len(), 1, "double-click writes exactly the gain");
+        assert!(
+            (writes[0] - 0.5).abs() < 1e-6,
+            "gain must be reset to 0 dB (normalized 0.5 in a ±24 dB range)"
+        );
+    }
+
+    #[test]
+    fn creating_a_band_when_the_bank_is_full_is_a_no_op() {
+        let ctx = Arc::new(TestGuiContext::default());
+        let full: Vec<(f32, f32, f32, FilterType)> = (0..MAX_BANDS)
+            .map(|i| (100.0 + i as f32 * 100.0, 0.0, 1.0, FilterType::Bell))
+            .collect();
+        let program = test_program_with(test_params(&full), ctx.clone());
+        assert!(program.create_band(1_000.0, 0.0).is_none());
+        assert!(ctx.writes().is_empty(), "nothing may be written when full");
     }
 
     /// Not an assertion — dumps the four layers as JSON for visual inspection
