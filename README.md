@@ -50,6 +50,11 @@ at ~24 px; past five bands it ran off the bottom of the window.)
 | Scroll over a node | Q (hold Alt for fine steps) |
 | Double-click a node | Gain back to 0 dB |
 | Right-click a node | Delete the band; later bands shift down, selection follows |
+| ← / → | Nudge the selected band's frequency by a semitone (Shift: an octave) |
+| ↑ / ↓ | Nudge gain by 0.1 dB (Shift: 1 dB) |
+| Tab / Shift+Tab | Select the next / previous band |
+| Backspace / Delete | Delete the selected band |
+| Esc | Clear the selection |
 
 ## Build
 
@@ -86,14 +91,16 @@ Rescan plugins in your DAW after copying.
 # Run all tests
 cargo test
 
-# 116 tests:
-#   93 unit tests — biquad coefficients, frequency response, stability,
+# 130 tests:
+#  107 unit tests — biquad coefficients, frequency response, stability,
 #                   response-curve math (log mapping, combined EQ response),
 #                   per-channel state independence, band selection and
 #                   delete-compaction bookkeeping, the editor's fixed-height
-#                   layout budget, and the canvas draw path (layers, curve
+#                   layout budget, the canvas draw path (layers, curve
 #                   position in pixel space, cache invalidation, selection
-#                   ring, click-to-select)
+#                   ring, click-to-select), keyboard nudging, and 4
+#                   end-to-end tests (a click-drag and a key press →
+#                   normalized value → plain value → coefficients → audio)
 #    3 loudness tests — auto-gain vs measured pink-noise level change
 #   10 FFT integration tests — sine sweep → spectrum verification
 #    7 property-based fuzz tests — 1000 random parameter combos each

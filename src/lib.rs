@@ -4,6 +4,8 @@ use nih_plug_iced::IcedState;
 use std::sync::Arc;
 
 pub mod dsp;
+#[cfg(test)]
+mod e2e;
 mod editor;
 #[cfg(test)]
 mod test_support;
