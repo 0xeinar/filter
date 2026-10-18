@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 pub mod dsp;
 mod editor;
+#[cfg(test)]
+mod test_support;
 pub mod ui;
 
 pub const MAX_BANDS: usize = 24;

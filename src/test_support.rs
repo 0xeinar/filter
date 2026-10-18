@@ -1,0 +1,95 @@
+//! Helpers shared by the crate's unit tests.
+//!
+//! Two things every GUI-side test needs: a `GuiContext` that goes nowhere, and
+//! `FilterParams` with exact values in place. The latter exists because
+//! `BandParams::default()` hardcodes 1 kHz / 0 dB / Q 1 and nih-plug's
+//! parameter setters are crate-private, so tests have to build the params with
+//! the values already set.
+
+use std::sync::Arc;
+
+use nih_plug::prelude::*;
+
+use crate::{BandParams, FilterParams, FilterType, MAX_BANDS};
+
+/// A `GuiContext` that accepts every call and does nothing — enough to drive
+/// the GUI code paths with no host and no window.
+pub struct NullGuiContext;
+
+impl GuiContext for NullGuiContext {
+    fn plugin_api(&self) -> PluginApi {
+        PluginApi::Standalone
+    }
+    fn request_resize(&self) -> bool {
+        false
+    }
+    unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
+    unsafe fn raw_set_parameter_normalized(&self, _param: ParamPtr, _normalized: f32) {}
+    unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
+    fn get_state(&self) -> PluginState {
+        PluginState {
+            version: String::new(),
+            params: Default::default(),
+            fields: Default::default(),
+        }
+    }
+    fn set_state(&self, _state: PluginState) {}
+}
+
+/// A band with explicit values.
+pub fn band(freq: f32, gain: f32, q: f32, ftype: FilterType, enabled: bool) -> BandParams {
+    BandParams {
+        freq: FloatParam::new(
+            "Freq",
+            freq,
+            FloatRange::Skewed {
+                min: 20.0,
+                max: 20_000.0,
+                factor: FloatRange::skew_factor(-2.5),
+            },
+        )
+        .with_smoother(SmoothingStyle::Logarithmic(20.0)),
+        gain: FloatParam::new(
+            "Gain",
+            gain,
+            FloatRange::Linear {
+                min: -24.0,
+                max: 24.0,
+            },
+        )
+        .with_smoother(SmoothingStyle::Linear(20.0)),
+        q: FloatParam::new(
+            "Q",
+            q,
+            FloatRange::Skewed {
+                min: 0.1,
+                max: 20.0,
+                factor: FloatRange::skew_factor(-1.0),
+            },
+        )
+        .with_smoother(SmoothingStyle::Logarithmic(20.0)),
+        filter_type: IntParam::new("Type", ftype as i32, IntRange::Linear { min: 0, max: 4 }),
+        enable: BoolParam::new("Enable", enabled),
+    }
+}
+
+/// Params holding `bands` (all enabled) with the band count already set to
+/// their number.
+pub fn test_params(bands: &[(f32, f32, f32, FilterType)]) -> Arc<FilterParams> {
+    let mut band_params: [BandParams; MAX_BANDS] = core::array::from_fn(|_| BandParams::default());
+    for (i, &(freq, gain, q, ftype)) in bands.iter().enumerate() {
+        band_params[i] = band(freq, gain, q, ftype, true);
+    }
+    Arc::new(FilterParams {
+        num_bands: IntParam::new(
+            "Bands",
+            bands.len() as i32,
+            IntRange::Linear {
+                min: 0,
+                max: MAX_BANDS as i32,
+            },
+        ),
+        band_params,
+        ..FilterParams::default()
+    })
+}

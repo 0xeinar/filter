@@ -2,18 +2,53 @@ use atomic_float::AtomicF32;
 use nih_plug::prelude::{util, Editor, GuiContext, ParamSetter};
 use nih_plug_iced::widgets as nih_widgets;
 use nih_plug_iced::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::dsp::spectrum::SpectrumRing;
 use crate::ui;
+use crate::ui::selection;
 use crate::FilterParams;
 use crate::FilterType;
 use crate::MAX_BANDS;
 
 pub use colors::band_color;
 
+/// Window size. The layout is fixed-height by construction (see the region
+/// constants below), so this is a hard budget, not a starting suggestion —
+/// `chrome_fits_in_the_window` asserts it.
+pub const EDITOR_WIDTH: u16 = 900;
+pub const EDITOR_HEIGHT: u16 = 500;
+
+// Fixed region heights. Every region states its height explicitly so the
+// whole column is deterministic and cannot silently overflow the window as
+// the band count grows — which is exactly what the old per-band rows did
+// (each row ~24 px, so past five bands the list ran off the bottom).
+const HEADER_H: u16 = 28;
+const STRIP_H: u16 = 24;
+const PANEL_H: u16 = 66;
+const FOOTER_H: u16 = 14;
+/// Vertical gap between the column's children.
+const GAP: u16 = 6;
+/// Band strip chip.
+const CHIP_W: u16 = 24;
+const CHIP_H: u16 = 20;
+
+/// Height of everything except the graph.
+pub fn chrome_height() -> u16 {
+    HEADER_H + ui::graph::GRAPH_HEIGHT as u16 + STRIP_H + PANEL_H + FOOTER_H + GAP * 4
+}
+
 pub fn default_state() -> Arc<IcedState> {
-    IcedState::from_size(900, 500)
+    // The layout is fixed-height, so this is a real invariant rather than a
+    // style preference: if the regions outgrow the window, the bottom of the
+    // editor is clipped.
+    debug_assert!(
+        chrome_height() <= EDITOR_HEIGHT,
+        "editor chrome is {} px tall but the window is {EDITOR_HEIGHT} px",
+        chrome_height()
+    );
+    IcedState::from_size(EDITOR_WIDTH as u32, EDITOR_HEIGHT as u32)
 }
 
 pub fn create(
@@ -77,11 +112,72 @@ mod colors {
     }
 }
 
+/// A numbered band chip in the strip under the graph.
+///
+/// Styled directly rather than themed: the chip's colour *is* the band's
+/// identity, so it has to come from the band palette.
+struct ChipStyle {
+    color: Color,
+    selected: bool,
+    enabled: bool,
+}
+
+impl button::StyleSheet for ChipStyle {
+    fn active(&self) -> button::Style {
+        let (bg_alpha, border_alpha, text_alpha) = if self.selected {
+            (0.9, 1.0, 0.0)
+        } else if !self.enabled {
+            (0.12, 0.18, 0.30)
+        } else {
+            (0.28, 0.45, 0.95)
+        };
+        button::Style {
+            shadow_offset: Vector::default(),
+            background: Some(Background::Color(Color {
+                a: bg_alpha,
+                ..self.color
+            })),
+            border_radius: 3.0,
+            border_width: 1.0,
+            border_color: Color {
+                a: border_alpha,
+                ..self.color
+            },
+            // A selected chip is filled with the band colour, so its digit
+            // has to go dark to stay readable.
+            text_color: if self.selected {
+                Color {
+                    r: 0.06,
+                    g: 0.06,
+                    b: 0.08,
+                    a: 1.0,
+                }
+            } else {
+                Color {
+                    a: text_alpha,
+                    ..self.color
+                }
+            },
+        }
+    }
+
+    fn hovered(&self) -> button::Style {
+        let active = self.active();
+        button::Style {
+            border_width: 1.5,
+            ..active
+        }
+    }
+}
+
 struct FilterEditor {
     params: Arc<FilterParams>,
     context: Arc<dyn GuiContext>,
     peak_meter: Arc<AtomicF32>,
     graph: ui::Graph,
+    /// Shared with the graph: one of the editor's few pieces of state that
+    /// is not a host parameter.
+    selection: Arc<AtomicUsize>,
     num_bands_slider_state: nih_widgets::param_slider::State,
     out_gain_slider_state: nih_widgets::param_slider::State,
     // Wrap in UnsafeCell to allow disjoint mutable access by index
@@ -89,6 +185,7 @@ struct FilterEditor {
     gain_slider_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
     q_slider_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
     type_pick_states: [std::cell::UnsafeCell<pick_list::State<FilterType>>; MAX_BANDS],
+    chip_states: [std::cell::UnsafeCell<button::State>; MAX_BANDS],
 }
 
 // Safety: We only ever access one index at a time, and each index is unique
@@ -115,6 +212,35 @@ impl FilterEditor {
     ) -> &mut pick_list::State<FilterType> {
         &mut *states[i].get()
     }
+
+    /// Get a mutable reference to a chip state by index.
+    /// Safety: Caller must ensure no two calls with the same index are active simultaneously.
+    #[allow(clippy::mut_from_ref)] // false positive: UnsafeCell::get() is the intended API
+    unsafe fn chip_state(
+        states: &[std::cell::UnsafeCell<button::State>; MAX_BANDS],
+        i: usize,
+    ) -> &mut button::State {
+        &mut *states[i].get()
+    }
+
+    /// The selection clamped to the bands that actually exist.
+    fn selected(&self, num_bands: usize) -> usize {
+        selection::clamp_to(self.selection.load(Ordering::Relaxed), num_bands)
+    }
+
+    fn select(&self, band: usize) {
+        self.selection.store(band, Ordering::Relaxed);
+    }
+
+    /// Select `index` only if that band exists. The band count can change
+    /// behind the GUI's back (the Bands slider, the host, a preset), so a
+    /// queued `SelectBand` can name a slot that is no longer in use.
+    fn select_if_live(&self, index: usize) {
+        let num_bands = self.params.num_bands.value() as usize;
+        if index < num_bands {
+            self.select(index);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -124,6 +250,8 @@ pub enum Message {
     TypeChanged(usize, FilterType),
     /// Band `index` enabled/disabled.
     EnableChanged(usize, bool),
+    /// Band `index` selected from the band strip.
+    SelectBand(usize),
     BypassToggled(bool),
     AutoGainToggled(bool),
 }
@@ -159,17 +287,20 @@ impl IcedEditor for FilterEditor {
         (params, peak_meter, spectrum_ring): Self::InitializationFlags,
         context: Arc<dyn GuiContext>,
     ) -> (Self, Command<Self::Message>) {
+        let selection = Arc::new(AtomicUsize::new(selection::NONE));
         let graph = ui::Graph::new(
             params.clone(),
             context.clone(),
             peak_meter.clone(),
             spectrum_ring,
+            selection.clone(),
         );
         let editor = FilterEditor {
             params,
             context,
             peak_meter,
             graph,
+            selection,
             num_bands_slider_state: Default::default(),
             out_gain_slider_state: Default::default(),
             freq_slider_states: core::array::from_fn(|_| {
@@ -184,6 +315,7 @@ impl IcedEditor for FilterEditor {
             type_pick_states: core::array::from_fn(|_| {
                 std::cell::UnsafeCell::new(pick_list::State::default())
             }),
+            chip_states: core::array::from_fn(|_| std::cell::UnsafeCell::new(button::State::new())),
         };
         (editor, Command::none())
     }
@@ -205,118 +337,155 @@ impl IcedEditor for FilterEditor {
             Message::EnableChanged(index, enabled) => {
                 let _ = self.set_band_enable(index, enabled);
             }
+            Message::SelectBand(index) => {
+                // Selecting a dead index (the band count can change from the
+                // host or from another editor) must not leave the panel
+                // pointing at nothing.
+                self.select_if_live(index);
+            }
             Message::BypassToggled(on) => {
                 let param = &self.params.bypass;
                 let setter = ParamSetter::new(self.context.as_ref());
-                setter.begin_set_parameter(param);
                 setter.set_parameter(param, on);
-                setter.end_set_parameter(param);
             }
             Message::AutoGainToggled(on) => {
                 let param = &self.params.auto_gain;
                 let setter = ParamSetter::new(self.context.as_ref());
-                setter.begin_set_parameter(param);
                 setter.set_parameter(param, on);
-                setter.end_set_parameter(param);
             }
         }
         Command::none()
     }
 
     fn view(&mut self) -> Element<'_, Self::Message> {
-        use nih_plug_iced::{Alignment, Column, Length, Row, Space, Text};
+        use nih_plug_iced::{Alignment, Column, Length, Row, Text};
 
         let num_bands = self.params.num_bands.value() as usize;
+        let selected = self.selected(num_bands);
 
-        let header = Column::new()
+        let header = Row::new()
+            .height(Length::Units(HEADER_H))
+            .spacing(10)
+            .align_items(Alignment::Center)
             .push(
                 Text::new("Filter")
                     .font(assets::NOTO_SANS_LIGHT)
-                    .size(28)
-                    .color(colors::TEXT)
-                    .height(36.into())
-                    .width(Length::Fill)
-                    .horizontal_alignment(alignment::Horizontal::Left),
+                    .size(18)
+                    .color(colors::TEXT),
             )
-            .push(Space::with_height(4.into()))
+            .push(Text::new("Bands").size(11).color(colors::TEXT_DIM))
             .push(
-                Row::new()
-                    .push(Text::new("Bands: ").size(13).color(colors::TEXT_DIM))
-                    .push(
-                        nih_widgets::ParamSlider::new(
-                            &mut self.num_bands_slider_state,
-                            &self.params.num_bands,
-                        )
-                        .map(Message::ParamUpdate),
-                    ),
+                nih_widgets::ParamSlider::new(
+                    &mut self.num_bands_slider_state,
+                    &self.params.num_bands,
+                )
+                .width(Length::Units(120))
+                .height(Length::Units(22))
+                .map(Message::ParamUpdate),
             )
-            .push(Space::with_height(4.into()))
+            .push(Text::new("Out").size(11).color(colors::TEXT_DIM))
             .push(
-                Row::new()
-                    .spacing(10)
-                    .align_items(Alignment::Center)
-                    .push(Text::new("Out: ").size(13).color(colors::TEXT_DIM))
-                    .push(
-                        nih_widgets::ParamSlider::new(
-                            &mut self.out_gain_slider_state,
-                            &self.params.output_gain,
-                        )
-                        .map(Message::ParamUpdate),
-                    )
-                    .push(Text::new("Auto gain").size(11).color(colors::TEXT_DIM))
-                    .push(
-                        Toggler::new(
-                            self.params.auto_gain.value(),
-                            String::new(),
-                            Message::AutoGainToggled,
-                        )
-                        .size(14),
-                    )
-                    .push(Text::new("Bypass").size(11).color(colors::TEXT_DIM))
-                    .push(
-                        Toggler::new(
-                            self.params.bypass.value(),
-                            String::new(),
-                            Message::BypassToggled,
-                        )
-                        .size(14),
-                    ),
+                nih_widgets::ParamSlider::new(
+                    &mut self.out_gain_slider_state,
+                    &self.params.output_gain,
+                )
+                .width(Length::Units(120))
+                .height(Length::Units(22))
+                .map(Message::ParamUpdate),
+            )
+            .push(Column::new().width(Length::Fill))
+            .push(Text::new("Auto gain").size(11).color(colors::TEXT_DIM))
+            .push(
+                Toggler::new(
+                    self.params.auto_gain.value(),
+                    String::new(),
+                    Message::AutoGainToggled,
+                )
+                .size(14),
+            )
+            .push(Text::new("Bypass").size(11).color(colors::TEXT_DIM))
+            .push(
+                Toggler::new(
+                    self.params.bypass.value(),
+                    String::new(),
+                    Message::BypassToggled,
+                )
+                .size(14),
             );
 
-        let mut bands_col = Column::new().spacing(2);
-
+        // Band strip: one chip per band. Fixed height, so 24 bands cost the
+        // same vertical space as one — the thing the old row list got wrong.
+        let mut strip = Row::new()
+            .height(Length::Units(STRIP_H))
+            .spacing(3)
+            .align_items(Alignment::Center);
+        if num_bands == 0 {
+            strip = strip.push(
+                Text::new("no bands — click the graph to add one")
+                    .size(11)
+                    .color(colors::TEXT_FAINT),
+            );
+        }
         for i in 0..num_bands {
-            let band_color = colors::band_color(i);
+            let bp = &self.params.band_params[i];
+            let enabled = bp.enable.value();
+            let style = ChipStyle {
+                color: colors::band_color(i),
+                selected: selected == i,
+                enabled,
+            };
+            let text_color = if style.selected {
+                Color {
+                    r: 0.06,
+                    g: 0.06,
+                    b: 0.08,
+                    a: 1.0,
+                }
+            } else {
+                Color {
+                    a: if enabled { 0.95 } else { 0.30 },
+                    ..style.color
+                }
+            };
+            // Safety: each index i is visited once per frame
+            let state = unsafe { Self::chip_state(&self.chip_states, i) };
+            strip = strip.push(
+                Button::new(
+                    state,
+                    Text::new(format!("{}", i + 1)).size(11).color(text_color),
+                )
+                .width(Length::Units(CHIP_W))
+                .height(Length::Units(CHIP_H))
+                .padding(0)
+                .style(style)
+                .on_press(Message::SelectBand(i)),
+            );
+        }
+
+        // Selected-band panel. This replaces the per-band rows: whatever the
+        // band count, the editor shows exactly one band's controls, so the
+        // layout never grows past the window.
+        let panel: Element<'_, Message> = if selection::is_none(selected) {
+            Column::new()
+                .height(Length::Units(PANEL_H))
+                .push(
+                    Text::new("Select a band on the graph or in the strip above")
+                        .size(11)
+                        .color(colors::TEXT_FAINT),
+                )
+                .push(
+                    Text::new("click: add · drag: freq/gain · scroll: Q · right-click: delete · double-click: flat")
+                        .size(11)
+                        .color(colors::TEXT_FAINT),
+                )
+                .into()
+        } else {
+            let i = selected;
             let bp = &self.params.band_params[i];
             let ftype = FilterType::from_i32(bp.filter_type.value());
-            let enabled = bp.enable.value();
+            let color = colors::band_color(i);
 
-            // Safety: Each index i is unique in this loop iteration
-            let freq_slider = unsafe {
-                nih_widgets::ParamSlider::new(
-                    Self::slider_state(&self.freq_slider_states, i),
-                    &self.params.band_params[i].freq,
-                )
-                .map(Message::ParamUpdate)
-            };
-
-            let gain_slider = unsafe {
-                nih_widgets::ParamSlider::new(
-                    Self::slider_state(&self.gain_slider_states, i),
-                    &self.params.band_params[i].gain,
-                )
-                .map(Message::ParamUpdate)
-            };
-
-            let q_slider = unsafe {
-                nih_widgets::ParamSlider::new(
-                    Self::slider_state(&self.q_slider_states, i),
-                    &self.params.band_params[i].q,
-                )
-                .map(Message::ParamUpdate)
-            };
-
-            // Safety: Each index i is unique in this loop iteration
+            // Safety: each index i is visited once per frame
             let type_pick = unsafe {
                 PickList::new(
                     Self::pick_state(&self.type_pick_states, i),
@@ -325,63 +494,196 @@ impl IcedEditor for FilterEditor {
                     move |t| Message::TypeChanged(i, t),
                 )
                 .text_size(11)
-                .width(Length::Units(86))
+                .width(Length::Units(96))
             };
-
-            let enable_toggle = Toggler::new(enabled, String::new(), move |on| {
+            let enable_toggle = Toggler::new(bp.enable.value(), String::new(), move |on| {
                 Message::EnableChanged(i, on)
             })
             .size(14);
 
-            let text_color = if enabled {
-                colors::TEXT_DIM
-            } else {
-                colors::TEXT_FAINT
-            };
-
-            let band_row = Row::new()
-                .spacing(8)
+            let readouts = Row::new()
+                .spacing(16)
                 .align_items(Alignment::Center)
-                .push(Text::new(format!("{} ", i + 1)).size(12).color(band_color))
-                .push(type_pick)
-                .push(enable_toggle)
-                .push(freq_slider)
-                .push(gain_slider)
-                .push(q_slider)
-                // Dim the whole row when the band is disabled
-                .push(Column::new().width(Length::Fill))
                 .push(
-                    Text::new(if enabled { "on" } else { "off" })
-                        .size(11)
-                        .color(text_color),
+                    Text::new(selection::format_freq(bp.freq.value()))
+                        .size(12)
+                        .color(colors::TEXT),
+                )
+                .push(
+                    Text::new(selection::format_gain(bp.gain.value()))
+                        .size(12)
+                        .color(colors::TEXT),
+                )
+                .push(
+                    Text::new(selection::format_q(bp.q.value()))
+                        .size(12)
+                        .color(colors::TEXT),
                 );
 
-            bands_col = bands_col.push(band_row);
-        }
+            let top = Row::new()
+                .spacing(10)
+                .align_items(Alignment::Center)
+                .push(Text::new(format!("Band {}", i + 1)).size(12).color(color))
+                .push(type_pick)
+                .push(enable_toggle)
+                .push(Text::new("Enable").size(11).color(colors::TEXT_DIM))
+                .push(Column::new().width(Length::Fill))
+                .push(readouts);
 
-        let peak_db = util::gain_to_db(self.peak_meter.load(std::sync::atomic::Ordering::Relaxed));
+            let freq_slider = unsafe {
+                nih_widgets::ParamSlider::new(
+                    Self::slider_state(&self.freq_slider_states, i),
+                    &self.params.band_params[i].freq,
+                )
+                .width(Length::Fill)
+                .map(Message::ParamUpdate)
+            };
+            let gain_slider = unsafe {
+                nih_widgets::ParamSlider::new(
+                    Self::slider_state(&self.gain_slider_states, i),
+                    &self.params.band_params[i].gain,
+                )
+                .width(Length::Fill)
+                .map(Message::ParamUpdate)
+            };
+            let q_slider = unsafe {
+                nih_widgets::ParamSlider::new(
+                    Self::slider_state(&self.q_slider_states, i),
+                    &self.params.band_params[i].q,
+                )
+                .width(Length::Fill)
+                .map(Message::ParamUpdate)
+            };
+
+            Column::new()
+                .height(Length::Units(PANEL_H))
+                .spacing(4)
+                .push(top)
+                .push(
+                    Row::new()
+                        .spacing(10)
+                        .align_items(Alignment::Center)
+                        .push(freq_slider)
+                        .push(gain_slider)
+                        .push(q_slider),
+                )
+                .into()
+        };
+
+        let peak_db = util::gain_to_db(self.peak_meter.load(Ordering::Relaxed));
+        let footer = Row::new().height(Length::Units(FOOTER_H)).push(
+            Text::new(if peak_db > -60.0 {
+                format!("Peak: {:.1} dB", peak_db)
+            } else {
+                "Peak: -inf dB".to_string()
+            })
+            .size(11)
+            .color(colors::TEXT_DIM),
+        );
 
         let content = Column::new()
-            .spacing(8)
+            .spacing(GAP)
             .push(header)
             .push(self.graph.view())
-            .push(Space::with_height(8.into()))
-            .push(bands_col)
-            .push(Space::with_height(8.into()))
-            .push(
-                Text::new(if peak_db > -60.0 {
-                    format!("Peak: {:.1} dB", peak_db)
-                } else {
-                    "Peak: -inf dB".to_string()
-                })
-                .size(11)
-                .color(colors::TEXT_DIM),
-            );
+            .push(strip)
+            .push(panel)
+            .push(footer);
 
         content.into()
     }
 
     fn background_color(&self) -> nih_plug_iced::Color {
         colors::BG
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{test_params, NullGuiContext};
+
+    fn editor_with(num_bands: usize) -> FilterEditor {
+        let bands: Vec<(f32, f32, f32, FilterType)> = (0..num_bands)
+            .map(|i| {
+                let hz = 40.0 * 1.6f32.powi(i as i32);
+                (hz.min(20_000.0), 3.0, 1.0, FilterType::Bell)
+            })
+            .collect();
+        let params = test_params(&bands);
+        let flags = (
+            params,
+            Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
+            Arc::new(SpectrumRing::new()),
+        );
+        #[allow(clippy::arc_with_non_send_sync)]
+        let ctx: Arc<dyn GuiContext> = Arc::new(NullGuiContext);
+        let (editor, _) = <FilterEditor as IcedEditor>::new(flags, ctx);
+        editor
+    }
+
+    #[test]
+    fn chrome_fits_in_the_window() {
+        // Every region above is given an explicit height, so this sum *is*
+        // the layout height. With the old per-band rows this was unbounded in
+        // the band count; now it is a constant that has to fit.
+        assert!(
+            chrome_height() <= EDITOR_HEIGHT,
+            "chrome is {} px tall but the window is only {} px",
+            chrome_height(),
+            EDITOR_HEIGHT
+        );
+    }
+
+    #[test]
+    fn band_strip_fits_horizontally_at_full_capacity() {
+        let width = MAX_BANDS as u16 * CHIP_W + (MAX_BANDS as u16 - 1) * 3;
+        assert!(
+            width <= EDITOR_WIDTH,
+            "{MAX_BANDS} chips need {width} px but the window is {EDITOR_WIDTH} px wide"
+        );
+    }
+
+    /// The view is a real widget tree; building it exercises the band strip,
+    /// the selected-band panel and the empty state. It cannot check pixels,
+    /// but it is the only thing that runs the editor code at all without a
+    /// window, and it is what catches an out-of-range chip index or a panic in
+    /// the panel path.
+    #[test]
+    fn view_builds_at_every_band_count() {
+        for count in [0, 1, 2, 5, 12, MAX_BANDS] {
+            let mut editor = editor_with(count);
+            let _ = editor.view();
+        }
+    }
+
+    #[test]
+    fn view_builds_with_a_selected_band() {
+        let mut editor = editor_with(3);
+        editor.select(1);
+        let _ = editor.view();
+    }
+
+    /// A selection left over from a larger band count (the "Bands" slider can
+    /// lower it at any time) must not make the panel point past the end.
+    #[test]
+    fn a_stale_selection_is_clamped_to_a_live_band() {
+        let mut editor = editor_with(1);
+        editor.select(9);
+        let _ = editor.view();
+        assert_eq!(editor.selected(1), 0);
+        assert_eq!(editor.selected(0), selection::NONE);
+    }
+
+    #[test]
+    fn select_band_message_ignores_a_dead_index() {
+        // The graph and the "Bands" slider both change the count; a queued
+        // SelectBand for a band that no longer exists must be dropped rather
+        // than select a parameter slot that is not in use.
+        let editor = editor_with(1);
+        editor.select(0);
+        editor.select_if_live(5);
+        assert_eq!(editor.selected(1), 0);
+        editor.select_if_live(0);
+        assert_eq!(editor.selected(1), 0);
     }
 }

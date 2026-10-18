@@ -4,6 +4,7 @@
 //! Interaction:
 //! - click empty graph: create a band at that frequency (0 dB, Bell, enabled)
 //!   and grab it, so the same click-drag also sets its gain
+//! - click a node: select that band — the editor's band panel follows it
 //! - drag a node: frequency (x) and gain (y)
 //! - scroll over a node: Q (Alt = fine)
 //! - double-click a node: gain back to 0 dB
@@ -12,6 +13,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,6 +29,7 @@ use crate::dsp::curve::{
     y_to_db, BandSpec, DB_MAX, FREQ_MAX, FREQ_MIN, GRID_DBS, GRID_FREQS,
 };
 use crate::dsp::spectrum::{SpectrumFrame, BINS};
+use crate::ui::selection;
 use crate::{editor, FilterParams, FilterType, MAX_BANDS};
 
 /// Height of the graph area in points.
@@ -137,6 +140,10 @@ struct GraphProgram {
     /// Last click `(band, instant)` — used to detect a double-click on a node
     /// (reset its gain) without needing iced's event stream to expose one.
     last_click: Cell<Option<(usize, std::time::Instant)>>,
+    /// Selected band, shared with the editor (`selection::NONE` for none).
+    /// An atomic instead of a `Cell` because the editor renders from it too,
+    /// and nih-plug rebuilds the whole widget tree every frame.
+    selected: Arc<AtomicUsize>,
 }
 
 /// Geometry that is only valid for one parameter/bounds state.
@@ -232,6 +239,22 @@ impl GraphProgram {
             self.copy_band(from, to);
         }
         self.set_gesture(&self.params.num_bands, num_active as i32 - 1);
+    }
+
+    /// Selected band, or `None`.
+    fn selected(&self) -> Option<usize> {
+        let sel = self.selected.load(Ordering::Relaxed);
+        if selection::is_none(sel) {
+            None
+        } else {
+            Some(sel)
+        }
+    }
+
+    /// Select a band (or clear the selection with `None`).
+    fn select(&self, band: Option<usize>) {
+        let value = band.unwrap_or(selection::NONE);
+        self.selected.store(value, Ordering::Relaxed);
     }
 
     /// Set a band's Q from a normalized value, as a complete gesture.
@@ -454,6 +477,7 @@ impl GraphProgram {
         bounds: Rectangle,
         hover: Option<usize>,
         dragging: Option<usize>,
+        selected: Option<usize>,
     ) {
         let num_active = self.params.num_bands.value() as usize;
         for i in 0..num_active {
@@ -486,8 +510,25 @@ impl GraphProgram {
             // Inner dot
             frame.fill(&Path::circle(center, inner_radius), Fill::from(color));
 
-            // Frequency + gain readout while dragging
-            if is_drag {
+            // The selected band gets a full-opacity ring so it reads as
+            // "active" from across the room — the panel below edits it.
+            let is_selected = selected == Some(i);
+            if is_selected {
+                frame.stroke(
+                    &Path::circle(center, 9.0),
+                    Stroke::default()
+                        .with_color(Color {
+                            a: 0.95,
+                            r: 1.0,
+                            g: 1.0,
+                            b: 1.0,
+                        })
+                        .with_width(1.5),
+                );
+            }
+
+            // Frequency + gain readout while dragging or while selected
+            if is_drag || is_selected {
                 let label = format!("{:.0} Hz  {:+.1} dB", bp.freq.value(), bp.gain.value());
                 let text_x = (center.x + 10.0).min(bounds.x + bounds.width - 95.0);
                 frame.fill_text(CanvasText {
@@ -532,7 +573,7 @@ impl GraphProgram {
         let mut spectrum_frame = Frame::new(bounds.size());
         self.update_and_draw_spectrum(&mut spectrum_frame, bounds);
         let mut nodes_frame = Frame::new(bounds.size());
-        self.draw_nodes(&mut nodes_frame, bounds, hover, dragging);
+        self.draw_nodes(&mut nodes_frame, bounds, hover, dragging, self.selected());
 
         let cached = cache
             .as_ref()
@@ -557,6 +598,7 @@ impl Graph {
         context: Arc<dyn GuiContext>,
         peak_meter: Arc<AtomicF32>,
         spectrum_ring: Arc<crate::dsp::spectrum::SpectrumRing>,
+        selected: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             // The Cell fields are GUI-thread-only interaction state, but the
@@ -576,6 +618,7 @@ impl Graph {
                 hover: Cell::new(None),
                 fine_scroll: Cell::new(false),
                 last_click: Cell::new(None),
+                selected,
             }),
         }
     }
@@ -638,10 +681,12 @@ impl GraphView {
                         if is_double {
                             let gain = &program.params.band_params[hit.band_index].gain;
                             program.set_plain(gain, 0.0);
+                            program.select(Some(hit.band_index));
                             program.last_click.set(None);
                             return (canvas::event::Status::Captured, None);
                         }
 
+                        program.select(Some(hit.band_index));
                         program.last_click.set(Some((hit.band_index, now)));
                         program.drag.set(Some(DragState {
                             band: hit.band_index,
@@ -657,6 +702,7 @@ impl GraphView {
                         match program.create_band(freq, 0.0) {
                             Some(band) => {
                                 let now = Instant::now();
+                                program.select(Some(band));
                                 program.drag.set(Some(DragState { band }));
                                 program.hover.set(Some(band));
                                 program.last_click.set(Some((band, now)));
@@ -678,6 +724,16 @@ impl GraphView {
                 match nearest_grabbable_node(pos.x, pos.y, &nodes) {
                     Some(hit) => {
                         program.delete_band(hit.band_index);
+                        // Follow the compaction: bands above the deleted one
+                        // slide down a slot, so the selection has to move with
+                        // them or the panel would silently point at its
+                        // neighbour.
+                        let next = selection::after_delete(
+                            program.selected.load(Ordering::Relaxed),
+                            hit.band_index,
+                            num_active - 1,
+                        );
+                        program.selected.store(next, Ordering::Relaxed);
                         program.drag.set(None);
                         program.hover.set(None);
                         program.last_click.set(None);
@@ -823,7 +879,7 @@ mod tests {
 
     use super::*;
     use crate::dsp::spectrum::SpectrumRing;
-    use crate::BandParams;
+    use crate::test_support::{test_params, NullGuiContext};
     use atomic_float::AtomicF32;
     use iced_graphics::Primitive;
     use nih_plug::prelude::util;
@@ -841,34 +897,6 @@ mod tests {
             self.writes.lock().unwrap().clone()
         }
     }
-
-    struct NullGuiContext;
-
-    macro_rules! stub_gui_context {
-        ($ty:ty) => {
-            impl GuiContext for $ty {
-                fn plugin_api(&self) -> PluginApi {
-                    PluginApi::Standalone
-                }
-                fn request_resize(&self) -> bool {
-                    false
-                }
-                unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
-                unsafe fn raw_set_parameter_normalized(&self, _param: ParamPtr, _normalized: f32) {}
-                unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
-                fn get_state(&self) -> PluginState {
-                    PluginState {
-                        version: String::new(),
-                        params: Default::default(),
-                        fields: Default::default(),
-                    }
-                }
-                fn set_state(&self, _state: PluginState) {}
-            }
-        };
-    }
-
-    stub_gui_context!(NullGuiContext);
 
     impl GuiContext for TestGuiContext {
         fn plugin_api(&self) -> PluginApi {
@@ -901,65 +929,6 @@ mod tests {
         }
     }
 
-    /// A band with explicit values. `BandParams::default()` hardcodes 1 kHz /
-    /// 0 dB / Q 1 and the parameter setters are crate-private in nih-plug, so
-    /// tests build params with the values already in place.
-    fn band(freq: f32, gain: f32, q: f32, ftype: FilterType, enabled: bool) -> BandParams {
-        BandParams {
-            freq: FloatParam::new(
-                "Freq",
-                freq,
-                FloatRange::Skewed {
-                    min: 20.0,
-                    max: 20_000.0,
-                    factor: FloatRange::skew_factor(-2.5),
-                },
-            )
-            .with_smoother(SmoothingStyle::Logarithmic(20.0)),
-            gain: FloatParam::new(
-                "Gain",
-                gain,
-                FloatRange::Linear {
-                    min: -24.0,
-                    max: 24.0,
-                },
-            )
-            .with_smoother(SmoothingStyle::Linear(20.0)),
-            q: FloatParam::new(
-                "Q",
-                q,
-                FloatRange::Skewed {
-                    min: 0.1,
-                    max: 20.0,
-                    factor: FloatRange::skew_factor(-1.0),
-                },
-            )
-            .with_smoother(SmoothingStyle::Logarithmic(20.0)),
-            filter_type: IntParam::new("Type", ftype as i32, IntRange::Linear { min: 0, max: 4 }),
-            enable: BoolParam::new("Enable", enabled),
-        }
-    }
-
-    fn test_params(bands: &[(f32, f32, f32, FilterType)]) -> Arc<FilterParams> {
-        let mut band_params: [BandParams; MAX_BANDS] =
-            core::array::from_fn(|_| BandParams::default());
-        for (i, &(freq, gain, q, ftype)) in bands.iter().enumerate() {
-            band_params[i] = band(freq, gain, q, ftype, true);
-        }
-        Arc::new(FilterParams {
-            num_bands: IntParam::new(
-                "Bands",
-                bands.len() as i32,
-                IntRange::Linear {
-                    min: 0,
-                    max: MAX_BANDS as i32,
-                },
-            ),
-            band_params,
-            ..FilterParams::default()
-        })
-    }
-
     #[allow(clippy::arc_with_non_send_sync)] // GUI-thread-only, same contract as Graph::new
     fn test_program_with(params: Arc<FilterParams>, context: Arc<dyn GuiContext>) -> GraphProgram {
         GraphProgram {
@@ -974,6 +943,7 @@ mod tests {
             hover: Cell::new(None),
             fine_scroll: Cell::new(false),
             last_click: Cell::new(None),
+            selected: Arc::new(AtomicUsize::new(selection::NONE)),
         }
     }
 
@@ -1439,5 +1409,144 @@ mod tests {
         }
         json += "  ]\n}\n";
         std::fs::write(path, json).expect("failed to write canvas dump");
+    }
+
+    // ---- selection ------------------------------------------------------
+    //
+    // Selection is shared state between the canvas and the editor, so these
+    // tests assert both halves: that a click moves it, and that deleting a
+    // band moves it to a band that still exists (the compaction hazard).
+
+    fn with_view(bands: &[(f32, f32, f32, FilterType)]) -> (GraphView, Arc<GraphProgram>) {
+        let ctx = Arc::new(NullGuiContext);
+        #[allow(clippy::arc_with_non_send_sync)]
+        let p = Arc::new(test_program_with(test_params(bands), ctx));
+        (GraphView { program: p.clone() }, p)
+    }
+
+    fn node_xy(program: &GraphProgram, band: usize) -> (f32, f32) {
+        let bp = &program.params.band_params[band];
+        let p = to_px(bounds(), bp.freq.value(), bp.gain.value());
+        (p.x, p.y)
+    }
+
+    #[test]
+    fn clicking_a_node_selects_that_band() {
+        let (view, program) = with_view(&[
+            (100.0, 6.0, 1.0, FilterType::Bell),
+            (2_000.0, -4.0, 1.0, FilterType::Bell),
+        ]);
+        assert_eq!(program.selected(), None, "nothing selected initially");
+
+        let (x, y) = node_xy(&program, 1);
+        assert_eq!(
+            click_at(&view, bounds(), x, y, mouse::Button::Left),
+            canvas::event::Status::Captured
+        );
+        assert_eq!(program.selected(), Some(1));
+    }
+
+    #[test]
+    fn creating_a_band_selects_it() {
+        let (view, program) = with_view(&[]);
+        let b = bounds();
+        click_at(
+            &view,
+            b,
+            b.x + freq_to_x(500.0) * b.width,
+            b.y + b.height * 0.5,
+            mouse::Button::Left,
+        );
+        assert_eq!(
+            program.selected(),
+            Some(0),
+            "a band you just created is the one you want to edit"
+        );
+    }
+
+    #[test]
+    fn deleting_a_band_below_the_selection_follows_the_compaction() {
+        let (view, program) = with_view(&[
+            (100.0, 6.0, 1.0, FilterType::Bell),
+            (500.0, 3.0, 1.0, FilterType::Bell),
+            (2_000.0, -4.0, 1.0, FilterType::Bell),
+        ]);
+        program.select(Some(2));
+
+        let (x, y) = node_xy(&program, 0);
+        click_at(&view, bounds(), x, y, mouse::Button::Right);
+
+        assert_eq!(
+            program.selected(),
+            Some(1),
+            "band 2 slid into slot 1, so the selection must follow it down"
+        );
+    }
+
+    #[test]
+    fn deleting_the_selected_band_leaves_a_live_band_selected() {
+        let (view, program) = with_view(&[
+            (100.0, 6.0, 1.0, FilterType::Bell),
+            (2_000.0, -4.0, 1.0, FilterType::Bell),
+        ]);
+        program.select(Some(1));
+
+        let (x, y) = node_xy(&program, 1);
+        click_at(&view, bounds(), x, y, mouse::Button::Right);
+
+        assert_eq!(
+            program.selected(),
+            Some(0),
+            "deleting the last band must fall back to the new last band"
+        );
+        assert!(program.selected().unwrap() < program.params.num_bands.value() as usize);
+    }
+
+    #[test]
+    fn deleting_the_only_band_clears_the_selection() {
+        let (view, program) = with_view(&[(100.0, 6.0, 1.0, FilterType::Bell)]);
+        program.select(Some(0));
+
+        let (x, y) = node_xy(&program, 0);
+        click_at(&view, bounds(), x, y, mouse::Button::Right);
+
+        assert_eq!(program.selected(), None);
+    }
+
+    #[test]
+    fn the_selected_band_shows_its_readout_without_dragging() {
+        let program = test_program(&[(440.0, -3.0, 1.0, FilterType::Bell)]);
+        let plain = program.draw(bounds(), None, None);
+        let mut before = Vec::new();
+        texts(&plain[3].clone().into_primitive(), &mut before);
+        assert!(
+            !before.iter().any(|t| t.contains("440 Hz")),
+            "an unselected node should not label itself: {before:?}"
+        );
+
+        program.select(Some(0));
+        let selected = program.draw(bounds(), None, None);
+        let mut after = Vec::new();
+        texts(&selected[3].clone().into_primitive(), &mut after);
+        assert!(
+            after
+                .iter()
+                .any(|t| t.contains("440 Hz") && t.contains("-3.0 dB")),
+            "the selected node should label itself in the panel's terms: {after:?}"
+        );
+    }
+
+    #[test]
+    fn the_selection_ring_is_drawn_only_for_the_selected_band() {
+        let program = test_program(&[(440.0, 0.0, 1.0, FilterType::Bell)]);
+        let plain = layer_vertices(&program.draw(bounds(), None, None), 3).len();
+
+        program.select(Some(0));
+        let selected = layer_vertices(&program.draw(bounds(), None, None), 3).len();
+
+        assert!(
+            selected > plain,
+            "the selected node should add a ring ({selected} vs {plain} vertices)"
+        );
     }
 }
