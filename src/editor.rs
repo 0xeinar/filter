@@ -83,6 +83,7 @@ struct FilterEditor {
     peak_meter: Arc<AtomicF32>,
     graph: ui::Graph,
     num_bands_slider_state: nih_widgets::param_slider::State,
+    out_gain_slider_state: nih_widgets::param_slider::State,
     // Wrap in UnsafeCell to allow disjoint mutable access by index
     freq_slider_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
     gain_slider_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
@@ -123,6 +124,8 @@ pub enum Message {
     TypeChanged(usize, FilterType),
     /// Band `index` enabled/disabled.
     EnableChanged(usize, bool),
+    BypassToggled(bool),
+    AutoGainToggled(bool),
 }
 
 impl FilterEditor {
@@ -168,6 +171,7 @@ impl IcedEditor for FilterEditor {
             peak_meter,
             graph,
             num_bands_slider_state: Default::default(),
+            out_gain_slider_state: Default::default(),
             freq_slider_states: core::array::from_fn(|_| {
                 std::cell::UnsafeCell::new(Default::default())
             }),
@@ -201,6 +205,20 @@ impl IcedEditor for FilterEditor {
             Message::EnableChanged(index, enabled) => {
                 let _ = self.set_band_enable(index, enabled);
             }
+            Message::BypassToggled(on) => {
+                let param = &self.params.bypass;
+                let setter = ParamSetter::new(self.context.as_ref());
+                setter.begin_set_parameter(param);
+                setter.set_parameter(param, on);
+                setter.end_set_parameter(param);
+            }
+            Message::AutoGainToggled(on) => {
+                let param = &self.params.auto_gain;
+                let setter = ParamSetter::new(self.context.as_ref());
+                setter.begin_set_parameter(param);
+                setter.set_parameter(param, on);
+                setter.end_set_parameter(param);
+            }
         }
         Command::none()
     }
@@ -230,6 +248,38 @@ impl IcedEditor for FilterEditor {
                             &self.params.num_bands,
                         )
                         .map(Message::ParamUpdate),
+                    ),
+            )
+            .push(Space::with_height(4.into()))
+            .push(
+                Row::new()
+                    .spacing(10)
+                    .align_items(Alignment::Center)
+                    .push(Text::new("Out: ").size(13).color(colors::TEXT_DIM))
+                    .push(
+                        nih_widgets::ParamSlider::new(
+                            &mut self.out_gain_slider_state,
+                            &self.params.output_gain,
+                        )
+                        .map(Message::ParamUpdate),
+                    )
+                    .push(Text::new("Auto gain").size(11).color(colors::TEXT_DIM))
+                    .push(
+                        Toggler::new(
+                            self.params.auto_gain.value(),
+                            String::new(),
+                            Message::AutoGainToggled,
+                        )
+                        .size(14),
+                    )
+                    .push(Text::new("Bypass").size(11).color(colors::TEXT_DIM))
+                    .push(
+                        Toggler::new(
+                            self.params.bypass.value(),
+                            String::new(),
+                            Message::BypassToggled,
+                        )
+                        .size(14),
                     ),
             );
 

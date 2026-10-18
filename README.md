@@ -10,6 +10,16 @@ A surgical parametric EQ plugin built in Rust. Inspired by FabFilter Pro-Q — d
 - **Dark themed GUI** — FabFilter-style aesthetic, colored band labels
 - **CLAP + VST3** — works in Ableton, Bitwig, Reaper, FL Studio
 - **Sample-accurate automation**
+- **Output stage** — ±24 dB trim, pink-weighted auto-gain, click-free bypass
+
+### Auto-gain
+
+Auto-gain estimates the level change of the current curve by integrating its
+power response over 20 Hz–20 kHz, weighted uniformly in log frequency (pink
+noise — a reasonable stand-in for music), and applies the inverse as makeup. It
+is a model, not a measurement, so it is accurate to roughly ±1.5 dB on typical
+curves rather than exact; `tests/auto_gain.rs` measures real pink noise through
+the real biquads to keep it honest.
 
 ## Graph interaction
 
@@ -57,11 +67,12 @@ Rescan plugins in your DAW after copying.
 # Run all tests
 cargo test
 
-# 81 tests:
-#   61 unit tests — biquad coefficients, frequency response, stability,
+# 95 tests:
+#   72 unit tests — biquad coefficients, frequency response, stability,
 #                   response-curve math (log mapping, combined EQ response),
 #                   per-channel state independence, and the canvas draw path
 #                   (layers, curve position in pixel space, cache invalidation)
+#    3 loudness tests — auto-gain vs measured pink-noise level change
 #   10 FFT integration tests — sine sweep → spectrum verification
 #    7 property-based fuzz tests — 1000 random parameter combos each
 #    3 null tests — plugin output vs an independent f64 DF-I reference
