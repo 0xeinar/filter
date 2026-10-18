@@ -39,6 +39,13 @@ pub const GRAPH_HEIGHT: f32 = 300.0;
 /// (resets the band's gain to 0 dB).
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
+/// Keyboard nudge steps for the selected band. One press is a semitone or
+/// 0.1 dB; Shift makes it an octave or 1 dB.
+const NUDGE_SEMITONES: f32 = 1.0;
+const NUDGE_COARSE_SEMITONES: f32 = 12.0;
+const NUDGE_DB: f32 = 0.1;
+const NUDGE_COARSE_DB: f32 = 1.0;
+
 /// Collect the current band parameters as pure `BandSpec` values.
 fn band_specs(params: &FilterParams, num_active: usize) -> [BandSpec; MAX_BANDS] {
     core::array::from_fn(|i| {
@@ -255,6 +262,22 @@ impl GraphProgram {
     fn select(&self, band: Option<usize>) {
         let value = band.unwrap_or(selection::NONE);
         self.selected.store(value, Ordering::Relaxed);
+    }
+
+    /// Delete a band and move the selection the way the compaction moved the
+    /// bands.
+    ///
+    /// Both the right-click and the Delete key go through here: a deleted band
+    /// releases its slot, the tail slides down, and a selection above it has to
+    /// follow — otherwise the panel starts silently editing a different band.
+    fn delete_and_follow(&self, band: usize, num_active: usize) {
+        self.delete_band(band);
+        let next = selection::after_delete(
+            self.selected.load(Ordering::Relaxed),
+            band,
+            num_active.saturating_sub(1),
+        );
+        self.selected.store(next, Ordering::Relaxed);
     }
 
     /// Set a band's Q from a normalized value, as a complete gesture.
@@ -643,16 +666,27 @@ impl Graph {
 /// Message type used by the editor.
 use crate::editor::Message;
 
+#[cfg(test)]
+impl Graph {
+    /// The canvas exactly as iced would drive it, so end-to-end tests go
+    /// through the real event handlers instead of a copy of their logic.
+    pub(crate) fn driver(&self) -> GraphView {
+        GraphView {
+            program: self.program.clone(),
+        }
+    }
+}
+
 /// Wrapper implementing Program (forwarded to the shared GraphProgram).
 ///
 /// Rebuilt every frame — all mutable interaction state lives on the
 /// `GraphProgram` behind interior mutability.
-struct GraphView {
+pub(crate) struct GraphView {
     program: Arc<GraphProgram>,
 }
 
 impl GraphView {
-    fn handle_mouse_event(
+    pub(crate) fn handle_mouse_event(
         &self,
         event: mouse::Event,
         bounds: Rectangle,
@@ -723,17 +757,7 @@ impl GraphView {
                 let nodes = node_positions(&program.params, num_active, bounds);
                 match nearest_grabbable_node(pos.x, pos.y, &nodes) {
                     Some(hit) => {
-                        program.delete_band(hit.band_index);
-                        // Follow the compaction: bands above the deleted one
-                        // slide down a slot, so the selection has to move with
-                        // them or the panel would silently point at its
-                        // neighbour.
-                        let next = selection::after_delete(
-                            program.selected.load(Ordering::Relaxed),
-                            hit.band_index,
-                            num_active - 1,
-                        );
-                        program.selected.store(next, Ordering::Relaxed);
+                        program.delete_and_follow(hit.band_index, num_active);
                         program.drag.set(None);
                         program.hover.set(None);
                         program.last_click.set(None);
@@ -810,11 +834,91 @@ impl GraphView {
         }
     }
 
-    fn handle_keyboard_event(&self, event: keyboard::Event) {
-        // Track the Alt modifier for fine scroll steps. The canvas receives
-        // raw keyboard events regardless of focus.
+    /// Handle a key press on the selected band.
+    ///
+    /// | Key | Action |
+    /// |---|---|
+    /// | ← → | Frequency by a semitone (Shift: an octave) |
+    /// | ↑ ↓ | Gain by 0.1 dB (Shift: 1 dB) |
+    /// | Tab / Shift+Tab | Select the next / previous band |
+    /// | Backspace / Delete | Delete the selected band |
+    /// | Esc | Clear the selection |
+    pub(crate) fn handle_keyboard_event(&self, event: keyboard::Event) -> canvas::event::Status {
+        let program = &self.program;
+
+        // The canvas receives raw keyboard events, including modifier changes,
+        // so Alt can gate fine Q scrolling and Shift can change the nudge step.
         if let keyboard::Event::ModifiersChanged(modifiers) = event {
-            self.program.fine_scroll.set(modifiers.alt());
+            program.fine_scroll.set(modifiers.alt());
+            return canvas::event::Status::Ignored;
+        }
+
+        let keyboard::Event::KeyPressed {
+            key_code,
+            modifiers,
+        } = event
+        else {
+            return canvas::event::Status::Ignored;
+        };
+
+        let num_active = program.params.num_bands.value() as usize;
+        let Some(band) = program.selected().filter(|&b| b < num_active) else {
+            return canvas::event::Status::Ignored;
+        };
+
+        use keyboard::KeyCode;
+        match key_code {
+            KeyCode::Left | KeyCode::Right => {
+                let semitones = if modifiers.shift() {
+                    NUDGE_COARSE_SEMITONES
+                } else {
+                    NUDGE_SEMITONES
+                };
+                let factor = 2f32.powf(semitones / 12.0);
+                let param = &program.params.band_params[band].freq;
+                let next = if key_code == KeyCode::Left {
+                    param.value() / factor
+                } else {
+                    param.value() * factor
+                };
+                let next = next.clamp(FREQ_MIN, FREQ_MAX);
+                program.set_gesture(param, next);
+                canvas::event::Status::Captured
+            }
+            KeyCode::Up | KeyCode::Down => {
+                let step = if modifiers.shift() {
+                    NUDGE_COARSE_DB
+                } else {
+                    NUDGE_DB
+                };
+                let delta = if key_code == KeyCode::Up { step } else { -step };
+                let param = &program.params.band_params[band].gain;
+                let next = (param.value() + delta).clamp(-DB_MAX, DB_MAX);
+                program.set_gesture(param, next);
+                canvas::event::Status::Captured
+            }
+            KeyCode::Tab => {
+                let count = num_active.max(1);
+                let next = if modifiers.shift() {
+                    (band + count - 1) % count
+                } else {
+                    (band + 1) % count
+                };
+                program.select(Some(next));
+                canvas::event::Status::Captured
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                program.delete_and_follow(band, num_active);
+                program.drag.set(None);
+                program.hover.set(None);
+                program.last_click.set(None);
+                canvas::event::Status::Captured
+            }
+            KeyCode::Escape => {
+                program.select(None);
+                canvas::event::Status::Captured
+            }
+            _ => canvas::event::Status::Ignored,
         }
     }
 }
@@ -831,8 +935,8 @@ impl Program<Message> for GraphView {
                 self.handle_mouse_event(mouse_event, bounds, cursor)
             }
             canvas::Event::Keyboard(keyboard_event) => {
-                self.handle_keyboard_event(keyboard_event);
-                (canvas::event::Status::Ignored, None)
+                let status = self.handle_keyboard_event(keyboard_event);
+                (status, None)
             }
         }
     }
@@ -1548,5 +1652,178 @@ mod tests {
             selected > plain,
             "the selected node should add a ring ({selected} vs {plain} vertices)"
         );
+    }
+
+    // ---- keyboard -------------------------------------------------------
+
+    fn press(view: &GraphView, key: keyboard::KeyCode) -> canvas::event::Status {
+        press_with(view, key, keyboard::Modifiers::default())
+    }
+
+    fn press_with(
+        view: &GraphView,
+        key: keyboard::KeyCode,
+        modifiers: keyboard::Modifiers,
+    ) -> canvas::event::Status {
+        view.handle_keyboard_event(keyboard::Event::KeyPressed {
+            key_code: key,
+            modifiers,
+        })
+    }
+
+    /// Params + a recording context, with band 0 selected, ready for a key.
+    fn keyboard_fixture(
+        bands: &[(f32, f32, f32, FilterType)],
+    ) -> (GraphView, Arc<GraphProgram>, Arc<TestGuiContext>) {
+        let ctx = Arc::new(TestGuiContext::default());
+        #[allow(clippy::arc_with_non_send_sync)]
+        let p = Arc::new(test_program_with(test_params(bands), ctx.clone()));
+        p.select(Some(0));
+        (GraphView { program: p.clone() }, p, ctx)
+    }
+
+    #[test]
+    fn right_arrow_moves_the_band_up_a_semitone() {
+        let (view, program, ctx) = keyboard_fixture(&[(1_000.0, 0.0, 1.0, FilterType::Bell)]);
+
+        assert_eq!(
+            press(&view, keyboard::KeyCode::Right),
+            canvas::event::Status::Captured
+        );
+
+        let expected = 1_000.0 * 2f32.powf(1.0 / 12.0);
+        let normalized = program.params.band_params[0]
+            .freq
+            .preview_normalized(expected);
+        let writes = ctx.writes();
+        assert_eq!(writes.len(), 1, "one gesture, one write");
+        assert!(
+            (writes[0] - normalized).abs() < 1e-4,
+            "expected {expected:.1} Hz, got normalized {} (want {normalized})",
+            writes[0]
+        );
+    }
+
+    #[test]
+    fn left_arrow_moves_the_band_down_a_semitone() {
+        let (view, program, ctx) = keyboard_fixture(&[(1_000.0, 0.0, 1.0, FilterType::Bell)]);
+
+        press(&view, keyboard::KeyCode::Left);
+
+        let expected = 1_000.0 / 2f32.powf(1.0 / 12.0);
+        let normalized = program.params.band_params[0]
+            .freq
+            .preview_normalized(expected);
+        assert!((ctx.writes()[0] - normalized).abs() < 1e-4);
+    }
+
+    #[test]
+    fn shift_arrow_moves_a_whole_octave() {
+        let (view, program, ctx) = keyboard_fixture(&[(1_000.0, 0.0, 1.0, FilterType::Bell)]);
+
+        press_with(&view, keyboard::KeyCode::Right, keyboard::Modifiers::SHIFT);
+
+        let normalized = program.params.band_params[0]
+            .freq
+            .preview_normalized(2_000.0);
+        assert!((ctx.writes()[0] - normalized).abs() < 1e-4);
+    }
+
+    #[test]
+    fn up_and_down_arrows_nudge_gain_by_a_tenth_of_a_db() {
+        let (view, program, ctx) = keyboard_fixture(&[(1_000.0, 3.0, 1.0, FilterType::Bell)]);
+        let gain = &program.params.band_params[0].gain;
+
+        press(&view, keyboard::KeyCode::Up);
+        assert!((ctx.writes()[0] - gain.preview_normalized(3.1)).abs() < 1e-6);
+
+        // The recording context does not store the value (nih-plug keeps the
+        // parameter setters crate-private), so the next press starts from the
+        // same 3.0 dB. Accumulation across presses is covered by the
+        // end-to-end test, which runs the value through the DSP.
+        press(&view, keyboard::KeyCode::Down);
+        assert!((ctx.writes()[1] - gain.preview_normalized(2.9)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn arrows_are_clamped_to_the_parameter_range() {
+        let (view, program, ctx) = keyboard_fixture(&[(1_000.0, 24.0, 1.0, FilterType::Bell)]);
+
+        press_with(&view, keyboard::KeyCode::Up, keyboard::Modifiers::SHIFT);
+
+        let gain = &program.params.band_params[0].gain;
+        assert!((ctx.writes()[0] - gain.preview_normalized(24.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn arrows_do_nothing_without_a_selection() {
+        let (view, _program, ctx) = keyboard_fixture(&[(1_000.0, 0.0, 1.0, FilterType::Bell)]);
+        // Undo the fixture's selection.
+        view.program.select(None);
+
+        assert_eq!(
+            press(&view, keyboard::KeyCode::Right),
+            canvas::event::Status::Ignored
+        );
+        assert!(ctx.writes().is_empty(), "no selection, no writes");
+    }
+
+    #[test]
+    fn tab_and_shift_tab_cycle_the_selection() {
+        let (view, program, _ctx) = keyboard_fixture(&[
+            (100.0, 0.0, 1.0, FilterType::Bell),
+            (1_000.0, 0.0, 1.0, FilterType::Bell),
+            (5_000.0, 0.0, 1.0, FilterType::Bell),
+        ]);
+
+        press(&view, keyboard::KeyCode::Tab);
+        assert_eq!(program.selected(), Some(1));
+        press(&view, keyboard::KeyCode::Tab);
+        assert_eq!(program.selected(), Some(2));
+        press(&view, keyboard::KeyCode::Tab);
+        assert_eq!(program.selected(), Some(0), "wraps to the first band");
+        press_with(&view, keyboard::KeyCode::Tab, keyboard::Modifiers::SHIFT);
+        assert_eq!(program.selected(), Some(2), "wraps backwards");
+    }
+
+    #[test]
+    fn delete_removes_the_selected_band_and_moves_the_selection() {
+        let (view, program, ctx) = keyboard_fixture(&[
+            (100.0, 0.0, 1.0, FilterType::Bell),
+            (1_000.0, 0.0, 1.0, FilterType::Bell),
+        ]);
+        program.select(Some(1));
+
+        assert_eq!(
+            press(&view, keyboard::KeyCode::Delete),
+            canvas::event::Status::Captured
+        );
+
+        let writes = ctx.writes();
+        assert!(
+            (writes.last().copied().unwrap() - 1.0 / MAX_BANDS as f32).abs() < 1e-6,
+            "the band count should be lowered to 1, got {writes:?}"
+        );
+        assert_eq!(program.selected(), Some(0));
+    }
+
+    #[test]
+    fn backspace_deletes_like_delete() {
+        let (view, program, ctx) = keyboard_fixture(&[(100.0, 0.0, 1.0, FilterType::Bell)]);
+
+        press(&view, keyboard::KeyCode::Backspace);
+
+        assert_eq!(ctx.writes(), vec![0.0], "the count must drop to 0");
+        assert_eq!(program.selected(), None);
+    }
+
+    #[test]
+    fn escape_clears_the_selection() {
+        let (view, program, _ctx) = keyboard_fixture(&[(100.0, 0.0, 1.0, FilterType::Bell)]);
+        assert_eq!(program.selected(), Some(0));
+
+        press(&view, keyboard::KeyCode::Escape);
+
+        assert_eq!(program.selected(), None);
     }
 }
