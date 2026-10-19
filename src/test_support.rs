@@ -132,6 +132,16 @@ pub fn band_with_slope(
 /// Params holding `bands` (all enabled) with the band count already set to
 /// their number.
 pub fn test_params(bands: &[(f32, f32, f32, FilterType)]) -> Arc<FilterParams> {
+    test_params_with_post_spectrum(bands, true)
+}
+
+/// As `test_params`, with the post-EQ spectrum overlay set to `post_spectrum`.
+/// Used to prove the overlay layer really is gated on the parameter rather than
+/// always drawn.
+pub fn test_params_with_post_spectrum(
+    bands: &[(f32, f32, f32, FilterType)],
+    post_spectrum: bool,
+) -> Arc<FilterParams> {
     let mut band_params: [BandParams; MAX_BANDS] = core::array::from_fn(|_| BandParams::default());
     for (i, &(freq, gain, q, ftype)) in bands.iter().enumerate() {
         band_params[i] = band(freq, gain, q, ftype, true);
@@ -146,6 +156,7 @@ pub fn test_params(bands: &[(f32, f32, f32, FilterType)]) -> Arc<FilterParams> {
             },
         ),
         band_params,
+        spectrum_post: BoolParam::new("Output Spectrum", post_spectrum),
         ..FilterParams::default()
     })
 }

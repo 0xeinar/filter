@@ -30,10 +30,12 @@ pub struct Filter {
     /// continue the other's filter memory.
     band_states: [[[dsp::BiquadState; dsp::biquad::MAX_SECTIONS]; MAX_BANDS]; MAX_CHANNELS],
     sample_rate: f32,
-    /// Shared with the GUI for the spectrum display
-    spectrum_ring: Arc<dsp::spectrum::SpectrumRing>,
-    /// Audio-thread-only FFT analyzer (None until initialize)
-    spectrum_analyzer: Option<dsp::spectrum::SpectrumAnalyzer>,
+    /// Shared with the GUI: the pre-EQ and post-EQ analyzer rings.
+    spectrum_taps: Arc<dsp::spectrum::SpectrumTaps>,
+    /// Audio-thread-only FFT analyzers (None until initialize). One per tap —
+    /// each owns its own window buffer, so they must not share state.
+    spectrum_analyzer_in: Option<dsp::spectrum::SpectrumAnalyzer>,
+    spectrum_analyzer_out: Option<dsp::spectrum::SpectrumAnalyzer>,
     /// Audio-thread snapshots of band type/enable for the current block.
     band_types: [FilterType; MAX_BANDS],
     band_slopes: [u32; MAX_BANDS],
@@ -119,6 +121,12 @@ pub struct FilterParams {
     /// un-bypassing is seamless.
     #[id = "bypass"]
     pub bypass: BoolParam,
+
+    /// Draw the post-EQ spectrum over the input one. Off is the "did I change
+    /// anything?" question answered by eyes instead of memory, so it defaults
+    /// on; the cost is one extra analyzer, and only while the editor is open.
+    #[id = "spectrum-post"]
+    pub spectrum_post: BoolParam,
 
     #[nested(array, group = "Bands")]
     pub band_params: [BandParams; MAX_BANDS],
@@ -377,8 +385,9 @@ impl Default for Filter {
                 core::array::from_fn(|_| core::array::from_fn(|_| dsp::BiquadState::default()))
             }),
             sample_rate: 44100.0,
-            spectrum_ring: Arc::new(dsp::spectrum::SpectrumRing::new()),
-            spectrum_analyzer: None,
+            spectrum_taps: Arc::new(dsp::spectrum::SpectrumTaps::new()),
+            spectrum_analyzer_in: None,
+            spectrum_analyzer_out: None,
             band_types: [FilterType::Bell; MAX_BANDS],
             band_slopes: [12; MAX_BANDS],
             band_enabled: [false; MAX_BANDS],
@@ -423,6 +432,8 @@ impl Default for FilterParams {
             auto_gain: BoolParam::new("Auto Gain", false),
             bypass: BoolParam::new("Bypass", false),
 
+            spectrum_post: BoolParam::new("Output Spectrum", true),
+
             band_params: core::array::from_fn(|_| BandParams::default()),
         }
     }
@@ -460,7 +471,7 @@ impl Plugin for Filter {
         editor::create(
             self.params.clone(),
             self.peak_meter.clone(),
-            self.spectrum_ring.clone(),
+            self.spectrum_taps.clone(),
             self.params.editor_state.clone(),
         )
     }
@@ -482,7 +493,8 @@ impl Plugin for Filter {
         self.bypass_mix
             .reset(if self.params.bypass.value() { 1.0 } else { 0.0 });
         self.comp_dirty = true;
-        self.spectrum_analyzer = Some(dsp::spectrum::SpectrumAnalyzer::new(self.sample_rate));
+        self.spectrum_analyzer_in = Some(dsp::spectrum::SpectrumAnalyzer::new(self.sample_rate));
+        self.spectrum_analyzer_out = Some(dsp::spectrum::SpectrumAnalyzer::new(self.sample_rate));
         true
     }
 
@@ -494,18 +506,21 @@ impl Plugin for Filter {
     ) -> ProcessStatus {
         let num_active = self.params.num_bands.value() as usize;
 
-        // Spectrum analysis runs on the INPUT signal. We sum channels to mono
-        // into the analyzer's internal scratch via per-block chunked feeding.
+        // Spectrum analysis runs on the INPUT signal, before any band touches
+        // the buffer. Channel 0 only (the earlier code averaged L/R; for a
+        // log-frequency display the difference is below the pixel grid).
         // Editor-open check: skip the FFT entirely when the GUI is closed.
-        if self.params.editor_state.is_open() {
-            if let (Some(analyzer), Some(first_channel)) =
-                (self.spectrum_analyzer.as_mut(), buffer.as_slice().first())
-            {
+        let editor_open = self.params.editor_state.is_open();
+        if editor_open {
+            if let (Some(analyzer), Some(first_channel)) = (
+                self.spectrum_analyzer_in.as_mut(),
+                buffer.as_slice().first(),
+            ) {
                 // Safety: nih-plug guarantees the buffer callback runs on the
                 // audio thread with no allocator use in our code below.
                 // as_slice borrows for this block only.
                 let samples: &[f32] = first_channel;
-                analyzer.push_block(&self.spectrum_ring, samples);
+                analyzer.push_block(&self.spectrum_taps.input, samples);
             }
         }
 
@@ -734,6 +749,28 @@ impl Plugin for Filter {
                         }
                     }
                 }
+            }
+        }
+
+        // Post-EQ tap. The buffer now holds the fully processed signal — every
+        // band, the output trim and the bypass crossfade — which is exactly
+        // what the overlay must show. It runs once per host block rather than
+        // per sub-block so the analyzer sees an evenly spaced sample stream;
+        // feeding per sub-block would run the FFT up to eight times as often
+        // for the same window.
+        //
+        // Deliberately still fed when the overlay is switched off: skipping it
+        // would freeze the analyzer mid-window and splice pre-toggle samples
+        // onto post-toggle ones, so re-enabling would flash a bogus frame. The
+        // second analyzer measures 0.22% of a core (benches/hotpath_bench.rs),
+        // which is not worth a visible artifact.
+        if editor_open {
+            if let (Some(analyzer), Some(first_channel)) = (
+                self.spectrum_analyzer_out.as_mut(),
+                buffer.as_slice().first(),
+            ) {
+                let samples: &[f32] = first_channel;
+                analyzer.push_block(&self.spectrum_taps.output, samples);
             }
         }
 

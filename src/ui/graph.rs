@@ -28,7 +28,7 @@ use crate::dsp::curve::{
     band_response_db, db_to_y, freq_to_x, nearest_grabbable_node, px_to_freq, scroll_q_step,
     y_to_db, BandSpec, DB_MAX, FREQ_MAX, FREQ_MIN, GRID_DBS, GRID_FREQS,
 };
-use crate::dsp::spectrum::{SpectrumFrame, BINS};
+use crate::dsp::spectrum::{SpectrumFrame, SpectrumRing, BINS};
 use crate::ui::selection;
 use crate::{editor, FilterParams, FilterType, MAX_BANDS};
 
@@ -57,16 +57,21 @@ fn band_specs(params: &FilterParams, num_active: usize) -> [BandSpec; MAX_BANDS]
 /// x position (0..1) of each spectrum bin's upper edge, precomputed once.
 /// Depends only on the FFT bin → frequency mapping, which is fixed.
 fn spectrum_bin_x() -> Vec<f32> {
-    let first_bin = 1.0f32;
-    let last_bin_f = (crate::dsp::spectrum::FFT_SIZE / 2 - 1) as f32;
-    let decades = (last_bin_f / first_bin).log10();
     (0..BINS)
-        .map(|i| {
-            let edge_bin = (first_bin * 10f32.powf(decades * (i + 1) as f32 / BINS as f32)).round();
-            let edge_hz = edge_bin * 48_000.0 / crate::dsp::spectrum::FFT_SIZE as f32;
-            freq_to_x(edge_hz.min(FREQ_MAX))
-        })
+        .map(|i| freq_to_x(crate::dsp::spectrum::bin_edge_hz(i).min(FREQ_MAX)))
         .collect()
+}
+
+/// dB floor of the spectrum display. Analyser output spans -96..12 dB; the
+/// graph maps -90 dB to the bottom edge and 0 dB to three quarters height,
+/// clamped outside that so a clipped or silent signal cannot draw off-canvas.
+const SPECTRUM_FLOOR_DB: f32 = -90.0;
+
+/// Map an analyzer dB value to a canvas y coordinate (shared by both taps so
+/// the two curves stay directly comparable).
+fn spectrum_y(bounds: Rectangle, db: f32) -> f32 {
+    let y01 = ((db - SPECTRUM_FLOOR_DB) / -SPECTRUM_FLOOR_DB).clamp(0.0, 1.0) * 0.75;
+    bounds.y + bounds.height * (1.0 - y01)
 }
 
 /// Map a frequency + gain to pixel coordinates within bounds.
@@ -121,10 +126,13 @@ struct GraphProgram {
     params: Arc<FilterParams>,
     context: Arc<dyn GuiContext>,
     _peak_meter: Arc<AtomicF32>,
-    spectrum_ring: Arc<crate::dsp::spectrum::SpectrumRing>,
-    /// Visually-smoothed spectrum bars, shared lock-free (GUI thread writes,
-    /// same thread reads; atomic to satisfy Send+Sync on the Arc).
-    smoothed: Vec<AtomicF32>,
+    /// Both analyzer taps: input (pre-EQ) and output (post-EQ).
+    taps: Arc<crate::dsp::spectrum::SpectrumTaps>,
+    /// Visually-smoothed spectrum bars, one vector per tap, shared lock-free
+    /// (GUI thread writes, same thread reads; atomic to satisfy Send+Sync on
+    /// the Arc).
+    smoothed_in: Vec<AtomicF32>,
+    smoothed_out: Vec<AtomicF32>,
     /// Precomputed x position (0..1 across the graph) for every spectrum bin.
     /// The bin → frequency mapping never changes, so this saves a `powf` and a
     /// `log10` per bin per frame — 192 of them at 60 fps.
@@ -359,34 +367,17 @@ impl GraphProgram {
     }
 
     /// Update the smoothed spectrum from the ring and draw it as a filled
-    /// area along the bottom of the graph. dB range: -90..0 mapped to
-    /// graph height fraction 0..0.75 (0 dB at 3/4 height, linear in dB).
-    fn update_and_draw_spectrum(&self, frame: &mut Frame, bounds: Rectangle) {
-        let latest: SpectrumFrame = self.spectrum_ring.read_newest();
+    /// area along the bottom of the graph (the INPUT signal).
+    fn draw_input_spectrum(&self, frame: &mut Frame, bounds: Rectangle) {
+        let mut db = [0.0f32; BINS];
+        self.smooth_spectrum(&self.taps.input, &self.smoothed_in, &mut db);
 
-        // Rise fast, fall slow (classic analyzer ballistics)
-        const RISE: f32 = 0.55;
-        const FALL: f32 = 0.08;
         let mut path_pts: Vec<Point> = Vec::with_capacity(BINS + 2);
-
-        // Map: bin i → precomputed x position (log, same as curve); dB → y
-        // with -90 dB at the bottom and 0 dB at 3/4 height. Values above 0 dB
-        // clamp.
-        let db_floor = -90.0f32;
         path_pts.push(Point::new(bounds.x, bounds.y + bounds.height));
-        for (i, slot) in self.smoothed.iter().enumerate() {
-            let cur = slot.load(std::sync::atomic::Ordering::Relaxed);
-            let target = latest.db[i];
-            let k = if target > cur { RISE } else { FALL };
-            let next = cur + (target - cur) * k;
-            slot.store(next, std::sync::atomic::Ordering::Relaxed);
-
-            let y01 = ((next - db_floor) / (0.0 - db_floor)).clamp(0.0, 1.0) * 0.75;
+        for (i, &value) in db.iter().enumerate() {
             let x = bounds.x + self.spec_x[i] * bounds.width;
-            let y = bounds.y + bounds.height * (1.0 - y01);
-            path_pts.push(Point::new(x, y));
+            path_pts.push(Point::new(x, spectrum_y(bounds, value)));
         }
-
         // Close down to the bottom-right corner; the bottom-left corner is the
         // first point.
         path_pts.push(Point::new(
@@ -415,6 +406,57 @@ impl GraphProgram {
                 .with_color(Color::from_rgba(0.35, 0.85, 0.6, 0.25))
                 .with_width(1.0),
         );
+    }
+
+    /// The post-EQ spectrum (what leaves the plugin), drawn as a line over the
+    /// input's filled area.
+    ///
+    /// A line, not a second filled area: two translucent fills overlapping
+    /// would read as a third colour wherever the curves cross, and the useful
+    /// information is the *gap* between them. A green fill plus an amber line
+    /// answers "what did the EQ do" at a glance.
+    fn draw_output_spectrum(&self, frame: &mut Frame, bounds: Rectangle) {
+        let mut db = [0.0f32; BINS];
+        self.smooth_spectrum(&self.taps.output, &self.smoothed_out, &mut db);
+
+        let line = Path::new(|p| {
+            for (i, &value) in db.iter().enumerate() {
+                let pt = Point::new(
+                    bounds.x + self.spec_x[i] * bounds.width,
+                    spectrum_y(bounds, value),
+                );
+                if i == 0 {
+                    p.move_to(pt);
+                } else {
+                    p.line_to(pt);
+                }
+            }
+        });
+        frame.stroke(
+            &line,
+            Stroke::default()
+                .with_color(Color::from_rgba(1.0, 0.72, 0.35, 0.85))
+                .with_width(1.5),
+        );
+    }
+
+    /// Advance one analyzer's ballistics and return the smoothed dB values.
+    ///
+    /// Rise fast, fall slow — the classic analyzer response. Smoothing lives
+    /// here rather than in the analyzer so the audio thread never holds display
+    /// state and the two taps can decay independently.
+    fn smooth_spectrum(&self, ring: &SpectrumRing, smoothed: &[AtomicF32], out: &mut [f32; BINS]) {
+        const RISE: f32 = 0.55;
+        const FALL: f32 = 0.08;
+        let latest: SpectrumFrame = ring.read_newest();
+        for (i, slot) in smoothed.iter().enumerate() {
+            let cur = slot.load(std::sync::atomic::Ordering::Relaxed);
+            let target = latest.db[i];
+            let k = if target > cur { RISE } else { FALL };
+            let next = cur + (target - cur) * k;
+            slot.store(next, std::sync::atomic::Ordering::Relaxed);
+            out[i] = next;
+        }
     }
 
     fn draw_curve(&self, frame: &mut Frame, bounds: Rectangle) {
@@ -596,8 +638,12 @@ impl GraphProgram {
         }
 
         // The spectrum moves continuously; the nodes move while dragging.
-        let mut spectrum_frame = Frame::new(bounds.size());
-        self.update_and_draw_spectrum(&mut spectrum_frame, bounds);
+        let mut input_frame = Frame::new(bounds.size());
+        self.draw_input_spectrum(&mut input_frame, bounds);
+        let mut output_frame = Frame::new(bounds.size());
+        if self.params.spectrum_post.value() {
+            self.draw_output_spectrum(&mut output_frame, bounds);
+        }
         let mut nodes_frame = Frame::new(bounds.size());
         self.draw_nodes(&mut nodes_frame, bounds, hover, dragging, self.selected());
 
@@ -606,7 +652,8 @@ impl GraphProgram {
             .expect("cache was just populated in this same call");
         vec![
             cached.grid.clone(),
-            spectrum_frame.into_geometry(),
+            input_frame.into_geometry(),
+            output_frame.into_geometry(),
             cached.curves.clone(),
             nodes_frame.into_geometry(),
         ]
@@ -623,7 +670,7 @@ impl Graph {
         params: Arc<FilterParams>,
         context: Arc<dyn GuiContext>,
         peak_meter: Arc<AtomicF32>,
-        spectrum_ring: Arc<crate::dsp::spectrum::SpectrumRing>,
+        taps: Arc<crate::dsp::spectrum::SpectrumTaps>,
         selected: Arc<AtomicUsize>,
     ) -> Self {
         Self {
@@ -636,8 +683,9 @@ impl Graph {
                 params,
                 context,
                 _peak_meter: peak_meter,
-                spectrum_ring,
-                smoothed: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
+                taps,
+                smoothed_in: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
+                smoothed_out: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
                 spec_x: spectrum_bin_x(),
                 cache: RefCell::new(None),
                 drag: Cell::new(None),
@@ -1001,12 +1049,23 @@ mod tests {
     //! cache is a test failure rather than something only an eyeball would catch.
 
     use super::*;
-    use crate::dsp::spectrum::SpectrumRing;
-    use crate::test_support::{test_params, NullGuiContext, RecordingGuiContext};
+    use crate::dsp::spectrum::SpectrumTaps;
+    use crate::test_support::{
+        test_params, test_params_with_post_spectrum, NullGuiContext, RecordingGuiContext,
+    };
     use atomic_float::AtomicF32;
     use iced_graphics::Primitive;
     use nih_plug::prelude::util;
     use nih_plug::prelude::Param;
+
+    // Layer indices, named. `draw()` returns one geometry per layer in render
+    // order; a bare integer here once broke three tests when a layer was
+    // inserted, so the indices are spelled out in exactly one place.
+    const GRID: usize = 0;
+    const INPUT_SPECTRUM: usize = 1;
+    const OUTPUT_SPECTRUM: usize = 2;
+    const CURVES: usize = 3;
+    const NODES: usize = 4;
 
     fn bounds() -> Rectangle {
         Rectangle {
@@ -1019,12 +1078,22 @@ mod tests {
 
     #[allow(clippy::arc_with_non_send_sync)] // GUI-thread-only, same contract as Graph::new
     fn test_program_with(params: Arc<FilterParams>, context: Arc<dyn GuiContext>) -> GraphProgram {
+        test_program_with_taps(params, context, Arc::new(SpectrumTaps::new()))
+    }
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn test_program_with_taps(
+        params: Arc<FilterParams>,
+        context: Arc<dyn GuiContext>,
+        taps: Arc<SpectrumTaps>,
+    ) -> GraphProgram {
         GraphProgram {
             params,
             context,
             _peak_meter: Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
-            spectrum_ring: Arc::new(SpectrumRing::new()),
-            smoothed: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
+            taps,
+            smoothed_in: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
+            smoothed_out: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
             spec_x: spectrum_bin_x(),
             cache: RefCell::new(None),
             drag: Cell::new(None),
@@ -1131,8 +1200,9 @@ mod tests {
         let program = test_program(&[(1_000.0, 12.0, 1.0, FilterType::Bell)]);
         let layers = program.draw(bounds(), None, None);
 
-        // Grid | spectrum | curves | nodes — the order the renderer composites.
-        assert_eq!(layers.len(), 4, "expected four canvas layers");
+        // Grid | input spectrum | output spectrum | curves | nodes — the order
+        // the renderer composites.
+        assert_eq!(layers.len(), 5, "expected five canvas layers");
 
         let mut labels = Vec::new();
         texts(&layers[0].clone().into_primitive(), &mut labels);
@@ -1147,19 +1217,23 @@ mod tests {
         // nothing, so grid lines silently disappeared while their labels kept
         // drawing. The grid layer must contain mesh geometry, not just text.
         assert!(
-            !layer_vertices(&layers, 0).is_empty(),
+            !layer_vertices(&layers, GRID).is_empty(),
             "grid layer has text but no mesh — grid lines are not being drawn"
         );
         assert!(
-            !layer_vertices(&layers, 1).is_empty(),
-            "spectrum layer has no geometry"
+            !layer_vertices(&layers, INPUT_SPECTRUM).is_empty(),
+            "input spectrum layer has no geometry"
         );
         assert!(
-            !layer_vertices(&layers, 2).is_empty(),
+            !layer_vertices(&layers, OUTPUT_SPECTRUM).is_empty(),
+            "output spectrum layer has no geometry"
+        );
+        assert!(
+            !layer_vertices(&layers, CURVES).is_empty(),
             "curve layer has no geometry"
         );
         assert!(
-            !layer_vertices(&layers, 3).is_empty(),
+            !layer_vertices(&layers, NODES).is_empty(),
             "node layer has no geometry for an enabled band"
         );
     }
@@ -1169,8 +1243,94 @@ mod tests {
         let program = test_program(&[]);
         let layers = program.draw(bounds(), None, None);
         assert!(
-            layer_vertices(&layers, 3).is_empty(),
+            layer_vertices(&layers, NODES).is_empty(),
             "no bands should draw no nodes"
+        );
+    }
+
+    /// A synthetic frame, as the analyzer would publish it.
+    fn frame_with(db: &[f32; BINS], seq: u64) -> SpectrumFrame {
+        let mut f = SpectrumFrame::silent();
+        f.db = *db;
+        f.seq = seq;
+        f
+    }
+
+    /// A flat synthetic frame at `db`.
+    fn frame(db: f32, seq: u64) -> SpectrumFrame {
+        frame_with(&[db; BINS], seq)
+    }
+
+    /// Topmost vertex of a layer — for a flat spectrum that is where the
+    /// curve was drawn.
+    fn top_y(layers: &[Geometry], index: usize) -> f32 {
+        layer_vertices(layers, index)
+            .iter()
+            .map(|v| v[1])
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    #[test]
+    fn input_and_output_overlays_follow_their_own_taps() {
+        let b = bounds();
+        let taps = Arc::new(SpectrumTaps::new());
+        // A flat 0 dB input with a 20 dB-quieter output: a broadband cut.
+        taps.input.publish(frame(0.0, 1));
+        taps.output.publish(frame(-20.0, 1));
+
+        let program =
+            test_program_with_taps(test_params(&[]), Arc::new(NullGuiContext), taps.clone());
+
+        // The ballistics need several frames to converge (rise is 0.55/frame),
+        // so draw a handful before measuring.
+        let mut layers = program.draw(b, None, None);
+        for _ in 0..40 {
+            layers = program.draw(b, None, None);
+        }
+
+        let input_y = top_y(&layers, INPUT_SPECTRUM);
+        let output_y = top_y(&layers, OUTPUT_SPECTRUM);
+
+        // y grows downward: the quieter output must sit below the input.
+        assert!(
+            output_y > input_y + 5.0,
+            "output overlay is not below the input overlay \
+             (input y {input_y:.1}, output y {output_y:.1})"
+        );
+        // And each must land where the dB→y mapping says, not merely in the
+        // right order — this catches both curves being drawn from one tap.
+        assert!(
+            (input_y - spectrum_y(b, 0.0)).abs() < 2.0,
+            "input overlay is at y {input_y:.1}, expected {:.1}",
+            spectrum_y(b, 0.0)
+        );
+        assert!(
+            (output_y - spectrum_y(b, -20.0)).abs() < 2.0,
+            "output overlay is at y {output_y:.1}, expected {:.1}",
+            spectrum_y(b, -20.0)
+        );
+    }
+
+    #[test]
+    fn output_overlay_is_gated_by_its_parameter() {
+        let b = bounds();
+        let taps = Arc::new(SpectrumTaps::new());
+        taps.input.publish(frame(0.0, 1));
+        taps.output.publish(frame(-12.0, 1));
+        let params = test_params_with_post_spectrum(&[], false);
+        let program = test_program_with_taps(params, Arc::new(NullGuiContext), taps);
+        let layers = program.draw(b, None, None);
+
+        // The layer stays in the list (indices are a render order contract)
+        // but must be empty when the overlay is off.
+        assert_eq!(layers.len(), 5);
+        assert!(
+            layer_vertices(&layers, OUTPUT_SPECTRUM).is_empty(),
+            "output overlay was drawn although the parameter is off"
+        );
+        assert!(
+            !layer_vertices(&layers, INPUT_SPECTRUM).is_empty(),
+            "the input spectrum must keep drawing when the overlay is off"
         );
     }
 
@@ -1182,7 +1342,7 @@ mod tests {
         let program = test_program(&[(1_000.0, 12.0, 1.0, FilterType::Bell)]);
         let b = bounds();
         let layers = program.draw(b, None, None);
-        let verts = layer_vertices(&layers, 2);
+        let verts = layer_vertices(&layers, CURVES);
 
         let expected_x = b.x + freq_to_x(1_000.0) * b.width;
         let expected_y = b.y + db_to_y(12.0) * b.height;
@@ -1208,14 +1368,14 @@ mod tests {
 
         // Two draws with unchanged params must reuse the cached layers and
         // produce byte-identical geometry.
-        let first = layer_vertices(&program.draw(b, None, None), 2);
-        let second = layer_vertices(&program.draw(b, None, None), 2);
+        let first = layer_vertices(&program.draw(b, None, None), CURVES);
+        let second = layer_vertices(&program.draw(b, None, None), CURVES);
         assert_eq!(first, second, "unchanged params must redraw identically");
 
         // A different gain has to produce a different curve: if the cache key
         // ever stops covering the band values, this is what fails.
         let flipped = test_program(&[(1_000.0, -12.0, 1.0, FilterType::Bell)]);
-        let third = layer_vertices(&flipped.draw(b, None, None), 2);
+        let third = layer_vertices(&flipped.draw(b, None, None), CURVES);
         assert_ne!(
             first, third,
             "curve layer does not respond to the band gain"
@@ -1458,20 +1618,51 @@ mod tests {
         assert!(ctx.writes().is_empty(), "nothing may be written when full");
     }
 
-    /// Not an assertion — dumps the four layers as JSON for visual inspection
+    /// Not an assertion — dumps the layers as JSON for visual inspection
     /// (`FILTER_CANVAS_DUMP=/tmp/layers.json cargo test -- --nocapture`).
     #[test]
     fn dump_layers_for_visual_inspection() {
         let Some(path) = std::env::var_os("FILTER_CANVAS_DUMP") else {
             return;
         };
-        let program = test_program(&[
+        let bands = [
             (100.0, 4.0, 1.0, FilterType::LowShelf),
             (1_000.0, 12.0, 1.6, FilterType::Bell),
             (6_000.0, -8.0, 2.0, FilterType::Bell),
-        ]);
+        ];
+        let params = test_params(&bands);
+
+        // Give both taps a plausible signal so the dump shows what the overlay
+        // looks like: a pink-ish input, and the same signal with this curve
+        // applied. Sine-free and deterministic, so the dump is diffable.
+        let taps = Arc::new(SpectrumTaps::new());
+        let specs = band_specs(&params, bands.len());
+        let mut input = [0.0f32; BINS];
+        let mut output = [0.0f32; BINS];
+        for i in 0..BINS {
+            // Same band→frequency mapping the canvas uses to place the bar, so
+            // the dump's geometry is self-consistent (and measurable).
+            let freq = crate::dsp::spectrum::bin_edge_hz(i);
+            let level = -18.0 - 12.0 * (i as f32 / BINS as f32);
+            input[i] = level;
+            let delta: f32 = specs
+                .iter()
+                .take(bands.len())
+                .map(|s| band_response_db(s, freq))
+                .sum();
+            output[i] = level + delta;
+        }
+        taps.input.publish(frame_with(&input, 1));
+        taps.output.publish(frame_with(&output, 1));
+
+        let program = test_program_with_taps(params, Arc::new(NullGuiContext), taps);
         let b = bounds();
-        let layers = program.draw(b, None, None);
+        // Let the ballistics settle before dumping, otherwise the dump shows
+        // curves on their way up from the floor.
+        let mut layers = program.draw(b, None, None);
+        for _ in 0..40 {
+            layers = program.draw(b, None, None);
+        }
 
         let mut json = String::from("{\n");
         json += &format!(
@@ -1633,7 +1824,7 @@ mod tests {
         let program = test_program(&[(440.0, -3.0, 1.0, FilterType::Bell)]);
         let plain = program.draw(bounds(), None, None);
         let mut before = Vec::new();
-        texts(&plain[3].clone().into_primitive(), &mut before);
+        texts(&plain[NODES].clone().into_primitive(), &mut before);
         assert!(
             !before.iter().any(|t| t.contains("440 Hz")),
             "an unselected node should not label itself: {before:?}"
@@ -1642,7 +1833,7 @@ mod tests {
         program.select(Some(0));
         let selected = program.draw(bounds(), None, None);
         let mut after = Vec::new();
-        texts(&selected[3].clone().into_primitive(), &mut after);
+        texts(&selected[NODES].clone().into_primitive(), &mut after);
         assert!(
             after
                 .iter()
@@ -1654,10 +1845,10 @@ mod tests {
     #[test]
     fn the_selection_ring_is_drawn_only_for_the_selected_band() {
         let program = test_program(&[(440.0, 0.0, 1.0, FilterType::Bell)]);
-        let plain = layer_vertices(&program.draw(bounds(), None, None), 3).len();
+        let plain = layer_vertices(&program.draw(bounds(), None, None), NODES).len();
 
         program.select(Some(0));
-        let selected = layer_vertices(&program.draw(bounds(), None, None), 3).len();
+        let selected = layer_vertices(&program.draw(bounds(), None, None), NODES).len();
 
         assert!(
             selected > plain,
