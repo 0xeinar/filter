@@ -25,7 +25,7 @@ use nih_plug_iced::{keyboard, mouse, Point, Rectangle};
 
 use crate::dsp::biquad::BiquadFilter;
 use crate::dsp::curve::{db_to_y, freq_to_x};
-use crate::dsp::spectrum::SpectrumRing;
+use crate::dsp::spectrum::SpectrumTaps;
 use crate::test_support::test_params;
 use crate::ui::graph::{Graph, GRAPH_HEIGHT};
 use crate::ui::selection;
@@ -50,7 +50,7 @@ impl Harness {
             params.clone(),
             context.clone(),
             Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
-            Arc::new(SpectrumRing::new()),
+            Arc::new(SpectrumTaps::new()),
             Arc::new(AtomicUsize::new(selection::NONE)),
         );
         Self {
@@ -269,7 +269,7 @@ fn dragging_a_cut_changes_frequency_and_leaves_gain_alone() {
         params.clone(),
         context.clone(),
         Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
-        Arc::new(SpectrumRing::new()),
+        Arc::new(SpectrumTaps::new()),
         Arc::new(AtomicUsize::new(selection::NONE)),
     );
     let h = Harness {

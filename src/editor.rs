@@ -5,7 +5,7 @@ use nih_plug_iced::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::dsp::spectrum::SpectrumRing;
+use crate::dsp::spectrum::SpectrumTaps;
 use crate::ui;
 use crate::ui::selection;
 use crate::FilterParams;
@@ -55,10 +55,10 @@ pub fn default_state() -> Arc<IcedState> {
 pub fn create(
     params: Arc<FilterParams>,
     peak_meter: Arc<AtomicF32>,
-    spectrum_ring: Arc<SpectrumRing>,
+    spectrum_taps: Arc<SpectrumTaps>,
     editor_state: Arc<IcedState>,
 ) -> Option<Box<dyn Editor>> {
-    create_iced_editor::<FilterEditor>(editor_state, (params, peak_meter, spectrum_ring))
+    create_iced_editor::<FilterEditor>(editor_state, (params, peak_meter, spectrum_taps))
 }
 
 mod colors {
@@ -268,6 +268,8 @@ pub enum Message {
     SelectBand(usize),
     BypassToggled(bool),
     AutoGainToggled(bool),
+    /// Show/hide the post-EQ spectrum overlay.
+    PostSpectrumToggled(bool),
 }
 
 impl FilterEditor {
@@ -305,10 +307,10 @@ impl FilterEditor {
 impl IcedEditor for FilterEditor {
     type Executor = executor::Default;
     type Message = Message;
-    type InitializationFlags = (Arc<FilterParams>, Arc<AtomicF32>, Arc<SpectrumRing>);
+    type InitializationFlags = (Arc<FilterParams>, Arc<AtomicF32>, Arc<SpectrumTaps>);
 
     fn new(
-        (params, peak_meter, spectrum_ring): Self::InitializationFlags,
+        (params, peak_meter, spectrum_taps): Self::InitializationFlags,
         context: Arc<dyn GuiContext>,
     ) -> (Self, Command<Self::Message>) {
         let selection = Arc::new(AtomicUsize::new(selection::NONE));
@@ -316,7 +318,7 @@ impl IcedEditor for FilterEditor {
             params.clone(),
             context.clone(),
             peak_meter.clone(),
-            spectrum_ring,
+            spectrum_taps,
             selection.clone(),
         );
         let editor = FilterEditor {
@@ -383,6 +385,11 @@ impl IcedEditor for FilterEditor {
                 let setter = ParamSetter::new(self.context.as_ref());
                 setter.set_parameter(param, on);
             }
+            Message::PostSpectrumToggled(on) => {
+                let param = &self.params.spectrum_post;
+                let setter = ParamSetter::new(self.context.as_ref());
+                setter.set_parameter(param, on);
+            }
         }
         Command::none()
     }
@@ -424,6 +431,15 @@ impl IcedEditor for FilterEditor {
                 .map(Message::ParamUpdate),
             )
             .push(Column::new().width(Length::Fill))
+            .push(Text::new("Post").size(11).color(colors::TEXT_DIM))
+            .push(
+                Toggler::new(
+                    self.params.spectrum_post.value(),
+                    String::new(),
+                    Message::PostSpectrumToggled,
+                )
+                .size(14),
+            )
             .push(Text::new("Auto gain").size(11).color(colors::TEXT_DIM))
             .push(
                 Toggler::new(
@@ -668,7 +684,7 @@ mod tests {
         let flags = (
             params,
             Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
-            Arc::new(SpectrumRing::new()),
+            Arc::new(SpectrumTaps::new()),
         );
         #[allow(clippy::arc_with_non_send_sync)]
         let ctx: Arc<dyn GuiContext> = context.clone();
@@ -687,7 +703,7 @@ mod tests {
         let flags = (
             params,
             Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
-            Arc::new(SpectrumRing::new()),
+            Arc::new(SpectrumTaps::new()),
         );
         #[allow(clippy::arc_with_non_send_sync)]
         let ctx: Arc<dyn GuiContext> = Arc::new(NullGuiContext);

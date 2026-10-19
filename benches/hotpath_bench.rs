@@ -7,7 +7,9 @@
 //! (d) per-sub-block coefficient baking (16 samples — the current shape while
 //!     a band is being automated), and
 //! (e) the fully static case: no smoother work, no coefficient updates at all,
-//!     which is what an untouched EQ costs.
+//!     which is what an untouched EQ costs, and
+//! (f) the spectrum analyzer, which now runs twice (input and post-EQ taps)
+//!     while the editor is open.
 //!
 //! Run with: cargo bench --bench hotpath_bench
 
@@ -15,6 +17,7 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
+use filter::dsp::spectrum::{SpectrumAnalyzer, SpectrumRing};
 use filter::dsp::BiquadFilter;
 use filter::FilterType;
 
@@ -152,9 +155,27 @@ fn main() {
         per_sample_static * 1e9,
         cpu(per_sample_static)
     );
+    // (f) analyzer cost per sample. This is the price of the spectrum display —
+    // paid twice now (input and output taps), and only while the editor is open.
+    let ring = SpectrumRing::new();
+    let mut analyzer = SpectrumAnalyzer::new(SR);
+    let t2 = Instant::now();
+    let mut n2 = 0usize;
+    for chunk in input.chunks(BLOCK) {
+        analyzer.push_block(&ring, chunk);
+        n2 += chunk.len();
+    }
+    black_box(&analyzer);
+    let per_sample_analyzer = t2.elapsed().as_secs_f64() / n2 as f64;
+
     println!(
         "    -> (a) -> (d): {:.1}x   (a) -> (e): {:.1}x",
         per_sample_prefix / per_sample_sub,
         per_sample_prefix / per_sample_static
+    );
+    println!(
+        "(f) one analyzer, per sample:           {:>7.2} ns/sample   {:>6.2}% CPU",
+        per_sample_analyzer * 1e9,
+        cpu(per_sample_analyzer)
     );
 }

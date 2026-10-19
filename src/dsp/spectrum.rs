@@ -22,6 +22,24 @@ pub const RING_FRAMES: usize = 4;
 /// One analyzer output frame: dB magnitudes for `BINS` bands, log-spaced.
 pub const BINS: usize = 96;
 
+/// Frequency of the upper edge of band `i`, in Hz.
+///
+/// The analyzer maps linear FFT bins onto `BINS` log-spaced bands spanning
+/// bin 1 to bin N/2-1. The GUI needs the same mapping to place a band's bar,
+/// and the canvas tests need it to synthesize a frame whose drawn position is
+/// known. Both call this, so the two can't drift.
+///
+/// Evaluated at a nominal 48 kHz: the display is a log-frequency picture, not
+/// a calibrated analyser, and the band edges move by less than a pixel with
+/// the sample rate.
+pub fn bin_edge_hz(i: usize) -> f32 {
+    let first_bin = 1.0f32;
+    let last_bin_f = (FFT_SIZE / 2 - 1) as f32;
+    let decades = (last_bin_f / first_bin).log10();
+    let edge_bin = (first_bin * 10f32.powf(decades * (i + 1) as f32 / BINS as f32)).round();
+    edge_bin * 48_000.0 / FFT_SIZE as f32
+}
+
 /// A single averaged spectrum frame in dB (normalized: 0 dBFS → ~0 dB).
 #[derive(Clone, Copy)]
 pub struct SpectrumFrame {
@@ -85,6 +103,33 @@ impl SpectrumRing {
 }
 
 impl Default for SpectrumRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The two analyzer taps: `input` is the pre-EQ signal, `output` the post-EQ
+/// signal (after every band, the output trim and the bypass mix).
+///
+/// Bundled into one struct rather than passed as two `Arc<SpectrumRing>`
+/// arguments so a caller can never hand the GUI the same ring twice by
+/// transposing an argument — the mistake would be invisible (both curves would
+/// simply agree) and the whole point of the overlay is that they differ.
+pub struct SpectrumTaps {
+    pub input: SpectrumRing,
+    pub output: SpectrumRing,
+}
+
+impl SpectrumTaps {
+    pub fn new() -> Self {
+        Self {
+            input: SpectrumRing::new(),
+            output: SpectrumRing::new(),
+        }
+    }
+}
+
+impl Default for SpectrumTaps {
     fn default() -> Self {
         Self::new()
     }
@@ -336,5 +381,65 @@ mod tests {
         // After the lock is released, a new publish can succeed
         let mut an = SpectrumAnalyzer::new(48_000.0);
         an.push_block(&r, &vec![0.1f32; FFT_SIZE + FFT_SIZE / 4]);
+    }
+
+    #[test]
+    fn taps_do_not_share_a_ring() {
+        let taps = SpectrumTaps::new();
+        let mut f = SpectrumFrame::silent();
+        f.seq = 9;
+        taps.input.publish(f);
+        assert_eq!(taps.input.read_newest().seq, 9);
+        // Publishing to one tap must not make the other look fed — a shared
+        // ring here would draw the input twice and hide every EQ change.
+        assert_eq!(taps.output.read_newest().seq, 0);
+    }
+
+    /// The overlay only means something if the two taps actually carry
+    /// different signals: the same sine, with the post tap filtered by a
+    /// -20 dB bell, must read ~20 dB lower at the peak.
+    #[test]
+    fn post_tap_shows_what_the_filter_did() {
+        use crate::dsp::BiquadFilter;
+        use crate::FilterType;
+
+        let sr = 48_000.0;
+        let taps = SpectrumTaps::new();
+        let mut pre = SpectrumAnalyzer::new(sr);
+        let mut post = SpectrumAnalyzer::new(sr);
+
+        let total = FFT_SIZE + 3 * (FFT_SIZE / 4);
+        let input: Vec<f32> = (0..total)
+            .map(|n| (2.0 * PI * 1000.0 * n as f32 / sr).sin())
+            .collect();
+
+        // -20 dB bell at 1 kHz, exactly where the sine sits.
+        let mut eq = BiquadFilter::new();
+        eq.update_coefficients(1000.0, -20.0, 1.0, FilterType::Bell, sr);
+        let output: Vec<f32> = input.iter().map(|&s| eq.process(s)).collect();
+
+        pre.push_block(&taps.input, &input);
+        post.push_block(&taps.output, &output);
+
+        let peak = |ring: &SpectrumRing| {
+            ring.read_newest()
+                .db
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max)
+        };
+        let pre_db = peak(&taps.input);
+        let post_db = peak(&taps.output);
+
+        assert!(
+            pre_db > -6.0,
+            "pre tap should see the full-scale sine, got {pre_db:.1} dB"
+        );
+        let delta = pre_db - post_db;
+        assert!(
+            (18.0..22.0).contains(&delta),
+            "post tap should read ~20 dB below the pre tap, got {delta:.1} dB \
+             (pre {pre_db:.1}, post {post_db:.1})"
+        );
     }
 }
