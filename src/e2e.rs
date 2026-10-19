@@ -16,7 +16,7 @@
 #![cfg(test)]
 
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use atomic_float::AtomicF32;
 use nih_plug::prelude::*;
@@ -34,50 +34,18 @@ use crate::{FilterParams, FilterType};
 const SAMPLE_RATE: f32 = 48_000.0;
 const WIDTH: f32 = 900.0;
 
-/// Records the normalized values the GUI sends to the host.
-#[derive(Default)]
-struct RecordingContext {
-    writes: Mutex<Vec<f32>>,
-}
-
-impl RecordingContext {
-    fn writes(&self) -> Vec<f32> {
-        self.writes.lock().unwrap().clone()
-    }
-}
-
-impl GuiContext for RecordingContext {
-    fn plugin_api(&self) -> PluginApi {
-        PluginApi::Standalone
-    }
-    fn request_resize(&self) -> bool {
-        false
-    }
-    unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
-    unsafe fn raw_set_parameter_normalized(&self, _param: ParamPtr, normalized: f32) {
-        self.writes.lock().unwrap().push(normalized);
-    }
-    unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
-    fn get_state(&self) -> PluginState {
-        PluginState {
-            version: String::new(),
-            params: Default::default(),
-            fields: Default::default(),
-        }
-    }
-    fn set_state(&self, _state: PluginState) {}
-}
+use crate::test_support::{test_params_with_slopes, RecordingGuiContext};
 
 struct Harness {
     params: Arc<FilterParams>,
-    context: Arc<RecordingContext>,
+    context: Arc<RecordingGuiContext>,
     graph: Graph,
 }
 
 impl Harness {
     fn new(bands: &[(f32, f32, f32, FilterType)]) -> Self {
         let params = test_params(bands);
-        let context = Arc::new(RecordingContext::default());
+        let context = Arc::new(RecordingGuiContext::default());
         let graph = Graph::new(
             params.clone(),
             context.clone(),
@@ -201,15 +169,15 @@ fn click_drag_to_plus_12_db_actually_boosts_that_frequency() {
     // Creation writes freq/gain/q/type/enable and then the count; the drag
     // that follows re-writes freq and gain. In a host the last write wins, so
     // the final freq/gain pair is what the audio thread would end up with.
-    assert_eq!(writes.len(), 8, "create + drag, got {writes:?}");
+    assert_eq!(writes.len(), 9, "create + drag, got {writes:?}");
     assert!(
-        (writes[5] - 1.0 / crate::MAX_BANDS as f32).abs() < 1e-6,
+        (writes[6] - 1.0 / crate::MAX_BANDS as f32).abs() < 1e-6,
         "the band count should be raised"
     );
 
     // What the host would store, converted exactly as it converts.
-    let freq = h.plain(0, Which::Freq, writes[6]);
-    let gain = h.plain(0, Which::Gain, writes[7]);
+    let freq = h.plain(0, Which::Freq, writes[7]);
+    let gain = h.plain(0, Which::Gain, writes[8]);
     let q = h.plain(0, Which::Q, writes[2]);
     assert!(
         (freq - 1_000.0).abs() / 1_000.0 < 0.02,
@@ -287,4 +255,70 @@ fn deleting_the_last_band_leaves_the_audio_untouched() {
         0.0,
         "the count should drop to zero, got {writes:?}"
     );
+}
+
+/// A cut band's node sits on the 0 dB line, and dragging it vertically must not
+/// write a gain that nothing reads — but it must still change frequency, and the
+/// audio must match the slope the band is set to.
+#[test]
+fn dragging_a_cut_changes_frequency_and_leaves_gain_alone() {
+    let params =
+        test_params_with_slopes(&[(1_000.0, 0.0, 0.707, FilterType::LowCut, crate::Slope::Db48)]);
+    let context = Arc::new(RecordingGuiContext::default());
+    let graph = Graph::new(
+        params.clone(),
+        context.clone(),
+        Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
+        Arc::new(SpectrumRing::new()),
+        Arc::new(AtomicUsize::new(selection::NONE)),
+    );
+    let h = Harness {
+        params,
+        context,
+        graph,
+    };
+
+    // Grab the node (drawn on the 0 dB line) and drag it up and to the right.
+    h.press_at(1_000.0, 0.0);
+    h.drag_to(1_500.0, 12.0);
+    h.release();
+
+    let writes = h.context.writes();
+    assert_eq!(
+        writes.len(),
+        1,
+        "dragging a cut should write frequency only, got {writes:?}"
+    );
+    let freq = h.plain(0, Which::Freq, writes[0]);
+    assert!(
+        (freq - 1_500.0).abs() / 1_500.0 < 0.02,
+        "expected the cut to follow the drag to ~1.5 kHz, got {freq:.1} Hz"
+    );
+
+    // And the audio really is a 48 dB/oct cut, not a 12 dB/oct one.
+    let attenuation =
+        |hz: f32| -measured_cascade_gain_db(freq, 0.0, 0.707, FilterType::LowCut, 48, hz);
+    let per_octave = attenuation(freq / 4.0) - attenuation(freq / 2.0);
+    assert!(
+        (per_octave - 48.0).abs() < 4.0,
+        "expected ~48 dB/oct, measured {per_octave:.1}"
+    );
+}
+
+/// `measured_gain_db` runs one biquad; a sloped cut is a cascade of up to
+/// eight, so this measures the whole thing the way the plugin builds it.
+fn measured_cascade_gain_db(
+    freq: f32,
+    gain_db: f32,
+    q: f32,
+    filter_type: FilterType,
+    slope: u32,
+    probe_hz: f32,
+) -> f32 {
+    let mut filter = crate::dsp::BiquadFilter::new();
+    filter.update_cascade(freq, gain_db, q, filter_type, slope, SAMPLE_RATE);
+    20.0 * filter
+        .magnitude_at_freq(probe_hz, SAMPLE_RATE)
+        .max(1e-30)
+        .log10()
 }

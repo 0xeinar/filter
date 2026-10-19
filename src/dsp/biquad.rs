@@ -1,5 +1,44 @@
 use crate::FilterType;
 
+/// Maximum number of sections one band can need. 96 dB/oct is eight 12 dB/oct
+/// sections; odd slopes finish with a first-order section, which reuses the
+/// same struct with `b2 = a2 = 0`.
+pub const MAX_SECTIONS: usize = 8;
+
+/// The slopes a cut filter can have, in dB per octave.
+pub const SLOPES_DB_PER_OCT: [u32; 9] = [6, 12, 18, 24, 30, 36, 48, 72, 96];
+
+/// Split a slope into second-order sections plus an optional first-order tail.
+///
+/// Butterworth cascades come in even orders, so odd multiples of 6 dB/oct are
+/// one second-order section short of the next even slope and finish with a
+/// one-pole section: 18 dB/oct = 12 + 6, 30 = 24 + 6, 6 = 6.
+pub fn cascade_shape(slope_db_per_oct: u32) -> (usize, bool) {
+    match slope_db_per_oct {
+        6 => (0, true),
+        18 => (1, true),
+        30 => (2, true),
+        24 => (2, false),
+        36 => (3, false),
+        48 => (4, false),
+        72 => (6, false),
+        96 => (8, false),
+        // 12 dB/oct is the default, and an unrecognised slope gets it too
+        // rather than silence.
+        _ => (1, false),
+    }
+}
+
+/// Q of section `k` in an `n`-section Butterworth cascade, ascending.
+///
+/// `1 / (2 cos((2k+1) pi / 4n))` — the standard result for a maximally flat
+/// cascade of 2nd-order sections. For n = 1 this is 0.7071, i.e. the familiar
+/// single biquad.
+pub fn butterworth_q(k: usize, n: usize) -> f64 {
+    debug_assert!(n > 0 && k < n);
+    1.0 / (2.0 * (((2 * k + 1) as f64) * std::f64::consts::PI / (4.0 * n as f64)).cos())
+}
+
 /// Biquad coefficients, shared by every channel that runs the same band.
 ///
 /// Plain float math with no state — one copy per band, recomputed only when
@@ -38,7 +77,10 @@ impl BiquadCoeffs {
         a2: 0.0,
     };
 
-    /// Compute the coefficients for the given parameters
+    /// Coefficients for a single section of `filter_type`.
+    ///
+    /// Cuts are treated as one Butterworth section here; `update_cascade` is
+    /// what turns a slope into several.
     pub fn update(
         &mut self,
         freq: f32,
@@ -65,11 +107,7 @@ impl BiquadCoeffs {
                 let a1 = -2.0 * cos_w0;
                 let a2 = 1.0 - alpha / a;
 
-                self.b0 = b0 / a0;
-                self.b1 = b1 / a0;
-                self.b2 = b2 / a0;
-                self.a1 = a1 / a0;
-                self.a2 = a2 / a0;
+                self.set(b0, b1, b2, a1, a2, a0);
             }
             FilterType::LowShelf => {
                 // Low shelf EQ (Audio EQ Cookbook)
@@ -82,11 +120,7 @@ impl BiquadCoeffs {
                 let a1 = -2.0 * ((a - 1.0) + (a + 1.0) * cos_w0);
                 let a2 = (a + 1.0) + (a - 1.0) * cos_w0 - two_sqrt_a_alpha;
 
-                self.b0 = b0 / a0;
-                self.b1 = b1 / a0;
-                self.b2 = b2 / a0;
-                self.a1 = a1 / a0;
-                self.a2 = a2 / a0;
+                self.set(b0, b1, b2, a1, a2, a0);
             }
             FilterType::HighShelf => {
                 // High shelf EQ (Audio EQ Cookbook)
@@ -99,41 +133,145 @@ impl BiquadCoeffs {
                 let a1 = 2.0 * ((a - 1.0) - (a + 1.0) * cos_w0);
                 let a2 = (a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha;
 
-                self.b0 = b0 / a0;
-                self.b1 = b1 / a0;
-                self.b2 = b2 / a0;
-                self.a1 = a1 / a0;
-                self.a2 = a2 / a0;
+                self.set(b0, b1, b2, a1, a2, a0);
             }
-            FilterType::LowCut => {
-                // High-pass filter (low cut) — 12 dB/oct (2nd order)
-                let b0 = (1.0 + cos_w0) / 2.0;
-                let b1 = -(1.0 + cos_w0);
-                let b2 = (1.0 + cos_w0) / 2.0;
+            FilterType::LowCut => self.cut_section(freq, q as f64, true, sample_rate),
+            FilterType::HighCut => self.cut_section(freq, q as f64, false, sample_rate),
+            FilterType::Notch => {
+                let b0 = 1.0;
+                let b1 = -2.0 * cos_w0;
+                let b2 = 1.0;
                 let a0 = 1.0 + alpha;
                 let a1 = -2.0 * cos_w0;
                 let a2 = 1.0 - alpha;
 
-                self.b0 = b0 / a0;
-                self.b1 = b1 / a0;
-                self.b2 = b2 / a0;
-                self.a1 = a1 / a0;
-                self.a2 = a2 / a0;
+                self.set(b0, b1, b2, a1, a2, a0);
             }
-            FilterType::HighCut => {
-                // Low-pass filter (high cut) — 12 dB/oct (2nd order)
-                let b0 = (1.0 - cos_w0) / 2.0;
-                let b1 = 1.0 - cos_w0;
-                let b2 = (1.0 - cos_w0) / 2.0;
+            FilterType::BandPass => {
+                // Constant 0 dB peak gain (Audio EQ Cookbook)
+                let b0 = alpha;
+                let b1 = 0.0;
+                let b2 = -alpha;
                 let a0 = 1.0 + alpha;
                 let a1 = -2.0 * cos_w0;
                 let a2 = 1.0 - alpha;
 
-                self.b0 = b0 / a0;
-                self.b1 = b1 / a0;
-                self.b2 = b2 / a0;
-                self.a1 = a1 / a0;
-                self.a2 = a2 / a0;
+                self.set(b0, b1, b2, a1, a2, a0);
+            }
+            FilterType::AllPass => {
+                let b0 = 1.0 - alpha;
+                let b1 = -2.0 * cos_w0;
+                let b2 = 1.0 + alpha;
+                let a0 = 1.0 + alpha;
+                let a1 = -2.0 * cos_w0;
+                let a2 = 1.0 - alpha;
+
+                self.set(b0, b1, b2, a1, a2, a0);
+            }
+            // Tilt is two sections; a single-section call gets its top half,
+            // which keeps this function total for any caller.
+            FilterType::TiltShelf => {
+                self.update(freq, gain_db / 2.0, q, FilterType::HighShelf, sample_rate);
+            }
+        }
+    }
+
+    /// One 2nd-order cut section at an explicit Q.
+    fn cut_section(&mut self, freq: f32, q: f64, highpass: bool, sample_rate: f32) {
+        let w0 = 2.0 * std::f64::consts::PI * freq as f64 / sample_rate as f64;
+        let cos_w0 = w0.cos();
+        let alpha = w0.sin() / (2.0 * q);
+
+        let (b0, b1, b2) = if highpass {
+            let b = (1.0 + cos_w0) / 2.0;
+            (b, -2.0 * b, b)
+        } else {
+            let b = (1.0 - cos_w0) / 2.0;
+            (b, 2.0 * b, b)
+        };
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha;
+
+        self.set(b0, b1, b2, a1, a2, a0);
+    }
+
+    /// One 1st-order cut section (6 dB/oct), bilinear transform of
+    /// `s/(s+1)` (high-pass) or `1/(s+1)` (low-pass).
+    ///
+    /// A one-pole section is a biquad with `b2 = a2 = 0`, so it rides the same
+    /// state and the same processing loop.
+    fn cut_first_order(&mut self, freq: f32, highpass: bool, sample_rate: f32) {
+        let k = (std::f64::consts::PI * freq as f64 / sample_rate as f64).tan();
+        let norm = 1.0 / (1.0 + k);
+        let (b0, b1) = if highpass {
+            (norm, -norm)
+        } else {
+            (k * norm, k * norm)
+        };
+
+        self.b0 = b0;
+        self.b1 = b1;
+        self.b2 = 0.0;
+        self.a1 = (k - 1.0) * norm;
+        self.a2 = 0.0;
+    }
+
+    #[inline]
+    fn set(&mut self, b0: f64, b1: f64, b2: f64, a1: f64, a2: f64, a0: f64) {
+        self.b0 = b0 / a0;
+        self.b1 = b1 / a0;
+        self.b2 = b2 / a0;
+        self.a1 = a1 / a0;
+        self.a2 = a2 / a0;
+    }
+
+    /// Fill `sections` with the cascade for one band and return how many
+    /// sections are in use (0 means passthrough).
+    ///
+    /// This is the single place that decides how a band maps to filter
+    /// sections, so the audio path and the drawn response curve cannot drift
+    /// apart — `curve::band_response_db` calls it too.
+    pub fn update_cascade(
+        sections: &mut [BiquadCoeffs; MAX_SECTIONS],
+        freq: f32,
+        gain_db: f32,
+        q: f32,
+        filter_type: FilterType,
+        slope_db_per_oct: u32,
+        sample_rate: f32,
+    ) -> usize {
+        match filter_type {
+            FilterType::LowCut | FilterType::HighCut => {
+                let highpass = filter_type == FilterType::LowCut;
+                let (second_order, first_order) = cascade_shape(slope_db_per_oct);
+
+                for (k, section) in sections.iter_mut().take(second_order).enumerate() {
+                    section.cut_section(
+                        freq,
+                        butterworth_q(k, second_order),
+                        highpass,
+                        sample_rate,
+                    );
+                }
+
+                let mut count = second_order;
+                if first_order {
+                    sections[count].cut_first_order(freq, highpass, sample_rate);
+                    count += 1;
+                }
+                count
+            }
+            FilterType::TiltShelf => {
+                // A tilt is a cut and a boost around the same pivot: -g/2 at
+                // the bottom, +g/2 at the top, 0 dB at the pivot.
+                sections[0].update(freq, -gain_db / 2.0, q, FilterType::LowShelf, sample_rate);
+                sections[1].update(freq, gain_db / 2.0, q, FilterType::HighShelf, sample_rate);
+                2
+            }
+            _ => {
+                sections[0].update(freq, gain_db, q, filter_type, sample_rate);
+                1
             }
         }
     }
@@ -193,13 +331,17 @@ impl BiquadState {
     }
 }
 
-/// Second-order IIR (biquad) filter for EQ processing — a convenience pairing
-/// of `BiquadCoeffs` + `BiquadState` for single-channel use (tests, analysis).
+/// One band's whole filter — a cascade of up to `MAX_SECTIONS` sections — for
+/// single-channel use (tests, analysis, the drawn response curve).
 ///
-/// Supports Bell, Low Shelf, High Shelf, Low Cut, High Cut.
+/// The plugin's hot path does not use this type: it keeps the sections and
+/// states in flat arrays so a block can be processed without indexing a
+/// struct per band. The coefficient math is shared, which is what keeps the
+/// two honest.
 pub struct BiquadFilter {
-    coeffs: BiquadCoeffs,
-    state: BiquadState,
+    sections: [BiquadCoeffs; MAX_SECTIONS],
+    count: usize,
+    states: [BiquadState; MAX_SECTIONS],
 }
 
 impl Default for BiquadFilter {
@@ -211,12 +353,13 @@ impl Default for BiquadFilter {
 impl BiquadFilter {
     pub fn new() -> Self {
         Self {
-            coeffs: BiquadCoeffs::PASSTHROUGH,
-            state: BiquadState::default(),
+            sections: [BiquadCoeffs::PASSTHROUGH; MAX_SECTIONS],
+            count: 0,
+            states: [BiquadState::default(); MAX_SECTIONS],
         }
     }
 
-    /// Update the filter coefficients for the given parameters
+    /// Update the filter at the default 12 dB/oct slope.
     pub fn update_coefficients(
         &mut self,
         freq: f32,
@@ -225,24 +368,62 @@ impl BiquadFilter {
         filter_type: FilterType,
         sample_rate: f32,
     ) {
-        self.coeffs
-            .update(freq, gain_db, q, filter_type, sample_rate);
+        self.update_cascade(freq, gain_db, q, filter_type, 12, sample_rate);
     }
 
-    /// Process a single sample through the filter (Direct Form II Transposed)
+    /// Update the filter for a given slope (only cuts use more than one
+    /// section).
+    pub fn update_cascade(
+        &mut self,
+        freq: f32,
+        gain_db: f32,
+        q: f32,
+        filter_type: FilterType,
+        slope_db_per_oct: u32,
+        sample_rate: f32,
+    ) {
+        self.count = BiquadCoeffs::update_cascade(
+            &mut self.sections,
+            freq,
+            gain_db,
+            q,
+            filter_type,
+            slope_db_per_oct,
+            sample_rate,
+        );
+        // A cascade that changes shape would ring on the old memory.
+        self.reset();
+    }
+
+    /// Process a single sample through the cascade (Direct Form II Transposed)
     #[inline]
     pub fn process(&mut self, input: f32) -> f32 {
-        self.state.process(&self.coeffs, input)
+        let mut s = input;
+        for k in 0..self.count {
+            s = self.states[k].process(&self.sections[k], s);
+        }
+        s
     }
 
     /// Reset the filter state
     pub fn reset(&mut self) {
-        self.state.reset();
+        for state in &mut self.states {
+            state.reset();
+        }
+    }
+
+    /// Number of sections in the current cascade (0 = passthrough).
+    pub fn section_count(&self) -> usize {
+        self.count
     }
 
     /// Compute the frequency response (magnitude) at a given frequency
     pub fn magnitude_at_freq(&self, freq: f32, sample_rate: f32) -> f32 {
-        self.coeffs.magnitude_at_freq(freq, sample_rate)
+        let mut mag = 1.0f32;
+        for section in self.sections.iter().take(self.count) {
+            mag *= section.magnitude_at_freq(freq, sample_rate);
+        }
+        mag
     }
 }
 
@@ -637,5 +818,185 @@ mod tests {
             "Two bells should boost more than one at 1kHz, got {:.1} dB",
             total_db
         );
+    }
+
+    // === New filter types ===
+
+    fn mag_db(filter: &BiquadFilter, freq: f32) -> f32 {
+        db_from_linear(filter.magnitude_at_freq(freq, SAMPLE_RATE))
+    }
+
+    #[test]
+    fn notch_rejects_the_centre_and_passes_everything_else() {
+        let mut filter = BiquadFilter::new();
+        filter.update_coefficients(1_000.0, 0.0, 4.0, FilterType::Notch, SAMPLE_RATE);
+
+        assert!(
+            mag_db(&filter, 1_000.0) < -40.0,
+            "notch should reject its centre hard, got {:.1} dB",
+            mag_db(&filter, 1_000.0)
+        );
+        for freq in [50.0, 200.0, 20_000.0] {
+            assert!(
+                mag_db(&filter, freq).abs() < 1.0,
+                "notch should pass {freq} Hz, got {:.2} dB",
+                mag_db(&filter, freq)
+            );
+        }
+    }
+
+    #[test]
+    fn band_pass_is_unity_at_its_centre_and_rejects_both_sides() {
+        let mut filter = BiquadFilter::new();
+        filter.update_coefficients(1_000.0, 0.0, 2.0, FilterType::BandPass, SAMPLE_RATE);
+
+        assert!(
+            mag_db(&filter, 1_000.0).abs() < 0.1,
+            "constant-peak band pass should be 0 dB at centre, got {:.2} dB",
+            mag_db(&filter, 1_000.0)
+        );
+        assert!(mag_db(&filter, 50.0) < -10.0);
+        assert!(mag_db(&filter, 20_000.0) < -10.0);
+    }
+
+    #[test]
+    fn all_pass_is_unity_everywhere_but_changes_phase() {
+        let mut filter = BiquadFilter::new();
+        filter.update_coefficients(1_000.0, 0.0, 2.0, FilterType::AllPass, SAMPLE_RATE);
+
+        for freq in [20.0, 100.0, 1_000.0, 9_000.0, 20_000.0] {
+            assert!(
+                mag_db(&filter, freq).abs() < 0.05,
+                "all pass must be flat, {freq} Hz came out {:.3} dB",
+                mag_db(&filter, freq)
+            );
+        }
+
+        // ...but it is not the identity: a sine comes out shifted.
+        filter.reset();
+        let mut delayed = BiquadFilter::new();
+        delayed.update_coefficients(1_000.0, 0.0, 2.0, FilterType::AllPass, SAMPLE_RATE);
+        let mut differs = false;
+        for n in 0..2_000 {
+            let x = (2.0 * std::f32::consts::PI * 1_000.0 * n as f32 / SAMPLE_RATE).sin();
+            let y = delayed.process(x);
+            if (y - x).abs() > 1e-3 {
+                differs = true;
+            }
+        }
+        assert!(differs, "an all pass that does not alter phase is a bug");
+    }
+
+    #[test]
+    fn tilt_shelf_is_minus_half_the_gain_low_and_plus_half_high() {
+        let mut filter = BiquadFilter::new();
+        filter.update_cascade(1_000.0, 12.0, 0.707, FilterType::TiltShelf, 12, SAMPLE_RATE);
+
+        assert_eq!(filter.section_count(), 2, "a tilt is a cut and a boost");
+        let low = mag_db(&filter, 30.0);
+        let high = mag_db(&filter, 18_000.0);
+        assert!(
+            (low + 6.0).abs() < 0.7,
+            "tilt should be -6 dB at the bottom, got {low:.1}"
+        );
+        assert!(
+            (high - 6.0).abs() < 0.7,
+            "tilt should be +6 dB at the top, got {high:.1}"
+        );
+        assert!(
+            mag_db(&filter, 1_000.0).abs() < 0.5,
+            "the pivot should stay at 0 dB, got {:.2}",
+            mag_db(&filter, 1_000.0)
+        );
+    }
+
+    #[test]
+    fn tilt_is_the_mirror_image_of_its_negative() {
+        let mut up = BiquadFilter::new();
+        up.update_cascade(1_000.0, 8.0, 0.707, FilterType::TiltShelf, 12, SAMPLE_RATE);
+        let mut down = BiquadFilter::new();
+        down.update_cascade(1_000.0, -8.0, 0.707, FilterType::TiltShelf, 12, SAMPLE_RATE);
+
+        for freq in [50.0, 500.0, 5_000.0] {
+            let sum = mag_db(&up, freq) + mag_db(&down, freq);
+            assert!(
+                sum.abs() < 0.01,
+                "a +8 dB tilt and its inverse should cancel at {freq} Hz, got {sum:.2} dB"
+            );
+        }
+    }
+
+    // === Slopes ===
+
+    #[test]
+    fn cascade_shape_matches_the_slope_table() {
+        // dB/oct -> (2nd-order sections, + 1st-order section)
+        let expected = [
+            (6, (0, true)),
+            (12, (1, false)),
+            (18, (1, true)),
+            (24, (2, false)),
+            (30, (2, true)),
+            (36, (3, false)),
+            (48, (4, false)),
+            (72, (6, false)),
+            (96, (8, false)),
+        ];
+        for (slope, shape) in expected {
+            assert_eq!(cascade_shape(slope), shape, "{slope} dB/oct");
+        }
+        assert_eq!(
+            SLOPES_DB_PER_OCT.len(),
+            expected.len(),
+            "the table the UI offers and the table the DSP understands must agree"
+        );
+    }
+
+    #[test]
+    fn butterworth_section_qs_are_the_textbook_values() {
+        // 2 sections: 0.5412, 1.3066. 4 sections adds 0.5098 and 2.5629.
+        assert!((butterworth_q(0, 2) - 0.541_196).abs() < 1e-5);
+        assert!((butterworth_q(1, 2) - 1.306_563).abs() < 1e-5);
+        assert!((butterworth_q(0, 4) - 0.509_796).abs() < 1e-5);
+        assert!((butterworth_q(3, 4) - 2.562_915).abs() < 1e-5);
+        // A single section is the familiar 0.7071.
+        assert!((butterworth_q(0, 1) - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn steeper_cuts_use_more_sections() {
+        let mut counts = Vec::new();
+        for slope in SLOPES_DB_PER_OCT {
+            let mut filter = BiquadFilter::new();
+            filter.update_cascade(1_000.0, 0.0, 0.707, FilterType::LowCut, slope, SAMPLE_RATE);
+            counts.push((slope, filter.section_count()));
+        }
+        let mut previous = 0;
+        for (slope, count) in counts {
+            assert!(
+                count >= previous,
+                "{slope} dB/oct uses {count} sections, fewer than a gentler slope ({previous})"
+            );
+            assert!(count <= MAX_SECTIONS);
+            previous = count;
+        }
+    }
+
+    #[test]
+    fn a_cut_ignores_its_gain_and_its_q() {
+        // Slope, not gain or Q, describes a cut: two different gains and two
+        // different Qs must produce the same thing.
+        let mut a = BiquadFilter::new();
+        a.update_cascade(500.0, 0.0, 0.707, FilterType::LowCut, 24, SAMPLE_RATE);
+        let mut b = BiquadFilter::new();
+        b.update_cascade(500.0, 18.0, 9.0, FilterType::LowCut, 24, SAMPLE_RATE);
+
+        for freq in [50.0, 200.0, 500.0, 4_000.0] {
+            let diff = (mag_db(&a, freq) - mag_db(&b, freq)).abs();
+            assert!(
+                diff < 4e-4,
+                "cut response moved with gain/Q at {freq} Hz by {diff:.5} dB"
+            );
+        }
     }
 }

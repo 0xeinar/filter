@@ -13,7 +13,8 @@
 //! are set with headroom over the measured values so they fail on real bugs,
 //! not on f32 rounding noise.
 
-use filter::dsp::{BiquadCoeffs, BiquadState};
+use filter::dsp::biquad::{butterworth_q, cascade_shape, MAX_SECTIONS, SLOPES_DB_PER_OCT};
+use filter::dsp::{BiquadCoeffs, BiquadFilter, BiquadState};
 use filter::FilterType;
 
 const SR: f64 = 48_000.0;
@@ -88,6 +89,36 @@ impl Reference {
                 -2.0 * cos_w0,
                 1.0 - alpha,
             ),
+            FilterType::Notch => (
+                1.0,
+                -2.0 * cos_w0,
+                1.0,
+                1.0 + alpha,
+                -2.0 * cos_w0,
+                1.0 - alpha,
+            ),
+            FilterType::BandPass => (alpha, 0.0, -alpha, 1.0 + alpha, -2.0 * cos_w0, 1.0 - alpha),
+            FilterType::AllPass => (
+                1.0 - alpha,
+                -2.0 * cos_w0,
+                1.0 + alpha,
+                1.0 + alpha,
+                -2.0 * cos_w0,
+                1.0 - alpha,
+            ),
+            // A tilt is two sections; this reference models its top half, and
+            // `nulls_tilt_shelf_against_two_references` chains both.
+            FilterType::TiltShelf => {
+                let k = 2.0 * a.sqrt() * alpha;
+                (
+                    a * ((a + 1.0) + (a - 1.0) * cos_w0 + k),
+                    -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_w0),
+                    a * ((a + 1.0) + (a - 1.0) * cos_w0 - k),
+                    (a + 1.0) - (a - 1.0) * cos_w0 + k,
+                    2.0 * ((a - 1.0) - (a + 1.0) * cos_w0),
+                    (a + 1.0) - (a - 1.0) * cos_w0 - k,
+                )
+            }
         };
 
         Self {
@@ -166,6 +197,9 @@ fn nulls_against_reference_all_types() {
         (6_000.0, -10.0, 0.707, FilterType::HighShelf),
         (80.0, 0.0, 0.707, FilterType::LowCut),
         (12_000.0, 0.0, 0.707, FilterType::HighCut),
+        (1_500.0, 0.0, 4.0, FilterType::Notch),
+        (2_500.0, 0.0, 6.0, FilterType::BandPass),
+        (700.0, 0.0, 0.9, FilterType::AllPass),
     ];
 
     for &(freq, gain, q, ftype) in cases {
@@ -237,4 +271,165 @@ fn reference_null_depth_is_reported() {
     let depth = null_depth(1_000.0, 6.0, 1.0, FilterType::Bell);
     println!("single bell null depth: {depth:.1} dB");
     assert!(depth < -100.0, "expected >100 dB null, got {depth:.1} dB");
+}
+
+/// Run the plugin's cascade for one band against a chain of reference
+/// sections, returning the residual level in dB.
+fn null_cascade(
+    freq: f32,
+    gain_db: f32,
+    q: f32,
+    filter_type: FilterType,
+    slope_db_per_oct: u32,
+    reference_sections: Vec<Reference>,
+) -> f64 {
+    let input = test_signal(48_000);
+
+    let mut sections = [BiquadCoeffs::PASSTHROUGH; MAX_SECTIONS];
+    let count = BiquadCoeffs::update_cascade(
+        &mut sections,
+        freq,
+        gain_db,
+        q,
+        filter_type,
+        slope_db_per_oct,
+        SR_F32,
+    );
+    assert_eq!(
+        count,
+        reference_sections.len(),
+        "the plugin and the reference disagree about how many sections this setting needs"
+    );
+    let mut states = [BiquadState::default(); MAX_SECTIONS];
+    let mut refs = reference_sections;
+
+    let mut sig_energy = 0.0f64;
+    let mut err_energy = 0.0f64;
+    for &x in &input {
+        let mut ours = x as f32;
+        for k in 0..count {
+            ours = states[k].process(&sections[k], ours);
+        }
+        let mut theirs = x;
+        for r in refs.iter_mut() {
+            theirs = r.process(theirs);
+        }
+        sig_energy += theirs * theirs;
+        let e = ours as f64 - theirs;
+        err_energy += e * e;
+    }
+
+    10.0 * (err_energy / sig_energy).log10()
+}
+
+#[test]
+fn nulls_a_tilt_shelf_against_two_references() {
+    // A tilt is two sections by construction: -g/2 at the bottom, +g/2 at the
+    // top. If the plugin ever changed that (or dropped one half) the section
+    // count assertion trips before the null can.
+    let gain = 9.0;
+    let freq = 1_000.0;
+    let q = 0.707;
+    let depth = null_cascade(
+        freq,
+        gain,
+        q,
+        FilterType::TiltShelf,
+        12,
+        vec![
+            Reference::new(
+                freq as f64,
+                -(gain as f64) / 2.0,
+                q as f64,
+                FilterType::LowShelf,
+            ),
+            Reference::new(
+                freq as f64,
+                (gain as f64) / 2.0,
+                q as f64,
+                FilterType::HighShelf,
+            ),
+        ],
+    );
+    println!("tilt shelf null depth: {depth:.1} dB");
+    assert!(depth < -120.0, "tilt shelf null only {depth:.1} dB");
+}
+
+#[test]
+fn nulls_sloped_cuts_against_chained_butterworth_sections() {
+    // Every even slope is a whole number of 2nd-order Butterworth sections;
+    // the odd ones add a 1st-order tail, which this reference cannot express,
+    // so those are covered by `measured_slopes_match_the_label` instead.
+    for slope in [12u32, 24, 36, 48, 72, 96] {
+        let freq = 300.0;
+        let (second_order, first_order) = cascade_shape(slope);
+        assert!(!first_order, "{slope} dB/oct should be all 2nd order");
+
+        let refs = (0..second_order)
+            .map(|k| {
+                Reference::new(
+                    freq as f64,
+                    0.0,
+                    butterworth_q(k, second_order),
+                    FilterType::LowCut,
+                )
+            })
+            .collect();
+
+        let depth = null_cascade(freq, 0.0, 0.707, FilterType::LowCut, slope, refs);
+        println!("{slope:>2} dB/oct low cut null depth: {depth:>8.1} dB");
+        assert!(
+            depth < -120.0,
+            "{slope} dB/oct low cut null only {depth:.1} dB"
+        );
+    }
+}
+
+/// Steepness actually measured off the transfer function, in dB/oct.
+///
+/// Both probes sit one octave apart *below* the corner, well inside the
+/// stopband of a low cut, where a Butterworth cascade is on its asymptote. The
+/// magnitude floor is 1e-30 rather than something audible: a 96 dB/oct cut is
+/// already at -289 dB there, and clamping early would read the clamp instead
+/// of the filter.
+fn measured_slope_db_per_oct(slope: u32) -> f32 {
+    let mut filter = BiquadFilter::new();
+    filter.update_cascade(2_000.0, 0.0, 0.707, FilterType::LowCut, slope, SR_F32);
+    let attenuation = |hz: f32| -20.0 * filter.magnitude_at_freq(hz, SR_F32).max(1e-30).log10();
+    attenuation(250.0) - attenuation(500.0)
+}
+
+#[test]
+fn measured_slopes_match_the_label() {
+    for &slope in SLOPES_DB_PER_OCT.iter() {
+        let measured = measured_slope_db_per_oct(slope);
+        let expected = slope as f32;
+        println!("{slope:>2} dB/oct -> measured {measured:>6.1} dB/oct");
+        assert!(
+            (measured - expected).abs() <= expected * 0.06,
+            "{slope} dB/oct measured {measured:.1} dB/oct"
+        );
+    }
+}
+
+/// A steeper slope is never shallower than a gentler one inside the stopband.
+///
+/// Only below the corner, though: all Butterworth cascades pass -3 dB at the
+/// corner and a steeper one is actually *shallower* just above it, so probing
+/// there would assert something false about the design rather than test it.
+#[test]
+fn slopes_are_monotonic_in_attenuation() {
+    for probe in [500.0f32, 250.0, 100.0, 50.0] {
+        let mut previous = 0.0f32; // dB of attenuation
+        for &slope in SLOPES_DB_PER_OCT.iter() {
+            let mut filter = BiquadFilter::new();
+            filter.update_cascade(1_000.0, 0.0, 0.707, FilterType::LowCut, slope, SR_F32);
+            let attenuation = -20.0 * filter.magnitude_at_freq(probe, SR_F32).max(1e-30).log10();
+            assert!(
+                attenuation >= previous - 0.01,
+                "at {probe} Hz, {slope} dB/oct attenuates {attenuation:.2} dB but a gentler slope already reached {previous:.2} dB"
+            );
+            previous = attenuation;
+        }
+    }
 }

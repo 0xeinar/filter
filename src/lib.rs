@@ -18,11 +18,17 @@ pub struct Filter {
     params: Arc<FilterParams>,
     peak_meter_decay_weight: f32,
     peak_meter: Arc<AtomicF32>,
-    /// Per-band coefficients — shared by every channel running that band.
-    band_coeffs: [dsp::BiquadCoeffs; MAX_BANDS],
+    /// Per-band coefficients, one entry per cascade section — shared by every
+    /// channel running that band. Only the first `band_sections[i]` are live.
+    band_coeffs: [[dsp::BiquadCoeffs; dsp::biquad::MAX_SECTIONS]; MAX_BANDS],
+    /// Live section count per band: 1 for a bell or shelf, 2 for a tilt, up to
+    /// 8 for a 96 dB/oct cut.
+    band_sections: [usize; MAX_BANDS],
     /// Per-channel filter state. Channel 0 uses `band_states[0]`,
-    /// channel 1 uses `band_states[1]`, etc.
-    band_states: [[dsp::BiquadState; MAX_BANDS]; MAX_CHANNELS],
+    /// channel 1 uses `band_states[1]`, etc. Section state is per channel for
+    /// the same reason the band state was: sharing it makes one channel
+    /// continue the other's filter memory.
+    band_states: [[[dsp::BiquadState; dsp::biquad::MAX_SECTIONS]; MAX_BANDS]; MAX_CHANNELS],
     sample_rate: f32,
     /// Shared with the GUI for the spectrum display
     spectrum_ring: Arc<dsp::spectrum::SpectrumRing>,
@@ -30,6 +36,7 @@ pub struct Filter {
     spectrum_analyzer: Option<dsp::spectrum::SpectrumAnalyzer>,
     /// Audio-thread snapshots of band type/enable for the current block.
     band_types: [FilterType; MAX_BANDS],
+    band_slopes: [u32; MAX_BANDS],
     band_enabled: [bool; MAX_BANDS],
     /// Last values baked into the current coefficients — lets process()
     /// skip recomputation when nothing moved.
@@ -37,6 +44,7 @@ pub struct Filter {
     last_baked_gain: [f32; MAX_BANDS],
     last_baked_q: [f32; MAX_BANDS],
     last_baked_type: [FilterType; MAX_BANDS],
+    last_baked_slope: [u32; MAX_BANDS],
     /// Smoothed bypass crossfade: 0 = processed, 1 = fully dry.
     bypass_mix: Smoother<f32>,
     /// Current bypass smoother target (0 or 1), so the ramp is not restarted
@@ -81,6 +89,11 @@ pub struct BandParams {
     #[id = "type"]
     pub filter_type: IntParam,
 
+    /// Slope of a cut filter, as a `Slope` index. Ignored by every other
+    /// type — a bell has a Q, not a slope.
+    #[id = "slope"]
+    pub slope: IntParam,
+
     #[id = "enable"]
     pub enable: BoolParam,
 }
@@ -121,6 +134,7 @@ pub fn band_specs(params: &FilterParams, num_active: usize) -> [dsp::curve::Band
                 gain_db: 0.0,
                 q: 1.0,
                 filter_type: FilterType::Bell,
+                slope_db_per_oct: Slope::DEFAULT.db_per_oct(),
                 enabled: false,
             };
         }
@@ -130,6 +144,7 @@ pub fn band_specs(params: &FilterParams, num_active: usize) -> [dsp::curve::Band
             gain_db: bp.gain.value(),
             q: bp.q.value(),
             filter_type: FilterType::from_i32(bp.filter_type.value()),
+            slope_db_per_oct: Slope::from_i32(bp.slope.value()).db_per_oct(),
             enabled: bp.enable.value(),
         }
     })
@@ -143,27 +158,50 @@ pub enum FilterType {
     HighShelf = 2,
     LowCut = 3,
     HighCut = 4,
+    // Appended, not inserted: the discriminant is what presets and automation
+    // store, so 0–4 must keep their meaning forever.
+    Notch = 5,
+    BandPass = 6,
+    AllPass = 7,
+    TiltShelf = 8,
 }
 
 impl FilterType {
     /// All filter types, in enum order — used by the UI pick list.
-    pub const ALL: [FilterType; 5] = [
+    pub const ALL: [FilterType; 9] = [
         Self::Bell,
         Self::LowShelf,
         Self::HighShelf,
         Self::LowCut,
         Self::HighCut,
+        Self::Notch,
+        Self::BandPass,
+        Self::AllPass,
+        Self::TiltShelf,
     ];
 
     pub fn from_i32(v: i32) -> Self {
         match v {
-            0 => Self::Bell,
             1 => Self::LowShelf,
             2 => Self::HighShelf,
             3 => Self::LowCut,
             4 => Self::HighCut,
+            5 => Self::Notch,
+            6 => Self::BandPass,
+            7 => Self::AllPass,
+            8 => Self::TiltShelf,
             _ => Self::Bell,
         }
+    }
+
+    /// Cuts are the only type whose steepness is a slope rather than a Q.
+    pub fn is_cut(self) -> bool {
+        matches!(self, Self::LowCut | Self::HighCut)
+    }
+
+    /// Types where the band's gain means nothing (a cut passes 0 dB).
+    pub fn has_gain(self) -> bool {
+        !self.is_cut()
     }
 
     pub fn name(self) -> &'static str {
@@ -173,7 +211,84 @@ impl FilterType {
             Self::HighShelf => "High Shelf",
             Self::LowCut => "Low Cut",
             Self::HighCut => "High Cut",
+            Self::Notch => "Notch",
+            Self::BandPass => "Band Pass",
+            Self::AllPass => "All Pass",
+            Self::TiltShelf => "Tilt Shelf",
         }
+    }
+}
+
+/// Slope of a cut filter, in dB per octave.
+///
+/// Stored as a parameter index rather than a raw value so the pick list and
+/// the automation lane agree on the same nine options.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slope {
+    Db6 = 0,
+    Db12 = 1,
+    Db18 = 2,
+    Db24 = 3,
+    Db30 = 4,
+    Db36 = 5,
+    Db48 = 6,
+    Db72 = 7,
+    Db96 = 8,
+}
+
+impl Slope {
+    pub const ALL: [Slope; 9] = [
+        Self::Db6,
+        Self::Db12,
+        Self::Db18,
+        Self::Db24,
+        Self::Db30,
+        Self::Db36,
+        Self::Db48,
+        Self::Db72,
+        Self::Db96,
+    ];
+
+    /// Default slope for a new band: 12 dB/oct, one biquad.
+    pub const DEFAULT: Slope = Self::Db12;
+
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            0 => Self::Db6,
+            2 => Self::Db18,
+            3 => Self::Db24,
+            4 => Self::Db30,
+            5 => Self::Db36,
+            6 => Self::Db48,
+            7 => Self::Db72,
+            8 => Self::Db96,
+            _ => Self::Db12,
+        }
+    }
+
+    pub fn db_per_oct(self) -> u32 {
+        crate::dsp::biquad::SLOPES_DB_PER_OCT[self as usize]
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Db6 => "6 dB/oct",
+            Self::Db12 => "12 dB/oct",
+            Self::Db18 => "18 dB/oct",
+            Self::Db24 => "24 dB/oct",
+            Self::Db30 => "30 dB/oct",
+            Self::Db36 => "36 dB/oct",
+            Self::Db48 => "48 dB/oct",
+            Self::Db72 => "72 dB/oct",
+            Self::Db96 => "96 dB/oct",
+        }
+    }
+}
+
+impl std::fmt::Display for Slope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
     }
 }
 
@@ -226,7 +341,18 @@ impl Default for BandParams {
             filter_type: IntParam::new(
                 "Type",
                 FilterType::Bell as i32,
-                IntRange::Linear { min: 0, max: 4 },
+                // Nine types now; 0–4 keep their old meaning so existing
+                // automation still resolves to the same filter.
+                IntRange::Linear { min: 0, max: 8 },
+            ),
+
+            slope: IntParam::new(
+                "Slope",
+                Slope::DEFAULT as i32,
+                IntRange::Linear {
+                    min: 0,
+                    max: Slope::ALL.len() as i32 - 1,
+                },
             ),
 
             // A band is audible the moment it exists. Bands are created from
@@ -243,19 +369,24 @@ impl Default for Filter {
             params: Arc::new(FilterParams::default()),
             peak_meter_decay_weight: 1.0,
             peak_meter: Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
-            band_coeffs: core::array::from_fn(|_| dsp::BiquadCoeffs::PASSTHROUGH),
+            band_coeffs: core::array::from_fn(|_| {
+                [dsp::BiquadCoeffs::PASSTHROUGH; dsp::biquad::MAX_SECTIONS]
+            }),
+            band_sections: [0; MAX_BANDS],
             band_states: core::array::from_fn(|_| {
-                core::array::from_fn(|_| dsp::BiquadState::default())
+                core::array::from_fn(|_| core::array::from_fn(|_| dsp::BiquadState::default()))
             }),
             sample_rate: 44100.0,
             spectrum_ring: Arc::new(dsp::spectrum::SpectrumRing::new()),
             spectrum_analyzer: None,
             band_types: [FilterType::Bell; MAX_BANDS],
+            band_slopes: [12; MAX_BANDS],
             band_enabled: [false; MAX_BANDS],
             last_baked_freq: [1000.0; MAX_BANDS],
             last_baked_gain: [0.0; MAX_BANDS],
             last_baked_q: [1.0; MAX_BANDS],
             last_baked_type: [FilterType::Bell; MAX_BANDS],
+            last_baked_slope: [0; MAX_BANDS],
             bypass_mix: Smoother::new(SmoothingStyle::Linear(20.0)),
             bypass_target: 0.0,
             comp_db: 0.0,
@@ -344,9 +475,10 @@ impl Plugin for Filter {
             .powf((buffer_config.sample_rate as f64 * PEAK_METER_DECAY_MS / 1000.0).recip())
             as f32;
         self.sample_rate = buffer_config.sample_rate;
-        for band in &mut self.band_coeffs {
-            band.update(1000.0, 0.0, 1.0, FilterType::Bell, self.sample_rate);
+        for sections in &mut self.band_coeffs {
+            sections[0].update(1000.0, 0.0, 1.0, FilterType::Bell, self.sample_rate);
         }
+        self.band_sections = [1; MAX_BANDS];
         self.bypass_mix
             .reset(if self.params.bypass.value() { 1.0 } else { 0.0 });
         self.comp_dirty = true;
@@ -437,6 +569,7 @@ impl Plugin for Filter {
 
                     self.band_types[band_idx] = ftype;
                     self.band_enabled[band_idx] = enabled;
+                    let slope = Slope::from_i32(bp.slope.value()).db_per_oct();
 
                     if enabled {
                         any_band_active = true;
@@ -449,7 +582,10 @@ impl Plugin for Filter {
                             || self.last_baked_freq[band_idx] != bp.freq.value()
                             || self.last_baked_gain[band_idx] != bp.gain.value()
                             || self.last_baked_q[band_idx] != bp.q.value()
-                            || self.last_baked_type[band_idx] != ftype;
+                            || self.last_baked_type[band_idx] != ftype
+                            || self.last_baked_slope[band_idx] != slope;
+
+                        self.band_slopes[band_idx] = slope;
 
                         if !moving {
                             coeffs_changed[band_idx] = false;
@@ -504,17 +640,22 @@ impl Plugin for Filter {
                     let baked_freq = freq_block[block_len - 1];
                     let baked_gain = gain_block[block_len - 1];
                     let baked_q = q_block[block_len - 1];
-                    self.band_coeffs[band_idx].update(
+                    let baked_type = self.band_types[band_idx];
+                    let baked_slope = self.band_slopes[band_idx];
+                    self.band_sections[band_idx] = dsp::BiquadCoeffs::update_cascade(
+                        &mut self.band_coeffs[band_idx],
                         baked_freq,
                         baked_gain,
                         baked_q,
-                        self.band_types[band_idx],
+                        baked_type,
+                        baked_slope,
                         self.sample_rate,
                     );
                     self.last_baked_freq[band_idx] = baked_freq;
                     self.last_baked_gain[band_idx] = baked_gain;
                     self.last_baked_q[band_idx] = baked_q;
-                    self.last_baked_type[band_idx] = self.band_types[band_idx];
+                    self.last_baked_type[band_idx] = baked_type;
+                    self.last_baked_slope[band_idx] = baked_slope;
                     self.comp_dirty = true;
                 }
 
@@ -551,19 +692,23 @@ impl Plugin for Filter {
                         let mut s = dry;
 
                         if any_band_active {
-                            // Zip gives bounds-check-free iteration over the
-                            // active band prefix; the enable flags ride along so
-                            // disabled bands are skipped without re-indexing.
-                            for ((state, coeffs), enabled) in states
-                                .iter_mut()
-                                .zip(self.band_coeffs.iter())
-                                .zip(self.band_enabled.iter())
-                                .take(num_active)
+                            // Each band is a cascade: one section for a bell or
+                            // shelf, two for a tilt, up to eight for a 96 dB/oct
+                            // cut. Slicing to the live count keeps the inner
+                            // loops bounds-check-free after the first iteration.
+                            for (band_idx, band_state) in
+                                states.iter_mut().enumerate().take(num_active)
                             {
-                                if !*enabled {
+                                if !self.band_enabled[band_idx] {
                                     continue;
                                 }
-                                s = state.process(coeffs, s);
+                                let sections = self.band_sections[band_idx];
+                                let coeffs = &self.band_coeffs[band_idx][..sections];
+                                for (coeff, state) in
+                                    coeffs.iter().zip(band_state[..sections].iter_mut())
+                                {
+                                    s = state.process(coeff, s);
+                                }
                             }
                         }
 
@@ -617,3 +762,62 @@ impl Vst3Plugin for Filter {
 
 nih_export_clap!(Filter);
 nih_export_vst3!(Filter);
+
+#[cfg(test)]
+mod param_tests {
+    use super::*;
+
+    /// The discriminant is what a preset and an automation lane store, so it
+    /// must never move. New types get appended, never inserted.
+    #[test]
+    fn filter_type_discriminants_are_stable() {
+        let expected = [
+            (FilterType::Bell, 0, "Bell"),
+            (FilterType::LowShelf, 1, "Low Shelf"),
+            (FilterType::HighShelf, 2, "High Shelf"),
+            (FilterType::LowCut, 3, "Low Cut"),
+            (FilterType::HighCut, 4, "High Cut"),
+            (FilterType::Notch, 5, "Notch"),
+            (FilterType::BandPass, 6, "Band Pass"),
+            (FilterType::AllPass, 7, "All Pass"),
+            (FilterType::TiltShelf, 8, "Tilt Shelf"),
+        ];
+        for (filter_type, value, name) in expected {
+            assert_eq!(filter_type as i32, value, "{name} moved");
+            assert_eq!(FilterType::from_i32(value), filter_type);
+            assert_eq!(filter_type.name(), name);
+        }
+        assert_eq!(FilterType::ALL.len(), expected.len());
+    }
+
+    #[test]
+    fn every_slope_index_round_trips_and_matches_the_dsp_table() {
+        for (index, slope) in Slope::ALL.iter().enumerate() {
+            assert_eq!(*slope as i32, index as i32);
+            assert_eq!(Slope::from_i32(index as i32), *slope);
+            assert_eq!(
+                slope.db_per_oct(),
+                dsp::biquad::SLOPES_DB_PER_OCT[index],
+                "{slope} disagrees with the DSP table"
+            );
+        }
+        assert_eq!(
+            Slope::DEFAULT.db_per_oct(),
+            12,
+            "cuts default to one biquad"
+        );
+    }
+
+    #[test]
+    fn only_cuts_are_steepness_controlled_and_gainless() {
+        for filter_type in FilterType::ALL {
+            assert_eq!(filter_type.is_cut(), !filter_type.has_gain());
+            if filter_type.is_cut() {
+                assert!(matches!(
+                    filter_type,
+                    FilterType::LowCut | FilterType::HighCut
+                ));
+            }
+        }
+    }
+}

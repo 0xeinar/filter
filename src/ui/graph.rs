@@ -47,26 +47,11 @@ const NUDGE_DB: f32 = 0.1;
 const NUDGE_COARSE_DB: f32 = 1.0;
 
 /// Collect the current band parameters as pure `BandSpec` values.
+///
+/// Deliberately the crate-level function rather than a copy: the graph used to
+/// duplicate this, and the copy silently fell behind when a field was added.
 fn band_specs(params: &FilterParams, num_active: usize) -> [BandSpec; MAX_BANDS] {
-    core::array::from_fn(|i| {
-        if i >= num_active {
-            return BandSpec {
-                freq: 1000.0,
-                gain_db: 0.0,
-                q: 1.0,
-                filter_type: FilterType::Bell,
-                enabled: false,
-            };
-        }
-        let bp = &params.band_params[i];
-        BandSpec {
-            freq: bp.freq.value(),
-            gain_db: bp.gain.value(),
-            q: bp.q.value(),
-            filter_type: FilterType::from_i32(bp.filter_type.value()),
-            enabled: bp.enable.value(),
-        }
-    })
+    crate::band_specs(params, num_active)
 }
 
 /// x position (0..1) of each spectrum bin's upper edge, precomputed once.
@@ -92,6 +77,19 @@ fn to_px(bounds: Rectangle, freq: f32, db: f32) -> Point {
     }
 }
 
+/// The gain a band's node is drawn and grabbed at.
+///
+/// A cut passes 0 dB and ignores its gain parameter, so its node belongs on
+/// the 0 dB line where its curve actually starts — not floating wherever the
+/// (unused) gain happens to sit.
+fn node_gain_db(bp: &crate::BandParams) -> f32 {
+    if FilterType::from_i32(bp.filter_type.value()).has_gain() {
+        bp.gain.value()
+    } else {
+        0.0
+    }
+}
+
 /// Node positions in canvas-local pixel coordinates `(band_index, x, y)`
 /// for all enabled, active bands.
 fn node_positions(
@@ -105,7 +103,7 @@ fn node_positions(
             let p = to_px(
                 bounds,
                 params.band_params[i].freq.value(),
-                params.band_params[i].gain.value(),
+                node_gain_db(&params.band_params[i]),
             );
             (i, p.x, p.y)
         })
@@ -174,6 +172,9 @@ impl CachedLayers {
             bp.gain.value().to_bits().hash(&mut h);
             bp.q.value().to_bits().hash(&mut h);
             bp.filter_type.value().hash(&mut h);
+            // Slopes change the drawn curve, so a slope edit has to invalidate
+            // the cached geometry just like a freq/gain edit does.
+            bp.slope.value().hash(&mut h);
             bp.enable.value().hash(&mut h);
         }
         for v in [bounds.x, bounds.y, bounds.width, bounds.height] {
@@ -210,6 +211,7 @@ impl GraphProgram {
         self.set_gesture(&dst.gain, src.gain.value());
         self.set_gesture(&dst.q, src.q.value());
         self.set_gesture(&dst.filter_type, src.filter_type.value());
+        self.set_gesture(&dst.slope, src.slope.value());
         self.set_gesture(&dst.enable, src.enable.value());
     }
 
@@ -228,6 +230,7 @@ impl GraphProgram {
         self.set_gesture(&bp.gain, gain_db.clamp(-DB_MAX, DB_MAX));
         self.set_gesture(&bp.q, 1.0);
         self.set_gesture(&bp.filter_type, FilterType::Bell as i32);
+        self.set_gesture(&bp.slope, crate::Slope::DEFAULT as i32);
         self.set_gesture(&bp.enable, true);
         self.set_gesture(&self.params.num_bands, num_active as i32 + 1);
         Some(num_active)
@@ -509,7 +512,7 @@ impl GraphProgram {
                 continue;
             }
             let color = editor::band_color(i);
-            let center = to_px(bounds, bp.freq.value(), bp.gain.value());
+            let center = to_px(bounds, bp.freq.value(), node_gain_db(bp));
 
             let is_hover = hover == Some(i);
             let is_drag = dragging == Some(i);
@@ -778,7 +781,11 @@ impl GraphView {
                     let gain_db = y_to_db((local_y / bounds.height).clamp(0.0, 1.0));
                     let bp = &program.params.band_params[state.band];
                     program.set_plain(&bp.freq, freq);
-                    program.set_plain(&bp.gain, gain_db);
+                    // A cut has no gain to drag; moving vertically would write
+                    // a value nothing reads.
+                    if FilterType::from_i32(bp.filter_type.value()).has_gain() {
+                        program.set_plain(&bp.gain, gain_db);
+                    }
                     (canvas::event::Status::Captured, None)
                 } else {
                     // Hover highlight when near a node
@@ -818,6 +825,18 @@ impl GraphView {
                 };
                 if lines_y == 0.0 {
                     return (canvas::event::Status::Ignored, None);
+                }
+
+                // A cut has no Q; scrolling it steps the slope instead, which
+                // is the control that actually shapes it.
+                let bp = &program.params.band_params[hit.band_index];
+                let ftype = FilterType::from_i32(bp.filter_type.value());
+                if ftype.is_cut() {
+                    let current = crate::Slope::from_i32(bp.slope.value()) as i32;
+                    let next = (current + lines_y.signum() as i32)
+                        .clamp(0, crate::Slope::ALL.len() as i32 - 1);
+                    program.set_gesture(&bp.slope, next);
+                    return (canvas::event::Status::Captured, None);
                 }
 
                 let fine = program.fine_scroll.get();
@@ -983,46 +1002,11 @@ mod tests {
 
     use super::*;
     use crate::dsp::spectrum::SpectrumRing;
-    use crate::test_support::{test_params, NullGuiContext};
+    use crate::test_support::{test_params, NullGuiContext, RecordingGuiContext};
     use atomic_float::AtomicF32;
     use iced_graphics::Primitive;
     use nih_plug::prelude::util;
     use nih_plug::prelude::Param;
-
-    /// Records the normalized values the draw/interaction code writes to the
-    /// host, so tests can assert on *what* the GUI asks the host to do.
-    #[derive(Default)]
-    struct TestGuiContext {
-        writes: std::sync::Mutex<Vec<f32>>,
-    }
-
-    impl TestGuiContext {
-        fn writes(&self) -> Vec<f32> {
-            self.writes.lock().unwrap().clone()
-        }
-    }
-
-    impl GuiContext for TestGuiContext {
-        fn plugin_api(&self) -> PluginApi {
-            PluginApi::Standalone
-        }
-        fn request_resize(&self) -> bool {
-            false
-        }
-        unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
-        unsafe fn raw_set_parameter_normalized(&self, _param: ParamPtr, normalized: f32) {
-            self.writes.lock().unwrap().push(normalized);
-        }
-        unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
-        fn get_state(&self) -> PluginState {
-            PluginState {
-                version: String::new(),
-                params: Default::default(),
-                fields: Default::default(),
-            }
-        }
-        fn set_state(&self, _state: PluginState) {}
-    }
 
     fn bounds() -> Rectangle {
         Rectangle {
@@ -1267,6 +1251,29 @@ mod tests {
             "filter type not tracked"
         );
         assert_ne!(
+            CachedLayers::key_for(
+                &crate::test_support::test_params_with_slopes(&[(
+                    1_000.0,
+                    0.0,
+                    0.707,
+                    FilterType::LowCut,
+                    crate::Slope::Db12
+                )]),
+                b
+            ),
+            CachedLayers::key_for(
+                &crate::test_support::test_params_with_slopes(&[(
+                    1_000.0,
+                    0.0,
+                    0.707,
+                    FilterType::LowCut,
+                    crate::Slope::Db48
+                )]),
+                b
+            ),
+            "cut slope not tracked — the drawn curve would go stale"
+        );
+        assert_ne!(
             base,
             CachedLayers::key_for(&test_params(&[]), b),
             "band count not tracked"
@@ -1298,7 +1305,7 @@ mod tests {
 
     #[test]
     fn clicking_empty_graph_creates_a_band_at_that_frequency() {
-        let ctx = Arc::new(TestGuiContext::default());
+        let ctx = Arc::new(RecordingGuiContext::default());
         let (view, program) = {
             #[allow(clippy::arc_with_non_send_sync)]
             let p = Arc::new(test_program_with(test_params(&[]), ctx.clone()));
@@ -1314,15 +1321,19 @@ mod tests {
         );
 
         let writes = ctx.writes();
-        assert_eq!(writes.len(), 6, "5 band params + the band count");
+        assert_eq!(
+            writes.len(),
+            7,
+            "6 band params (freq, gain, q, type, slope, enable) + the band count"
+        );
         assert!(
-            (writes[4] - 1.0).abs() < 1e-6,
+            (writes[5] - 1.0).abs() < 1e-6,
             "created band must be enabled"
         );
         assert!(
-            (writes[5] - 1.0 / MAX_BANDS as f32).abs() < 1e-4,
+            (writes[6] - 1.0 / MAX_BANDS as f32).abs() < 1e-4,
             "band count must be raised to 1, got normalized {}",
-            writes[5]
+            writes[6]
         );
         let expected_freq = program.params.band_params[0]
             .freq
@@ -1339,7 +1350,7 @@ mod tests {
 
     #[test]
     fn right_clicking_a_node_deletes_it_and_compacts_the_tail() {
-        let ctx = Arc::new(TestGuiContext::default());
+        let ctx = Arc::new(RecordingGuiContext::default());
         let (view, program) = {
             #[allow(clippy::arc_with_non_send_sync)]
             let p = Arc::new(test_program_with(
@@ -1375,7 +1386,7 @@ mod tests {
 
     #[test]
     fn deleting_a_middle_band_copies_the_tail_down_before_lowering_the_count() {
-        let ctx = Arc::new(TestGuiContext::default());
+        let ctx = Arc::new(RecordingGuiContext::default());
         let program = test_program_with(
             test_params(&[
                 (100.0, 1.0, 1.0, FilterType::Bell),
@@ -1387,7 +1398,7 @@ mod tests {
         program.delete_band(1);
 
         let writes = ctx.writes();
-        assert_eq!(writes.len(), 6, "one band copied (5 params) + the count");
+        assert_eq!(writes.len(), 7, "one band copied (6 params) + the count");
         // The copied frequency must be the third band's 5 kHz, not the deleted one.
         let expected = program.params.band_params[1]
             .freq
@@ -1397,14 +1408,14 @@ mod tests {
             "tail band was not copied into the freed slot"
         );
         assert!(
-            (writes[5] - 2.0 / MAX_BANDS as f32).abs() < 1e-4,
+            (writes[6] - 2.0 / MAX_BANDS as f32).abs() < 1e-4,
             "band count must drop to 2"
         );
     }
 
     #[test]
     fn double_clicking_a_node_resets_its_gain() {
-        let ctx = Arc::new(TestGuiContext::default());
+        let ctx = Arc::new(RecordingGuiContext::default());
         let (view, _program) = {
             #[allow(clippy::arc_with_non_send_sync)]
             let p = Arc::new(test_program_with(
@@ -1438,7 +1449,7 @@ mod tests {
 
     #[test]
     fn creating_a_band_when_the_bank_is_full_is_a_no_op() {
-        let ctx = Arc::new(TestGuiContext::default());
+        let ctx = Arc::new(RecordingGuiContext::default());
         let full: Vec<(f32, f32, f32, FilterType)> = (0..MAX_BANDS)
             .map(|i| (100.0 + i as f32 * 100.0, 0.0, 1.0, FilterType::Bell))
             .collect();
@@ -1674,8 +1685,8 @@ mod tests {
     /// Params + a recording context, with band 0 selected, ready for a key.
     fn keyboard_fixture(
         bands: &[(f32, f32, f32, FilterType)],
-    ) -> (GraphView, Arc<GraphProgram>, Arc<TestGuiContext>) {
-        let ctx = Arc::new(TestGuiContext::default());
+    ) -> (GraphView, Arc<GraphProgram>, Arc<RecordingGuiContext>) {
+        let ctx = Arc::new(RecordingGuiContext::default());
         #[allow(clippy::arc_with_non_send_sync)]
         let p = Arc::new(test_program_with(test_params(bands), ctx.clone()));
         p.select(Some(0));
@@ -1825,5 +1836,111 @@ mod tests {
         press(&view, keyboard::KeyCode::Escape);
 
         assert_eq!(program.selected(), None);
+    }
+
+    // ---- cuts and slopes ------------------------------------------------
+
+    /// A cut's node is drawn and grabbed on the 0 dB line, so clicking where
+    /// the node appears must grab it — not create a second band on top.
+    #[test]
+    fn a_cut_node_is_grabbed_on_the_zero_db_line() {
+        let ctx = Arc::new(RecordingGuiContext::default());
+        let params = crate::test_support::test_params_with_slopes(&[(
+            1_000.0,
+            0.0,
+            0.707,
+            FilterType::LowCut,
+            crate::Slope::Db24,
+        )]);
+        #[allow(clippy::arc_with_non_send_sync)]
+        let program = Arc::new(test_program_with(params.clone(), ctx.clone()));
+        let view = GraphView {
+            program: program.clone(),
+        };
+        let b = bounds();
+
+        // The band's gain parameter says +12 dB, but a cut is drawn at 0 dB.
+        let (x, y) = node_xy(&program, 0);
+        assert!(
+            (y - (b.y + db_to_y(0.0) * b.height)).abs() < 1.0,
+            "a cut node belongs on the 0 dB line, got y = {y}"
+        );
+
+        click_at(&view, b, x, y, mouse::Button::Left);
+        assert!(
+            ctx.writes().is_empty(),
+            "clicking a cut node created a band instead of grabbing it: {:?}",
+            ctx.writes()
+        );
+        assert!(program.drag.get().is_some(), "the node should be grabbed");
+    }
+
+    #[test]
+    fn scrolling_over_a_cut_steps_the_slope_instead_of_the_q() {
+        let ctx = Arc::new(RecordingGuiContext::default());
+        let params = crate::test_support::test_params_with_slopes(&[(
+            1_000.0,
+            0.0,
+            0.707,
+            FilterType::LowCut,
+            crate::Slope::Db12,
+        )]);
+        #[allow(clippy::arc_with_non_send_sync)]
+        let program = Arc::new(test_program_with(params.clone(), ctx.clone()));
+        let view = GraphView {
+            program: program.clone(),
+        };
+        let b = bounds();
+        let (x, y) = node_xy(&program, 0);
+        let cursor = Cursor::Available(Point::new(x, y));
+
+        view.handle_mouse_event(
+            mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+            },
+            b,
+            cursor,
+        );
+
+        let writes = ctx.writes();
+        assert_eq!(writes.len(), 1, "one slope step, one write: {writes:?}");
+        let slope = &params.band_params[0].slope;
+        let expected = slope.preview_normalized(crate::Slope::Db18 as i32);
+        assert!(
+            (writes[0] - expected).abs() < 1e-6,
+            "12 dB/oct + 1 step should be 18 dB/oct"
+        );
+    }
+
+    #[test]
+    fn scrolling_over_a_bell_still_steps_the_q() {
+        let (view, program, ctx) = keyboard_fixture(&[(1_000.0, 0.0, 1.0, FilterType::Bell)]);
+        let b = bounds();
+        let (x, y) = node_xy(&program, 0);
+
+        view.handle_mouse_event(
+            mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+            },
+            b,
+            Cursor::Available(Point::new(x, y)),
+        );
+
+        let writes = ctx.writes();
+        assert_eq!(writes.len(), 1);
+        // Scrolling up opens the Q: the normalized value must move up from
+        // where it was, and the slope must not have been touched.
+        let q = &program.params.band_params[0].q;
+        assert!(
+            writes[0] > q.preview_normalized(q.value()),
+            "expected a wider Q, got normalized {} from {}",
+            writes[0],
+            q.preview_normalized(q.value())
+        );
+        assert_eq!(
+            crate::Slope::from_i32(program.params.band_params[0].slope.value()),
+            crate::Slope::DEFAULT,
+            "scrolling a bell must not change the slope"
+        );
     }
 }
