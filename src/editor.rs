@@ -10,6 +10,7 @@ use crate::ui;
 use crate::ui::selection;
 use crate::FilterParams;
 use crate::FilterType;
+use crate::Slope;
 use crate::MAX_BANDS;
 
 pub use colors::band_color;
@@ -185,6 +186,7 @@ struct FilterEditor {
     gain_slider_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
     q_slider_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
     type_pick_states: [std::cell::UnsafeCell<pick_list::State<FilterType>>; MAX_BANDS],
+    slope_pick_states: [std::cell::UnsafeCell<pick_list::State<Slope>>; MAX_BANDS],
     chip_states: [std::cell::UnsafeCell<button::State>; MAX_BANDS],
 }
 
@@ -210,6 +212,16 @@ impl FilterEditor {
         states: &[std::cell::UnsafeCell<pick_list::State<FilterType>>; MAX_BANDS],
         i: usize,
     ) -> &mut pick_list::State<FilterType> {
+        &mut *states[i].get()
+    }
+
+    /// Get a mutable reference to a slope pick list state by index.
+    /// Safety: Caller must ensure no two calls with the same index are active simultaneously.
+    #[allow(clippy::mut_from_ref)] // false positive: UnsafeCell::get() is the intended API
+    unsafe fn slope_pick_state(
+        states: &[std::cell::UnsafeCell<pick_list::State<Slope>>; MAX_BANDS],
+        i: usize,
+    ) -> &mut pick_list::State<Slope> {
         &mut *states[i].get()
     }
 
@@ -248,6 +260,8 @@ pub enum Message {
     ParamUpdate(nih_widgets::ParamMessage),
     /// Band `index` changed filter type.
     TypeChanged(usize, FilterType),
+    /// Band `index` changed cut slope.
+    SlopeChanged(usize, Slope),
     /// Band `index` enabled/disabled.
     EnableChanged(usize, bool),
     /// Band `index` selected from the band strip.
@@ -263,6 +277,16 @@ impl FilterEditor {
         let setter = ParamSetter::new(self.context.as_ref());
         setter.begin_set_parameter(param);
         setter.set_parameter(param, filter_type as i32);
+        setter.end_set_parameter(param);
+        Command::none()
+    }
+
+    /// Set a cut band's slope as a single automation gesture.
+    fn set_band_slope(&mut self, index: usize, slope: Slope) -> Command<Message> {
+        let param = &self.params.band_params[index].slope;
+        let setter = ParamSetter::new(self.context.as_ref());
+        setter.begin_set_parameter(param);
+        setter.set_parameter(param, slope as i32);
         setter.end_set_parameter(param);
         Command::none()
     }
@@ -315,6 +339,9 @@ impl IcedEditor for FilterEditor {
             type_pick_states: core::array::from_fn(|_| {
                 std::cell::UnsafeCell::new(pick_list::State::default())
             }),
+            slope_pick_states: core::array::from_fn(|_| {
+                std::cell::UnsafeCell::new(pick_list::State::default())
+            }),
             chip_states: core::array::from_fn(|_| std::cell::UnsafeCell::new(button::State::new())),
         };
         (editor, Command::none())
@@ -333,6 +360,9 @@ impl IcedEditor for FilterEditor {
             Message::ParamUpdate(message) => self.handle_param_message(message),
             Message::TypeChanged(index, filter_type) => {
                 let _ = self.set_band_type(index, filter_type);
+            }
+            Message::SlopeChanged(index, slope) => {
+                let _ = self.set_band_slope(index, slope);
             }
             Message::EnableChanged(index, enabled) => {
                 let _ = self.set_band_enable(index, enabled);
@@ -501,24 +531,33 @@ impl IcedEditor for FilterEditor {
             })
             .size(14);
 
-            let readouts = Row::new()
-                .spacing(16)
-                .align_items(Alignment::Center)
-                .push(
-                    Text::new(selection::format_freq(bp.freq.value()))
-                        .size(12)
-                        .color(colors::TEXT),
-                )
-                .push(
+            // A cut is described by its slope, everything else by gain and Q.
+            // Showing a gain that nothing reads would be a lie about the state.
+            let mut readouts = Row::new().spacing(16).align_items(Alignment::Center).push(
+                Text::new(selection::format_freq(bp.freq.value()))
+                    .size(12)
+                    .color(colors::TEXT),
+            );
+            if ftype.has_gain() {
+                readouts = readouts.push(
                     Text::new(selection::format_gain(bp.gain.value()))
                         .size(12)
                         .color(colors::TEXT),
-                )
-                .push(
+                );
+            }
+            if ftype.is_cut() {
+                readouts = readouts.push(
+                    Text::new(Slope::from_i32(bp.slope.value()).name())
+                        .size(12)
+                        .color(colors::TEXT),
+                );
+            } else {
+                readouts = readouts.push(
                     Text::new(selection::format_q(bp.q.value()))
                         .size(12)
                         .color(colors::TEXT),
                 );
+            }
 
             let top = Row::new()
                 .spacing(10)
@@ -538,35 +577,52 @@ impl IcedEditor for FilterEditor {
                 .width(Length::Fill)
                 .map(Message::ParamUpdate)
             };
-            let gain_slider = unsafe {
-                nih_widgets::ParamSlider::new(
-                    Self::slider_state(&self.gain_slider_states, i),
-                    &self.params.band_params[i].gain,
-                )
-                .width(Length::Fill)
-                .map(Message::ParamUpdate)
-            };
-            let q_slider = unsafe {
-                nih_widgets::ParamSlider::new(
-                    Self::slider_state(&self.q_slider_states, i),
-                    &self.params.band_params[i].q,
-                )
-                .width(Length::Fill)
-                .map(Message::ParamUpdate)
-            };
+            let mut controls = Row::new()
+                .spacing(10)
+                .align_items(Alignment::Center)
+                .push(freq_slider);
+            if ftype.has_gain() {
+                let gain_slider = unsafe {
+                    nih_widgets::ParamSlider::new(
+                        Self::slider_state(&self.gain_slider_states, i),
+                        &self.params.band_params[i].gain,
+                    )
+                    .width(Length::Fill)
+                    .map(Message::ParamUpdate)
+                };
+                controls = controls.push(gain_slider);
+            }
+            if ftype.is_cut() {
+                // Slope is the cut's steepness control; there is no Q to show.
+                // Safety: each index i is visited once per frame
+                let slope_pick = unsafe {
+                    PickList::new(
+                        Self::slope_pick_state(&self.slope_pick_states, i),
+                        &Slope::ALL,
+                        Some(Slope::from_i32(bp.slope.value())),
+                        move |s| Message::SlopeChanged(i, s),
+                    )
+                    .text_size(11)
+                    .width(Length::Fill)
+                };
+                controls = controls.push(slope_pick);
+            } else {
+                let q_slider = unsafe {
+                    nih_widgets::ParamSlider::new(
+                        Self::slider_state(&self.q_slider_states, i),
+                        &self.params.band_params[i].q,
+                    )
+                    .width(Length::Fill)
+                    .map(Message::ParamUpdate)
+                };
+                controls = controls.push(q_slider);
+            }
 
             Column::new()
                 .height(Length::Units(PANEL_H))
                 .spacing(4)
                 .push(top)
-                .push(
-                    Row::new()
-                        .spacing(10)
-                        .align_items(Alignment::Center)
-                        .push(freq_slider)
-                        .push(gain_slider)
-                        .push(q_slider),
-                )
+                .push(controls)
                 .into()
         };
 
@@ -600,7 +656,25 @@ impl IcedEditor for FilterEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{test_params, NullGuiContext};
+    use crate::test_support::{test_params, NullGuiContext, RecordingGuiContext};
+    use nih_plug::prelude::Param;
+
+    /// An editor over explicit bands, plus the context that records its writes.
+    fn editor_with_bands(
+        bands: &[(f32, f32, f32, FilterType)],
+    ) -> (FilterEditor, Arc<RecordingGuiContext>) {
+        let params = test_params(bands);
+        let context = Arc::new(RecordingGuiContext::default());
+        let flags = (
+            params,
+            Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
+            Arc::new(SpectrumRing::new()),
+        );
+        #[allow(clippy::arc_with_non_send_sync)]
+        let ctx: Arc<dyn GuiContext> = context.clone();
+        let (editor, _) = <FilterEditor as IcedEditor>::new(flags, ctx);
+        (editor, context)
+    }
 
     fn editor_with(num_bands: usize) -> FilterEditor {
         let bands: Vec<(f32, f32, f32, FilterType)> = (0..num_bands)
@@ -685,5 +759,38 @@ mod tests {
         assert_eq!(editor.selected(1), 0);
         editor.select_if_live(0);
         assert_eq!(editor.selected(1), 0);
+    }
+
+    #[test]
+    fn changing_slope_is_one_single_gesture() {
+        let (mut editor, ctx) = editor_with_bands(&[(100.0, 0.0, 0.707, FilterType::LowCut)]);
+        let _ = editor.set_band_slope(0, Slope::Db48);
+
+        let writes = ctx.writes();
+        assert_eq!(writes.len(), 1, "one begin/set/end, one write: {writes:?}");
+        let expected = editor.params.band_params[0]
+            .slope
+            .preview_normalized(Slope::Db48 as i32);
+        assert!((writes[0] - expected).abs() < 1e-6);
+    }
+
+    /// A cut has no meaningful gain and no Q: the panel must build from the
+    /// slope branch instead, with the gain and Q sliders absent.
+    #[test]
+    fn the_panel_builds_for_every_filter_type() {
+        for filter_type in FilterType::ALL {
+            let (mut editor, _) = editor_with_bands(&[(500.0, 3.0, 1.0, filter_type)]);
+            editor.select(0);
+            let _ = editor.view();
+        }
+    }
+
+    /// Building the view must not write to the host — a repaint is not an edit.
+    #[test]
+    fn rendering_never_writes_parameters() {
+        let (mut editor, ctx) = editor_with_bands(&[(500.0, 3.0, 1.0, FilterType::LowCut)]);
+        editor.select(0);
+        let _ = editor.view();
+        assert!(ctx.writes().is_empty(), "view() wrote {:?}", ctx.writes());
     }
 }

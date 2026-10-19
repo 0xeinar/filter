@@ -16,6 +16,7 @@ const SETTLE: usize = 4_000;
 fn specs(bands: &[(f32, f32, f32, FilterType)]) -> [BandSpec; MAX_BANDS] {
     core::array::from_fn(|i| match bands.get(i) {
         Some(&(freq, gain_db, q, filter_type)) => BandSpec {
+            slope_db_per_oct: 12,
             freq,
             gain_db,
             q,
@@ -23,6 +24,7 @@ fn specs(bands: &[(f32, f32, f32, FilterType)]) -> [BandSpec; MAX_BANDS] {
             enabled: true,
         },
         None => BandSpec {
+            slope_db_per_oct: 12,
             freq: 1000.0,
             gain_db: 0.0,
             q: 1.0,

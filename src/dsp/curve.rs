@@ -43,7 +43,22 @@ pub struct BandSpec {
     pub gain_db: f32,
     pub q: f32,
     pub filter_type: FilterType,
+    /// Only cuts use more than one section.
+    pub slope_db_per_oct: u32,
     pub enabled: bool,
+}
+
+impl Default for BandSpec {
+    fn default() -> Self {
+        Self {
+            freq: 1000.0,
+            gain_db: 0.0,
+            q: 1.0,
+            filter_type: FilterType::Bell,
+            slope_db_per_oct: 12,
+            enabled: false,
+        }
+    }
 }
 
 /// Combined response of all bands at a given frequency.
@@ -63,12 +78,20 @@ pub fn combined_response_db(bands: &[BandSpec; MAX_BANDS], num_active: usize, fr
 
 /// Analytic magnitude (dB) of one band at one frequency.
 ///
-/// Builds a throwaway biquad with the Audio EQ Cookbook coefficients — the
-/// same math as `BiquadFilter::update_coefficients` — and evaluates |H(e^jw)|.
+/// Builds a throwaway cascade with the Audio EQ Cookbook coefficients — the
+/// same `BiquadCoeffs::update_cascade` the audio path uses — and evaluates
+/// |H(e^jw)| for every section. Because both sides call the same function, the
+/// drawn curve cannot drift from what is heard.
 pub fn band_response_db(spec: &BandSpec, freq: f32) -> f32 {
-    // Share coefficient computation with the DSP by going through a real filter.
     let mut f = super::biquad::BiquadFilter::new();
-    f.update_coefficients(spec.freq, spec.gain_db, spec.q, spec.filter_type, 48_000.0);
+    f.update_cascade(
+        spec.freq,
+        spec.gain_db,
+        spec.q,
+        spec.filter_type,
+        spec.slope_db_per_oct,
+        48_000.0,
+    );
     let mag = f.magnitude_at_freq(freq, 48_000.0);
     20.0 * mag.max(1e-6).log10()
 }
@@ -208,6 +231,7 @@ mod tests {
     fn specs(bands: &[(f32, f32, f32, FilterType)]) -> [BandSpec; MAX_BANDS] {
         core::array::from_fn(|i| match bands.get(i) {
             Some(&(freq, gain, q, t)) => BandSpec {
+                slope_db_per_oct: 12,
                 freq,
                 gain_db: gain,
                 q,
@@ -215,6 +239,7 @@ mod tests {
                 enabled: true,
             },
             None => BandSpec {
+                slope_db_per_oct: 12,
                 freq: 1000.0,
                 gain_db: 0.0,
                 q: 1.0,
@@ -293,6 +318,7 @@ mod tests {
 
     fn spec(freq: f32, gain: f32, q: f32, t: FilterType) -> BandSpec {
         BandSpec {
+            slope_db_per_oct: 12,
             freq,
             gain_db: gain,
             q,
@@ -341,6 +367,7 @@ mod tests {
     #[test]
     fn flat_curve_is_zero_db() {
         let bands: [BandSpec; MAX_BANDS] = core::array::from_fn(|_| BandSpec {
+            slope_db_per_oct: 12,
             freq: 1000.0,
             gain_db: 6.0,
             q: 1.0,
@@ -354,6 +381,7 @@ mod tests {
     #[test]
     fn disabled_band_contributes_nothing() {
         let mut bands: [BandSpec; MAX_BANDS] = core::array::from_fn(|_| BandSpec {
+            slope_db_per_oct: 12,
             freq: 1000.0,
             gain_db: 0.0,
             q: 1.0,
@@ -369,6 +397,7 @@ mod tests {
     #[test]
     fn bell_peaks_at_its_frequency() {
         let mut bands: [BandSpec; MAX_BANDS] = core::array::from_fn(|_| BandSpec {
+            slope_db_per_oct: 12,
             freq: 1000.0,
             gain_db: 0.0,
             q: 1.0,
@@ -387,6 +416,7 @@ mod tests {
     #[test]
     fn low_cut_attenuates_lows() {
         let mut bands: [BandSpec; MAX_BANDS] = core::array::from_fn(|_| BandSpec {
+            slope_db_per_oct: 12,
             freq: 1000.0,
             gain_db: 0.0,
             q: 1.0,
@@ -404,6 +434,7 @@ mod tests {
     #[test]
     fn two_bands_sum() {
         let mut bands: [BandSpec; MAX_BANDS] = core::array::from_fn(|_| BandSpec {
+            slope_db_per_oct: 12,
             freq: 1000.0,
             gain_db: 0.0,
             q: 1.0,
@@ -425,6 +456,7 @@ mod tests {
     #[test]
     fn response_curve_matches_point_evaluation() {
         let mut bands: [BandSpec; MAX_BANDS] = core::array::from_fn(|_| BandSpec {
+            slope_db_per_oct: 12,
             freq: 1000.0,
             gain_db: 0.0,
             q: 1.0,
@@ -505,5 +537,56 @@ mod tests {
     fn scroll_q_steps() {
         assert!((scroll_q_step(false) - 0.02).abs() < 1e-6);
         assert!((scroll_q_step(true) - 0.005).abs() < 1e-6);
+    }
+
+    // === Slope and the newer filter types, as drawn ===
+
+    #[test]
+    fn the_drawn_curve_follows_the_slope() {
+        // The curve is the picture of the audio, so a slope change has to move
+        // it. 48 dB/oct must be far below 12 dB/oct in the stopband.
+        let mut steep = spec(1_000.0, 0.0, 0.707, FilterType::LowCut);
+        steep.slope_db_per_oct = 48;
+        let gentle = spec(1_000.0, 0.0, 0.707, FilterType::LowCut);
+
+        let gentle_db = band_response_db(&gentle, 250.0);
+        let steep_db = band_response_db(&steep, 250.0);
+        assert!(
+            steep_db < gentle_db - 15.0,
+            "48 dB/oct should be much deeper than 12 at 250 Hz: {steep_db:.1} vs {gentle_db:.1}"
+        );
+    }
+
+    #[test]
+    fn notch_band_pass_and_tilt_show_up_in_the_curve() {
+        let notch = spec(1_000.0, 0.0, 4.0, FilterType::Notch);
+        assert!(band_response_db(&notch, 1_000.0) < -40.0);
+        assert!(band_response_db(&notch, 100.0).abs() < 1.0);
+
+        let band_pass = spec(1_000.0, 0.0, 2.0, FilterType::BandPass);
+        assert!(band_response_db(&band_pass, 1_000.0).abs() < 0.2);
+        assert!(band_response_db(&band_pass, 50.0) < -10.0);
+
+        let tilt = spec(1_000.0, 12.0, 0.707, FilterType::TiltShelf);
+        assert!(
+            band_response_db(&tilt, 30.0) < -4.0,
+            "a +12 dB tilt cuts the bottom"
+        );
+        assert!(
+            band_response_db(&tilt, 15_000.0) > 4.0,
+            "a +12 dB tilt boosts the top"
+        );
+    }
+
+    #[test]
+    fn a_cut_curve_does_not_move_with_gain() {
+        let flat = spec(500.0, 0.0, 0.707, FilterType::LowCut);
+        let boosted = spec(500.0, 18.0, 0.707, FilterType::LowCut);
+        for freq in [50.0, 500.0, 5_000.0] {
+            assert!(
+                (band_response_db(&flat, freq) - band_response_db(&boosted, freq)).abs() < 1e-3,
+                "a cut's drawn response must ignore gain (at {freq} Hz)"
+            );
+        }
     }
 }

@@ -36,8 +36,56 @@ impl GuiContext for NullGuiContext {
     fn set_state(&self, _state: PluginState) {}
 }
 
+/// A `GuiContext` that records the normalized values the GUI writes, so a
+/// test can assert on what the editor asked the host to do.
+#[derive(Default)]
+pub struct RecordingGuiContext {
+    writes: std::sync::Mutex<Vec<f32>>,
+}
+
+impl RecordingGuiContext {
+    /// Normalized values written so far, in order.
+    pub fn writes(&self) -> Vec<f32> {
+        self.writes.lock().unwrap().clone()
+    }
+}
+
+impl GuiContext for RecordingGuiContext {
+    fn plugin_api(&self) -> PluginApi {
+        PluginApi::Standalone
+    }
+    fn request_resize(&self) -> bool {
+        false
+    }
+    unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
+    unsafe fn raw_set_parameter_normalized(&self, _param: ParamPtr, normalized: f32) {
+        self.writes.lock().unwrap().push(normalized);
+    }
+    unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
+    fn get_state(&self) -> PluginState {
+        PluginState {
+            version: String::new(),
+            params: Default::default(),
+            fields: Default::default(),
+        }
+    }
+    fn set_state(&self, _state: PluginState) {}
+}
+
 /// A band with explicit values.
 pub fn band(freq: f32, gain: f32, q: f32, ftype: FilterType, enabled: bool) -> BandParams {
+    band_with_slope(freq, gain, q, ftype, crate::Slope::DEFAULT as i32, enabled)
+}
+
+/// A band with an explicit slope index (`Slope` as i32; 1 = 12 dB/oct).
+pub fn band_with_slope(
+    freq: f32,
+    gain: f32,
+    q: f32,
+    ftype: FilterType,
+    slope_index: i32,
+    enabled: bool,
+) -> BandParams {
     BandParams {
         freq: FloatParam::new(
             "Freq",
@@ -68,7 +116,15 @@ pub fn band(freq: f32, gain: f32, q: f32, ftype: FilterType, enabled: bool) -> B
             },
         )
         .with_smoother(SmoothingStyle::Logarithmic(20.0)),
-        filter_type: IntParam::new("Type", ftype as i32, IntRange::Linear { min: 0, max: 4 }),
+        filter_type: IntParam::new("Type", ftype as i32, IntRange::Linear { min: 0, max: 8 }),
+        slope: IntParam::new(
+            "Slope",
+            slope_index,
+            IntRange::Linear {
+                min: 0,
+                max: crate::Slope::ALL.len() as i32 - 1,
+            },
+        ),
         enable: BoolParam::new("Enable", enabled),
     }
 }
@@ -79,6 +135,29 @@ pub fn test_params(bands: &[(f32, f32, f32, FilterType)]) -> Arc<FilterParams> {
     let mut band_params: [BandParams; MAX_BANDS] = core::array::from_fn(|_| BandParams::default());
     for (i, &(freq, gain, q, ftype)) in bands.iter().enumerate() {
         band_params[i] = band(freq, gain, q, ftype, true);
+    }
+    Arc::new(FilterParams {
+        num_bands: IntParam::new(
+            "Bands",
+            bands.len() as i32,
+            IntRange::Linear {
+                min: 0,
+                max: MAX_BANDS as i32,
+            },
+        ),
+        band_params,
+        ..FilterParams::default()
+    })
+}
+
+/// Params whose bands also carry a cut slope — `test_params` leaves every band
+/// at the default 12 dB/oct.
+pub fn test_params_with_slopes(
+    bands: &[(f32, f32, f32, FilterType, crate::Slope)],
+) -> Arc<FilterParams> {
+    let mut band_params: [BandParams; MAX_BANDS] = core::array::from_fn(|_| BandParams::default());
+    for (i, &(freq, gain, q, ftype, slope)) in bands.iter().enumerate() {
+        band_params[i] = band_with_slope(freq, gain, q, ftype, slope as i32, true);
     }
     Arc::new(FilterParams {
         num_bands: IntParam::new(
