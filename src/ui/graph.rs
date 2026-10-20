@@ -1290,7 +1290,7 @@ mod tests {
     fn triangles(primitive: &Primitive, out: &mut Vec<[[f32; 6]; 3]>) {
         match primitive {
             Primitive::Mesh2D { buffers, .. } => {
-                for idx in buffers.indices.chunks_exact(3) {
+                for idx in buffers.indices.as_chunks::<3>().0 {
                     let mut tri = [[0.0f32; 6]; 3];
                     for (k, &i) in idx.iter().enumerate() {
                         let v = buffers.vertices[i as usize];

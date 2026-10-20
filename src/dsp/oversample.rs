@@ -287,7 +287,7 @@ fn down_stage(
     input: &[f32],
     out: &mut [f32],
 ) {
-    for (i, pair) in input.chunks_exact(2).enumerate() {
+    for (i, pair) in input.as_chunks::<2>().0.iter().enumerate() {
         *pos = if *pos + 1 == TAPS { 0 } else { *pos + 1 };
         hist[*pos] = pair[0];
         *pos = if *pos + 1 == TAPS { 0 } else { *pos + 1 };
