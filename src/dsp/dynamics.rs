@@ -30,23 +30,132 @@ const LEVEL_FLOOR: f32 = 1e-6;
 /// mean "reach full gain at threshold", i.e. a step — treat it as off.
 pub const MIN_RANGE_DB: f32 = 0.1;
 
-/// Gain applied by a dynamic band, in dB.
+/// Knee widths below this are a hard corner (the floating-point equivalent of
+/// "knee off").
+pub const MIN_KNEE_DB: f32 = 0.1;
+
+/// Listening Q for a sidechain-filtered detector.
 ///
-/// `amount` ramps linearly in dB from 0 at the threshold to 1 at
-/// `threshold + range`, then holds. Below the threshold the band contributes
-/// nothing, which is what makes the EQ frequency-selective in level rather than
-/// in time: quiet material passes untouched.
+/// Fixed rather than shared with the band: the point of a sidechain is to
+/// listen somewhere *else*, and inheriting the band's Q would make the trigger
+/// band as narrow as the band being controlled — exactly what you do not want
+/// when ducking a 4-octave bass from a kick.
+pub const SIDECHAIN_Q: f32 = 1.0;
+
+/// Which side of the threshold a dynamic band reacts to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynMode {
+    /// Gain applies *above* the threshold: quiet material passes untouched and
+    /// loud material gets the band's full gain. The default, and the one that
+    /// makes a cut frequency-selective in level.
+    Down,
+    /// Gain applies *below* the threshold, reaching full gain at
+    /// `threshold - knee` (or `threshold - range` with no knee). This is upward
+    /// compression: a positive gain lifts quiet material towards the threshold
+    /// instead of boosting everything.
+    Up,
+}
+
+impl DynMode {
+    pub fn from_i32(value: i32) -> Self {
+        if value == 1 {
+            Self::Up
+        } else {
+            Self::Down
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Down => "Down",
+            Self::Up => "Up",
+        }
+    }
+}
+
+/// The dynamic law of one band: where the transition starts, how wide it is,
+/// how it is eased, and which side of the threshold it acts on.
+///
+/// A struct rather than five positional arguments because two of them are dB
+/// quantities that mean entirely different things (`threshold` and `range`),
+/// and a transposed pair would be invisible in a call site.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DynLaw {
+    pub threshold_db: f32,
+    /// Transition width with no knee: full gain at `threshold + range`.
+    pub range_db: f32,
+    /// Transition width when a knee is set. See [`DynLaw::amount`].
+    pub knee_db: f32,
+    pub mode: DynMode,
+}
+
+impl DynLaw {
+    pub fn new(threshold_db: f32, range_db: f32, knee_db: f32, mode: DynMode) -> Self {
+        Self {
+            threshold_db,
+            range_db,
+            knee_db,
+            mode,
+        }
+    }
+
+    /// How much of the band's static gain applies at `level_db`, in 0..=1.
+    ///
+    /// Two shapes, and only one of them can be the transition:
+    ///
+    /// * **No knee** — linear in dB from 0 at the threshold to 1 at
+    ///   `threshold + range`. A hard corner at the threshold.
+    /// * **Knee `k`** — quadratic from 0 at `threshold - k` to 1 at the
+    ///   threshold, then held. `range` is the transition width *when no knee is
+    ///   set*: a knee and a range cannot both define the same transition, and
+    ///   silently ignoring one of them would be worse than saying so here.
+    ///
+    /// The quadratic is what removes the step: a note decaying through the
+    /// threshold eases into the band instead of arriving at it.
+    pub fn amount(&self, level_db: f32) -> f32 {
+        let knee = self.knee_db;
+        let use_knee = knee >= MIN_KNEE_DB;
+        if !use_knee && self.range_db < MIN_RANGE_DB {
+            // Nothing sane to ramp over: the band is static.
+            return 1.0;
+        }
+        // Upward is the same law with the level mirrored about the threshold —
+        // one implementation, so the knee and the ramp cannot diverge between
+        // the two directions.
+        let level = match self.mode {
+            DynMode::Down => level_db,
+            DynMode::Up => 2.0 * self.threshold_db - level_db,
+        };
+        if !use_knee {
+            return ((level - self.threshold_db) / self.range_db).clamp(0.0, 1.0);
+        }
+        if level <= self.threshold_db - knee {
+            0.0
+        } else if level >= self.threshold_db {
+            1.0
+        } else {
+            let t = (level - (self.threshold_db - knee)) / knee;
+            t * t
+        }
+    }
+
+    /// The gain this band applies, in dB.
+    pub fn gain_db(&self, static_gain_db: f32, level_db: f32) -> f32 {
+        static_gain_db * self.amount(level_db)
+    }
+}
+
+/// Gain applied by a dynamic band with no knee and no direction, in dB.
+///
+/// Kept as a free function because it is the common case and the older tests
+/// read better for it; it is exactly [`DynLaw`] with `knee = 0`, `mode = Down`.
 pub fn dynamic_gain_db(
     static_gain_db: f32,
     level_db: f32,
     threshold_db: f32,
     range_db: f32,
 ) -> f32 {
-    if range_db < MIN_RANGE_DB {
-        return static_gain_db;
-    }
-    let amount = ((level_db - threshold_db) / range_db).clamp(0.0, 1.0);
-    static_gain_db * amount
+    DynLaw::new(threshold_db, range_db, 0.0, DynMode::Down).gain_db(static_gain_db, level_db)
 }
 
 /// One-pole smoothing coefficient for a time constant in milliseconds.
@@ -267,6 +376,113 @@ mod tests {
         // dividing by zero and producing NaN into the coefficients.
         assert_eq!(dynamic_gain_db(-8.0, -60.0, -30.0, 0.0), -8.0);
         assert_eq!(dynamic_gain_db(-8.0, -60.0, -30.0, 0.01), -8.0);
+    }
+
+    // ---- upward mode -----------------------------------------------------
+
+    #[test]
+    fn upward_applies_gain_below_the_threshold_and_not_above_it() {
+        // +6 dB band, threshold -30, range 6, no knee: full gain at -36 and
+        // below, nothing at -30 and above — the mirror of the downward law.
+        let law = DynLaw::new(-30.0, 6.0, 0.0, DynMode::Up);
+        assert_eq!(law.gain_db(6.0, -36.0), 6.0);
+        assert_eq!(law.gain_db(6.0, -40.0), 6.0);
+        assert_eq!(law.gain_db(6.0, -30.0), 0.0);
+        // The case that tempted a second implementation: loud material must be
+        // left alone *by the dynamic part*. It is the same static gain either
+        // way, which for a dynamic band is 0 dB applied.
+        assert_eq!(law.gain_db(6.0, -20.0), 0.0);
+        // Halfway through the mirrored ramp is half the gain.
+        let half = law.gain_db(6.0, -33.0);
+        assert!((half - 3.0).abs() < 1e-4, "expected +3 dB, got {half}");
+    }
+
+    #[test]
+    fn up_and_down_are_mirror_images_of_each_other() {
+        // Same law, level reflected about the threshold: every amount matches
+        // its mirror. This is what keeps the knee from existing twice.
+        let down = DynLaw::new(-30.0, 8.0, 0.0, DynMode::Down);
+        let up = DynLaw::new(-30.0, 8.0, 0.0, DynMode::Up);
+        for tenths in -450..-150 {
+            let level = tenths as f32 / 10.0;
+            let mirror = -60.0 - level;
+            assert!(
+                (down.amount(level) - up.amount(mirror)).abs() < 1e-5,
+                "level {level}: down {} vs up at {mirror} {}",
+                down.amount(level),
+                up.amount(mirror)
+            );
+        }
+    }
+
+    // ---- soft knee -------------------------------------------------------
+
+    #[test]
+    fn a_six_db_knee_gives_a_quarter_of_full_gain_three_db_down() {
+        // The number from the issue: with a 6 dB knee, 3 dB below the threshold
+        // is the midpoint of a quadratic that starts at 0 and ends at 1 —
+        // exactly a quarter.
+        let law = DynLaw::new(-30.0, 12.0, 6.0, DynMode::Down);
+        let amount = law.amount(-33.0);
+        assert!(
+            (amount - 0.25).abs() < 1e-5,
+            "expected 0.25 of full gain, got {amount}"
+        );
+        let gain = law.gain_db(-12.0, -33.0);
+        assert!((gain - -3.0).abs() < 1e-4, "expected -3 dB, got {gain}");
+    }
+
+    #[test]
+    fn the_knee_is_monotonic_and_has_no_step_at_either_end() {
+        let law = DynLaw::new(-30.0, 12.0, 6.0, DynMode::Down);
+        let mut previous = 0.0;
+        let mut level = -40.0;
+        while level <= -20.0 {
+            let amount = law.amount(level);
+            assert!(
+                amount >= previous - 1e-6,
+                "amount fell from {previous} to {amount} at {level} dB"
+            );
+            assert!(
+                amount - previous < 0.05,
+                "step of {:.3} at {level} dB — the knee is not smoothing the corner",
+                amount - previous
+            );
+            previous = amount;
+            level += 0.1;
+        }
+        // Starts at exactly zero, ends at exactly full.
+        assert_eq!(law.amount(-36.0), 0.0);
+        assert_eq!(law.amount(-30.0), 1.0);
+        assert_eq!(law.amount(-30.1).min(1.0), law.amount(-30.1));
+    }
+
+    #[test]
+    fn without_a_knee_the_corner_is_still_a_corner() {
+        // The old behaviour must not change: `range` alone still ramps linearly
+        // from the threshold, and there is no easing below it.
+        let law = DynLaw::new(-30.0, 12.0, 0.0, DynMode::Down);
+        assert_eq!(law.amount(-30.0), 0.0);
+        assert!((law.amount(-24.0) - 0.5).abs() < 1e-5);
+        assert_eq!(law.amount(-18.0), 1.0);
+        // A knee below the minimum width is the same as no knee.
+        let tiny = DynLaw::new(-30.0, 12.0, 0.05, DynMode::Down);
+        assert!((tiny.amount(-24.0) - law.amount(-24.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_knee_works_in_upward_mode_too() {
+        // Mirrored: the transition sits *above* the threshold, so the knee runs
+        // from full gain at the threshold down to nothing `knee` dB above it.
+        let law = DynLaw::new(-30.0, 12.0, 6.0, DynMode::Up);
+        assert_eq!(law.amount(-36.0), 1.0);
+        assert_eq!(law.amount(-30.0), 1.0, "the threshold is still full gain");
+        assert_eq!(law.amount(-24.0), 0.0);
+        let midpoint = law.amount(-27.0); // 3 dB above the threshold
+        assert!(
+            (midpoint - 0.25).abs() < 1e-5,
+            "expected a quarter at the knee midpoint, got {midpoint}"
+        );
     }
 
     #[test]

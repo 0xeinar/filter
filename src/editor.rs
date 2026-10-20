@@ -22,7 +22,7 @@ pub use colors::band_color;
 /// constants below), so this is a hard budget, not a starting suggestion —
 /// `chrome_fits_in_the_window` asserts it.
 pub const EDITOR_WIDTH: u16 = 900;
-pub const EDITOR_HEIGHT: u16 = 500;
+pub const EDITOR_HEIGHT: u16 = 524;
 
 // Fixed region heights. Every region states its height explicitly so the
 // whole column is deterministic and cannot silently overflow the window as
@@ -30,7 +30,7 @@ pub const EDITOR_HEIGHT: u16 = 500;
 // (each row ~24 px, so past five bands the list ran off the bottom).
 const HEADER_H: u16 = 28;
 const STRIP_H: u16 = 24;
-const PANEL_H: u16 = 92;
+const PANEL_H: u16 = 116;
 const FOOTER_H: u16 = 14;
 /// Vertical gap between the column's children.
 const GAP: u16 = 6;
@@ -129,6 +129,15 @@ struct ChipStyle {
     color: Color,
     selected: bool,
     enabled: bool,
+}
+
+/// The mode after `current`, wrapping. Kept as a free function so the wrap can
+/// be tested without a host to write the parameter back.
+fn next_dyn_mode(current: i32) -> i32 {
+    match crate::dsp::dynamics::DynMode::from_i32(current) {
+        crate::dsp::dynamics::DynMode::Down => 1,
+        crate::dsp::dynamics::DynMode::Up => 0,
+    }
 }
 
 /// The A/B slot buttons: filled when live, outlined when not.
@@ -250,6 +259,8 @@ struct FilterEditor {
     slot_copy_state: std::cell::UnsafeCell<button::State>,
     /// Button cache for the oversampling cycle control.
     os_state: std::cell::UnsafeCell<button::State>,
+    /// Button cache for each band's dynamic-mode cycle control.
+    dyn_mode_states: [std::cell::UnsafeCell<button::State>; MAX_BANDS],
     graph: ui::Graph,
     /// Shared with the graph: one of the editor's few pieces of state that
     /// is not a host parameter.
@@ -265,6 +276,8 @@ struct FilterEditor {
     dyn_range_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
     dyn_attack_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
     dyn_release_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
+    dyn_knee_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
+    dyn_sc_freq_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
     type_pick_states: [std::cell::UnsafeCell<pick_list::State<FilterType>>; MAX_BANDS],
     slope_pick_states: [std::cell::UnsafeCell<pick_list::State<Slope>>; MAX_BANDS],
     chip_states: [std::cell::UnsafeCell<button::State>; MAX_BANDS],
@@ -354,6 +367,10 @@ pub enum Message {
     OversamplingCycled,
     /// Band `index` enabled/disabled its dynamics.
     DynamicsToggled(usize, bool),
+    /// Band `index` switched between downward and upward dynamics.
+    DynModeCycled(usize),
+    /// Band `index` enabled/disabled its sidechain filter.
+    SidechainToggled(usize, bool),
     /// Step back one edit.
     Undo,
     /// Step forward again.
@@ -396,6 +413,30 @@ impl FilterEditor {
     /// host records one undo step rather than one per parameter touched.
     fn set_band_dynamics(&self, index: usize, on: bool) -> Command<Message> {
         let param = &self.params.band_params[index].dyn_enable;
+        let setter = ParamSetter::new(self.context.as_ref());
+        setter.begin_set_parameter(param);
+        setter.set_parameter(param, on);
+        setter.end_set_parameter(param);
+        Command::none()
+    }
+
+    /// Switch a band between downward and upward dynamics as one gesture.
+    ///
+    /// Same split as [`Self::set_band_dynamics`]: the decision lives in a plain
+    /// method because `update()` needs a `WindowQueue` a test cannot build.
+    fn cycle_dyn_mode(&self, index: usize) -> Command<Message> {
+        let param = &self.params.band_params[index].dyn_mode;
+        let next = next_dyn_mode(param.value());
+        let setter = ParamSetter::new(self.context.as_ref());
+        setter.begin_set_parameter(param);
+        setter.set_parameter(param, next);
+        setter.end_set_parameter(param);
+        Command::none()
+    }
+
+    /// Enable/disable a band's sidechain filter as one gesture.
+    fn set_band_sidechain(&self, index: usize, on: bool) -> Command<Message> {
+        let param = &self.params.band_params[index].dyn_sc_enable;
         let setter = ParamSetter::new(self.context.as_ref());
         setter.begin_set_parameter(param);
         setter.set_parameter(param, on);
@@ -449,6 +490,9 @@ impl IcedEditor for FilterEditor {
             slot_b_state: std::cell::UnsafeCell::new(button::State::new()),
             slot_copy_state: std::cell::UnsafeCell::new(button::State::new()),
             os_state: std::cell::UnsafeCell::new(button::State::new()),
+            dyn_mode_states: core::array::from_fn(|_| {
+                std::cell::UnsafeCell::new(button::State::new())
+            }),
             graph,
             selection,
             num_bands_slider_state: Default::default(),
@@ -472,6 +516,12 @@ impl IcedEditor for FilterEditor {
                 std::cell::UnsafeCell::new(Default::default())
             }),
             dyn_release_states: core::array::from_fn(|_| {
+                std::cell::UnsafeCell::new(Default::default())
+            }),
+            dyn_knee_states: core::array::from_fn(|_| {
+                std::cell::UnsafeCell::new(Default::default())
+            }),
+            dyn_sc_freq_states: core::array::from_fn(|_| {
                 std::cell::UnsafeCell::new(Default::default())
             }),
             type_pick_states: core::array::from_fn(|_| {
@@ -550,6 +600,12 @@ impl IcedEditor for FilterEditor {
                 let param = &self.params.spectrum_post;
                 let setter = ParamSetter::new(self.context.as_ref());
                 setter.set_parameter(param, on);
+            }
+            Message::DynModeCycled(index) => {
+                let _ = self.cycle_dyn_mode(index);
+            }
+            Message::SidechainToggled(index, on) => {
+                let _ = self.set_band_sidechain(index, on);
             }
             Message::OversamplingCycled => {
                 let param = &self.params.oversampling;
@@ -904,11 +960,10 @@ impl IcedEditor for FilterEditor {
                 controls = controls.push(q_slider);
             }
 
-            // Dynamics row. Only a type with a gain can be dynamic: a cut
+            // Dynamics rows. Only a type with a gain can be dynamic: a cut
             // passes 0 dB at every level, so there is nothing for a detector to
             // modulate. Say that rather than showing controls that do nothing.
-            // The row keeps its height either way, so the panel's height is the
-            // same constant for every band type.
+            // The panel keeps its fixed height either way.
             let dynamics_row: Element<'_, Message> = if ftype.has_gain() {
                 let dyn_on = bp.dyn_enable.value();
                 let mut row = Row::new()
@@ -921,7 +976,26 @@ impl IcedEditor for FilterEditor {
                         .size(14),
                     )
                     .push(Text::new("Dyn").size(11).color(colors::TEXT_DIM));
+                let mut second: Option<Row<'_, Message>> = None;
                 if dyn_on {
+                    // Which side of the threshold the band reacts to. A button
+                    // that cycles and shows the current mode, like the
+                    // oversampling control: two states, and the label is the
+                    // state.
+                    let mode = crate::dsp::dynamics::DynMode::from_i32(bp.dyn_mode.value());
+                    // Safety: each index i is visited once per frame
+                    let mode_button = button::Button::new(
+                        unsafe { &mut *self.dyn_mode_states[i].get() },
+                        Text::new(mode.name()).size(10),
+                    )
+                    .width(Length::Units(38))
+                    .height(Length::Units(20))
+                    .padding(0)
+                    .style(SlotStyle {
+                        active: mode != crate::dsp::dynamics::DynMode::Down,
+                    })
+                    .on_press(Message::DynModeCycled(i));
+
                     // Safety: each index i is visited once per frame
                     let threshold = unsafe {
                         nih_widgets::ParamSlider::new(
@@ -963,7 +1037,55 @@ impl IcedEditor for FilterEditor {
                         .push(Text::new("Atk").size(11).color(colors::TEXT_DIM))
                         .push(attack)
                         .push(Text::new("Rel").size(11).color(colors::TEXT_DIM))
-                        .push(release);
+                        .push(release)
+                        .push(mode_button);
+
+                    // Second row: the knee, and where the detector listens.
+                    // Both only mean something while dynamics are on, so they
+                    // live here rather than taking panel space when they would
+                    // do nothing.
+                    let knee = unsafe {
+                        nih_widgets::ParamSlider::new(
+                            Self::slider_state(&self.dyn_knee_states, i),
+                            &self.params.band_params[i].dyn_knee,
+                        )
+                        .width(Length::Fill)
+                        .map(Message::ParamUpdate)
+                    };
+                    let sc_on = bp.dyn_sc_enable.value();
+                    let mut sc_row = Row::new()
+                        .spacing(8)
+                        .align_items(Alignment::Center)
+                        .push(Text::new("Knee").size(11).color(colors::TEXT_DIM))
+                        .push(knee)
+                        .push(
+                            Toggler::new(sc_on, String::new(), move |on| {
+                                Message::SidechainToggled(i, on)
+                            })
+                            .size(14),
+                        )
+                        .push(Text::new("Sidechain").size(11).color(colors::TEXT_DIM));
+                    if sc_on {
+                        // Safety: each index i is visited once per frame
+                        let sc_freq = unsafe {
+                            nih_widgets::ParamSlider::new(
+                                Self::slider_state(&self.dyn_sc_freq_states, i),
+                                &self.params.band_params[i].dyn_sc_freq,
+                            )
+                            .width(Length::Fill)
+                            .map(Message::ParamUpdate)
+                        };
+                        sc_row = sc_row
+                            .push(Text::new("at").size(11).color(colors::TEXT_DIM))
+                            .push(sc_freq);
+                    } else {
+                        sc_row = sc_row.push(
+                            Text::new("detector follows the band")
+                                .size(11)
+                                .color(colors::TEXT_FAINT),
+                        );
+                    }
+                    second = Some(sc_row);
                 } else {
                     row = row.push(
                         Text::new(
@@ -973,7 +1095,11 @@ impl IcedEditor for FilterEditor {
                         .color(colors::TEXT_FAINT),
                     );
                 }
-                row.into()
+                let mut column = Column::new().spacing(4).push(row);
+                if let Some(second) = second {
+                    column = column.push(second);
+                }
+                column.into()
             } else {
                 Row::new()
                     .align_items(Alignment::Center)
@@ -1081,6 +1207,67 @@ mod tests {
                 let _ = editor.view();
             }
         }
+    }
+
+    #[test]
+    fn the_panel_builds_with_a_knee_a_sidechain_and_upward_mode() {
+        // The widest the dynamics rows ever get: two rows, every slider and
+        // both toggles live. A missing per-band state or a duplicated borrow
+        // panics here rather than on someone's session.
+        let params = test_params_with_dynamics(&[(1_000.0, -6.0, 1.0, FilterType::Bell)]);
+        {
+            let ctx = NullGuiContext;
+            let setter = ParamSetter::new(&ctx);
+            let bp = &params.band_params[0];
+            for _ in 0..1 {
+                setter.begin_set_parameter(&bp.dyn_knee);
+                setter.set_parameter(&bp.dyn_knee, 6.0);
+                setter.end_set_parameter(&bp.dyn_knee);
+                setter.begin_set_parameter(&bp.dyn_sc_enable);
+                setter.set_parameter(&bp.dyn_sc_enable, true);
+                setter.end_set_parameter(&bp.dyn_sc_enable);
+                setter.begin_set_parameter(&bp.dyn_sc_freq);
+                setter.set_parameter(&bp.dyn_sc_freq, 80.0);
+                setter.end_set_parameter(&bp.dyn_sc_freq);
+                setter.begin_set_parameter(&bp.dyn_mode);
+                setter.set_parameter(&bp.dyn_mode, 1);
+                setter.end_set_parameter(&bp.dyn_mode);
+            }
+        }
+        let mut editor = editor_over(params);
+        let _ = editor.view();
+    }
+
+    #[test]
+    fn the_dynamic_mode_cycle_wraps_over_two_modes() {
+        assert_eq!(next_dyn_mode(0), 1);
+        assert_eq!(next_dyn_mode(1), 0);
+        // A value from an older session or a host that sent something odd is
+        // read as Down (the default), so the cycle still lands on a real mode
+        // rather than on an index nothing reads.
+        assert_eq!(next_dyn_mode(7), 1);
+    }
+
+    #[test]
+    fn the_mode_and_sidechain_controls_are_single_gestures() {
+        // The recording context counts gestures and the normalized value they
+        // carry but does not apply them (that is the host's job), so the
+        // assertions are about *what was asked for*, not about state that a
+        // null host never writes back.
+        let (editor, ctx) = editor_with_bands(&[(1_000.0, -6.0, 1.0, FilterType::Bell)]);
+        let mode = &editor.params.band_params[0].dyn_mode;
+        assert_eq!(mode.value(), 0, "bands start in downward mode");
+
+        let _ = editor.cycle_dyn_mode(0);
+        assert_eq!(ctx.writes(), vec![1.0], "cycling Down must ask for Up");
+        let _ = editor.set_band_sidechain(0, true);
+        assert_eq!(
+            ctx.writes(),
+            vec![1.0, 1.0],
+            "the sidechain toggle is its own gesture"
+        );
+
+        // The wrap itself is unit-tested in `the_dynamic_mode_cycle_wraps`.
     }
 
     #[test]

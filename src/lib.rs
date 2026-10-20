@@ -173,6 +173,25 @@ pub struct BandParams {
     /// How fast the detector falls back when the level drops.
     #[id = "dyn-release"]
     pub dyn_release: FloatParam,
+
+    /// React above the threshold (Down) or below it (Up).
+    #[id = "dyn-mode"]
+    pub dyn_mode: IntParam,
+
+    /// Transition width in dB, eased quadratically instead of a hard corner.
+    /// Zero is the hard corner; while it is set, `range` is not the transition
+    /// width (see `dynamics::DynLaw::amount`).
+    #[id = "dyn-knee"]
+    pub dyn_knee: FloatParam,
+
+    /// Trigger on another part of the spectrum instead of the band's own
+    /// region — duck a bass band from a kick, for example.
+    #[id = "dyn-sc-enable"]
+    pub dyn_sc_enable: BoolParam,
+
+    /// Where the sidechain detector listens, when it is enabled.
+    #[id = "dyn-sc-freq"]
+    pub dyn_sc_freq: FloatParam,
 }
 
 #[derive(Params)]
@@ -587,6 +606,36 @@ impl Default for BandParams {
             )
             .with_unit(" ms")
             .with_value_to_string(formatters::v2s_f32_rounded(0)),
+            dyn_mode: IntParam::new("Mode", 0, IntRange::Linear { min: 0, max: 1 })
+                // The host shows this in its automation list, where "0"/"1"
+                // says nothing. `from_string` is not wired up: nih-plug falls
+                // back to parsing the integer, which is what the host sends.
+                .with_value_to_string(Arc::new(|v: i32| {
+                    dsp::dynamics::DynMode::from_i32(v).name().to_string()
+                })),
+            dyn_knee: FloatParam::new(
+                "Knee",
+                0.0,
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 12.0,
+                },
+            )
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_step_size(0.5),
+            dyn_sc_enable: BoolParam::new("Sidechain", false),
+            dyn_sc_freq: FloatParam::new(
+                "Sidechain Freq",
+                1_000.0,
+                FloatRange::Skewed {
+                    min: 20.0,
+                    max: 20_000.0,
+                    factor: FloatRange::skew_factor(-2.0),
+                },
+            )
+            .with_unit(" Hz")
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(0)),
         }
     }
 }
@@ -1040,19 +1089,30 @@ impl Filter {
                         } else {
                             dsp::dynamics::SHELF_DETECT_Q
                         };
+                        // A sidechain filter moves the detector somewhere else
+                        // in the spectrum, with a fixed width: the trigger band
+                        // must not inherit the controlled band's Q, or ducking
+                        // a wide bass band from a kick would listen to a
+                        // hairline around 1 kHz.
+                        let (detect_freq, detect_q) = if bp.dyn_sc_enable.value() {
+                            (bp.dyn_sc_freq.value(), dsp::dynamics::SIDECHAIN_Q)
+                        } else {
+                            (baked_freq, detect_q)
+                        };
                         let level = self.detectors[band_idx].update(
                             &det_in[..block_len],
-                            baked_freq,
+                            detect_freq,
                             detect_q,
                             bp.dyn_attack.value(),
                             bp.dyn_release.value(),
                         );
-                        dsp::dynamics::dynamic_gain_db(
-                            static_gain,
-                            level,
+                        dsp::dynamics::DynLaw::new(
                             bp.dyn_threshold.value(),
                             bp.dyn_range.value(),
+                            bp.dyn_knee.value(),
+                            dsp::dynamics::DynMode::from_i32(bp.dyn_mode.value()),
                         )
+                        .gain_db(static_gain, level)
                     } else {
                         static_gain
                     };
