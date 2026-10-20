@@ -17,7 +17,7 @@
 use std::f32::consts::PI;
 
 use filter::dsp::biquad::MAX_SECTIONS;
-use filter::dsp::dynamics::{dynamic_gain_db, Detector, SHELF_DETECT_Q};
+use filter::dsp::dynamics::{Detector, DynLaw, DynMode, SHELF_DETECT_Q, SIDECHAIN_Q};
 use filter::dsp::{BiquadCoeffs, BiquadState};
 use filter::FilterType;
 
@@ -63,8 +63,11 @@ struct DynBand {
     freq: f32,
     q: f32,
     static_gain: f32,
-    threshold: f32,
-    range: f32,
+    /// The dynamic law: threshold, transition width, knee, direction.
+    law: DynLaw,
+    /// Detector frequency when a sidechain filter is in use, with
+    /// `SIDECHAIN_Q`. `None` means "listen to the band's own region".
+    sidechain: Option<f32>,
     attack: f32,
     release: f32,
     filter_type: FilterType,
@@ -82,8 +85,8 @@ impl DynBand {
             freq,
             q,
             static_gain,
-            threshold,
-            range,
+            law: DynLaw::new(threshold, range, 0.0, DynMode::Down),
+            sidechain: None,
             attack: 5.0,
             release: 150.0,
             filter_type: FilterType::Bell,
@@ -97,6 +100,16 @@ impl DynBand {
         self
     }
 
+    fn with_law(mut self, law: DynLaw) -> Self {
+        self.law = law;
+        self
+    }
+
+    fn with_sidechain(mut self, hz: f32) -> Self {
+        self.sidechain = Some(hz);
+        self
+    }
+
     /// Process `input` (also used as the linked detector input, i.e. dry) and
     /// return the output.
     fn process(&mut self, input: &[f32]) -> Vec<f32> {
@@ -104,18 +117,21 @@ impl DynBand {
         for sub in input.chunks(COEFF_BLOCK) {
             // Detector input is the dry signal, as in `process()`: the link is
             // measured before any band is applied.
-            let level = self.detector.update(
-                sub,
-                self.freq,
-                if self.filter_type.is_bell_like() {
-                    self.q
-                } else {
-                    SHELF_DETECT_Q
-                },
-                self.attack,
-                self.release,
-            );
-            let gain = dynamic_gain_db(self.static_gain, level, self.threshold, self.range);
+            let (detect_freq, detect_q) = match self.sidechain {
+                Some(hz) => (hz, SIDECHAIN_Q),
+                None => (
+                    self.freq,
+                    if self.filter_type.is_bell_like() {
+                        self.q
+                    } else {
+                        SHELF_DETECT_Q
+                    },
+                ),
+            };
+            let level = self
+                .detector
+                .update(sub, detect_freq, detect_q, self.attack, self.release);
+            let gain = self.law.gain_db(self.static_gain, level);
             self.last_gain = gain;
             self.count = BiquadCoeffs::update_cascade(
                 &mut self.sections,
@@ -235,7 +251,9 @@ fn attack_delays_the_cut_and_release_holds_it() {
 
 #[test]
 fn a_boost_band_lifts_loud_material_only() {
-    // The same law applies upward: +6 dB dynamic bell, threshold -30.
+    // Downward mode with a positive gain: the band boosts *above* the
+    // threshold. (This is not what `DynMode::Up` does — see the upward tests
+    // below, where the gain applies below the threshold instead.)
     let mut band = DynBand::new(1_000.0, 1.0, 6.0, -30.0, 12.0);
     let loud = tone(1_000.0, -10.0, 0.5);
     let loud_out = band.process(&loud);
@@ -285,5 +303,172 @@ fn a_high_q_band_is_narrow_in_level_as_well_as_in_frequency() {
     assert!(
         level > -17.0,
         "a Q 10 band should barely trigger on a 1.5 kHz tone, measured {level:.1} dBFS"
+    );
+}
+
+// ---- upward mode --------------------------------------------------------
+
+#[test]
+fn upward_mode_lifts_quiet_material_and_leaves_loud_material_alone() {
+    // +6 dB bell, Up, threshold -30, range 6: full gain at -36 and below,
+    // nothing at -30 and above. This is upward compression — quiet parts come
+    // up, loud parts are not made louder.
+    let law = DynLaw::new(-30.0, 6.0, 0.0, DynMode::Up);
+
+    let mut quiet_band = DynBand::new(1_000.0, 1.0, 6.0, -30.0, 6.0).with_law(law);
+    let quiet = tone(1_000.0, -40.0, 0.5);
+    let quiet_db = steady_db(&quiet_band.process(&quiet), 1_000.0, 0.1);
+    assert!(
+        (quiet_db - -34.0).abs() < 1.0,
+        "a -40 dBFS tone should be lifted by the full +6 dB, measured {quiet_db:.1}"
+    );
+    assert!(
+        (quiet_band.last_gain - 6.0).abs() < 0.5,
+        "baked {:.2} dB, expected +6",
+        quiet_band.last_gain
+    );
+
+    let mut loud_band = DynBand::new(1_000.0, 1.0, 6.0, -30.0, 6.0).with_law(law);
+    let loud = tone(1_000.0, -10.0, 0.5);
+    let loud_db = steady_db(&loud_band.process(&loud), 1_000.0, 0.1);
+    assert!(
+        (loud_db - -10.0).abs() < 1.0,
+        "loud material must pass untouched in upward mode, measured {loud_db:.1}"
+    );
+    assert!(
+        loud_band.last_gain.abs() < 0.05,
+        "baked {:.2} dB on a loud tone, expected 0",
+        loud_band.last_gain
+    );
+}
+
+// ---- soft knee ----------------------------------------------------------
+
+#[test]
+fn a_knee_eases_the_cut_instead_of_stepping_at_the_threshold() {
+    // -12 dB bell, threshold -30, 6 dB knee: a tone at -33 (3 dB below the
+    // threshold, the knee's midpoint) gets a quarter of the cut, i.e. -3 dB.
+    let law = DynLaw::new(-30.0, 12.0, 6.0, DynMode::Down);
+    let mut band = DynBand::new(1_000.0, 1.0, -12.0, -30.0, 12.0).with_law(law);
+    let input = tone(1_000.0, -33.0, 0.5);
+    let level = steady_db(&band.process(&input), 1_000.0, 0.1);
+    assert!(
+        (level - -36.0).abs() < 2.0,
+        "expected about -36 dBFS (in -33, cut -3), measured {level:.1}"
+    );
+    // The exact-quarter property is asserted on the law itself; here the
+    // tolerance is the detector's, which reads a steady tone within about a
+    // dB of the truth — a dB of level error near the knee midpoint moves the
+    // baked gain by roughly a dB too.
+    assert!(
+        (band.last_gain - -3.0).abs() < 1.5,
+        "baked {:.2} dB, expected about -3 (a quarter of -12)",
+        band.last_gain
+    );
+
+    // ... and the same level with no knee is untouched, which is the step the
+    // knee exists to remove.
+    let mut hard = DynBand::new(1_000.0, 1.0, -12.0, -30.0, 12.0);
+    let hard_level = steady_db(&hard.process(&input), 1_000.0, 0.1);
+    assert!(
+        hard.last_gain.abs() < 0.1,
+        "the hard-corner law should still be inert 3 dB below the threshold, \
+         baked {:.2} dB (level {hard_level:.1})",
+        hard.last_gain
+    );
+}
+
+// ---- sidechain filter ---------------------------------------------------
+
+#[test]
+fn a_sidechain_filter_triggers_the_band_from_another_part_of_the_spectrum() {
+    // The band sits at 1 kHz, where there is nothing to hear. The detector is
+    // moved to 8 kHz, where a loud tone is playing: the band must bake its cut
+    // even though its own region is silent.
+    let mut band = DynBand::new(1_000.0, 1.0, -12.0, -30.0, 12.0).with_sidechain(8_000.0);
+    let loud = tone(8_000.0, -10.0, 0.5);
+    band.process(&loud);
+    assert!(
+        (band.last_gain - -12.0).abs() < 1.0,
+        "a sidechained band should reach its full cut, baked {:.2} dB",
+        band.last_gain
+    );
+
+    // Without the sidechain the same input must not move it: that is the
+    // difference between this and a broadband detector.
+    let mut no_sidechain = DynBand::new(1_000.0, 1.0, -12.0, -30.0, 12.0);
+    no_sidechain.process(&loud);
+    // A Q 1 band-pass at 1 kHz still passes some 8 kHz — about 1.5% of the
+    // power, which is a fraction of a dB of the cut. What must not happen is
+    // the band reaching anything like its full range.
+    assert!(
+        no_sidechain.last_gain.abs() < 2.0,
+        "without a sidechain an 8 kHz tone must not trigger a 1 kHz band, baked {:.2} dB",
+        no_sidechain.last_gain
+    );
+}
+
+#[test]
+fn a_sidechain_filter_ignores_the_bands_own_content() {
+    // The mirror image: band at 1 kHz, detector at 8 kHz, and the *only*
+    // content is 1 kHz. The band's own region is loud, but the detector is
+    // listening elsewhere, so nothing is applied.
+    let mut band = DynBand::new(1_000.0, 1.0, -12.0, -30.0, 12.0).with_sidechain(8_000.0);
+    let own = tone(1_000.0, -10.0, 0.5);
+    band.process(&own);
+    assert!(
+        band.last_gain.abs() < 0.7,
+        "the detector is sidechained away from 1 kHz and must ignore it, baked {:.2} dB",
+        band.last_gain
+    );
+}
+
+#[test]
+fn a_knee_moves_the_transition_start_below_the_threshold() {
+    // The audible difference from a hard corner: the band begins engaging
+    // *before* the threshold is reached, so material approaching it eases in
+    // instead of arriving at the corner. Measured across the knee in audio.
+    let law = DynLaw::new(-30.0, 12.0, 6.0, DynMode::Down);
+    let baked = |dbfs: f32| {
+        let mut band = DynBand::new(1_000.0, 1.0, -12.0, -30.0, 12.0).with_law(law);
+        band.process(&tone(1_000.0, dbfs, 0.3));
+        band.last_gain
+    };
+
+    let below_knee = baked(-36.5); // outside the knee: nothing
+    let middle = baked(-33.0); // knee midpoint: about a quarter
+    let at_threshold = baked(-30.0); // top of the knee: full
+
+    assert!(
+        below_knee.abs() < 0.5,
+        "below the knee the band must be inert, baked {below_knee:.2} dB"
+    );
+    let fraction = middle / -12.0;
+    assert!(
+        (0.15..0.40).contains(&fraction),
+        "at the knee midpoint the band should apply about a quarter of its \
+         range, applied {fraction:.2}"
+    );
+    // Not *exactly* -12: the detector reads a steady tone ~0.6 dB low, and the
+    // top of the knee is the steepest part of the curve, so that offset shows
+    // up here as about 2 dB of gain. Three quarters of the range is the claim.
+    assert!(
+        at_threshold < -9.0,
+        "the top of the knee should be nearly the full -12 dB, baked {at_threshold:.2}"
+    );
+    assert!(
+        below_knee > middle && middle > at_threshold,
+        "the knee must engage progressively, got {below_knee:.2} / {middle:.2} / \
+         {at_threshold:.2} dB"
+    );
+
+    // The hard-corner law at the same midpoint applies nothing at all, which is
+    // the step the knee removes.
+    let mut hard = DynBand::new(1_000.0, 1.0, -12.0, -30.0, 12.0);
+    hard.process(&tone(1_000.0, -33.0, 0.3));
+    assert!(
+        hard.last_gain.abs() < 0.3,
+        "the hard corner should still be inert at -33, baked {:.2} dB",
+        hard.last_gain
     );
 }

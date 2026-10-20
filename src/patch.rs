@@ -39,6 +39,10 @@ pub struct BandPatch {
     pub dyn_range: f32,
     pub dyn_attack: f32,
     pub dyn_release: f32,
+    pub dyn_mode: i32,
+    pub dyn_knee: f32,
+    pub dyn_sc_enable: bool,
+    pub dyn_sc_freq: f32,
 }
 
 /// A complete plugin state: the global parameters plus every band.
@@ -64,6 +68,10 @@ impl BandPatch {
             dyn_range: bp.dyn_range.value(),
             dyn_attack: bp.dyn_attack.value(),
             dyn_release: bp.dyn_release.value(),
+            dyn_mode: bp.dyn_mode.value(),
+            dyn_knee: bp.dyn_knee.value(),
+            dyn_sc_enable: bp.dyn_sc_enable.value(),
+            dyn_sc_freq: bp.dyn_sc_freq.value(),
         }
     }
 }
@@ -81,7 +89,7 @@ impl Patch {
 
     /// Write this patch into the parameters, touching only what differs.
     ///
-    /// Writing everything on every undo would emit 24 bands × 11 parameters of
+    /// Writing everything on every undo would emit 24 bands × 15 parameters of
     /// host traffic for a one-knob change, and hosts treat a parameter write as
     /// automation input. Skipping equal values keeps an undo to the size of the
     /// edit it reverses.
@@ -111,6 +119,10 @@ impl Patch {
             written += set(&setter, &bp.dyn_range, band.dyn_range);
             written += set(&setter, &bp.dyn_attack, band.dyn_attack);
             written += set(&setter, &bp.dyn_release, band.dyn_release);
+            written += set(&setter, &bp.dyn_mode, band.dyn_mode);
+            written += set(&setter, &bp.dyn_knee, band.dyn_knee);
+            written += set(&setter, &bp.dyn_sc_enable, band.dyn_sc_enable);
+            written += set(&setter, &bp.dyn_sc_freq, band.dyn_sc_freq);
         }
         written
     }
@@ -305,7 +317,7 @@ impl AbSlots {
 /// an older version is ignored rather than deserialized into a plausible but
 /// wrong state: `serde` would happily accept a blob missing the fields added
 /// since, and the band parameters would then silently land on their defaults.
-pub const AB_SCHEMA: u32 = 1;
+pub const AB_SCHEMA: u32 = 2;
 
 /// The A/B pair as it is stored in the session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
