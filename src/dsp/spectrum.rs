@@ -83,12 +83,193 @@ pub struct SpectrumFrame {
     pub seq: u64,
 }
 
+/// The analyzer's own floor and ceiling, deliberately wider than any display
+/// range.
+///
+/// These used to be -96..12, which was the display range written into the
+/// analysis path: the -120 dB scale could never show anything below -96, and
+/// the +4.5 dB/oct tilt pushes 20 kHz 19.4 dB up, so a full-scale top octave
+/// clipped at +12 and the tilt looked broken up there. Clamping belongs in the
+/// display; the frame carries what the signal actually is.
+pub const ANALYZER_FLOOR_DB: f32 = -160.0;
+pub const ANALYZER_CEIL_DB: f32 = 40.0;
+
 impl SpectrumFrame {
     pub fn silent() -> Self {
         Self {
-            db: [-96.0; BINS],
+            db: [ANALYZER_FLOOR_DB; BINS],
             seq: 0,
         }
+    }
+}
+
+/// Display tilt, in dB per octave.
+///
+/// Pink-ish music falls 3 dB/oct; 4.5 dB/oct is the slope that makes a typical
+/// mix read roughly flat without lifting the noise floor of a quiet top end
+/// into a fake slope of its own (which steeper tilts do).
+pub const TILT_DB_PER_OCT: f32 = 4.5;
+
+/// The tilt pivots around this frequency: 0 dB of offset here.
+pub const TILT_REF_HZ: f32 = 1_000.0;
+
+/// Tilt offset in dB for `freq`.
+///
+/// One function, used by the analyzer (which bakes the offset into every
+/// published band) and by the curve drawing (which offsets each point as it
+/// plots). If those two ever computed the slope separately they would drift,
+/// and the picture would show a gap between the EQ curve and the spectrum that
+/// the EQ did not create.
+pub fn tilt_db(freq: f32, db_per_oct: f32) -> f32 {
+    db_per_oct * (freq.max(1.0) / TILT_REF_HZ).log2()
+}
+
+/// The dB floors the range selector cycles through.
+pub const DB_RANGES: [f32; 3] = [-60.0, -90.0, -120.0];
+/// Index into `DB_RANGES` the display starts on.
+pub const DEFAULT_DB_RANGE: usize = 1;
+
+/// Offsets the pre-EQ trace can be shifted by, in dB, so it can be pulled out
+/// from under the post trace. Cycles in this order.
+pub const PRE_GAIN_STEPS: [f32; 3] = [0.0, -6.0, -12.0];
+
+/// Display state shared by the audio thread (tilt), the canvas (all of it) and
+/// anything else that needs to know how the analyzer is being shown.
+///
+/// Atomics rather than a lock: the audio thread reads `tilt` once per block and
+/// must never block on a GUI thread that is mid-drag.
+pub struct SpectrumView {
+    freeze: std::sync::atomic::AtomicBool,
+    tilt: std::sync::atomic::AtomicBool,
+    /// Index into `DB_RANGES`.
+    range: AtomicUsize,
+    /// Index into `PRE_GAIN_STEPS`.
+    pre_gain: AtomicUsize,
+}
+
+impl SpectrumView {
+    pub fn new() -> Self {
+        Self {
+            freeze: std::sync::atomic::AtomicBool::new(false),
+            tilt: std::sync::atomic::AtomicBool::new(false),
+            range: AtomicUsize::new(DEFAULT_DB_RANGE),
+            pre_gain: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn frozen(&self) -> bool {
+        self.freeze.load(Ordering::Relaxed)
+    }
+
+    pub fn set_frozen(&self, on: bool) {
+        self.freeze.store(on, Ordering::Relaxed);
+    }
+
+    pub fn tilted(&self) -> bool {
+        self.tilt.load(Ordering::Relaxed)
+    }
+
+    pub fn set_tilted(&self, on: bool) {
+        self.tilt.store(on, Ordering::Relaxed);
+    }
+
+    /// The dB value that maps to the bottom of the graph.
+    pub fn floor_db(&self) -> f32 {
+        DB_RANGES[self.range.load(Ordering::Relaxed).min(DB_RANGES.len() - 1)]
+    }
+
+    pub fn range_index(&self) -> usize {
+        self.range.load(Ordering::Relaxed).min(DB_RANGES.len() - 1)
+    }
+
+    /// Step to the next range, wrapping at the end.
+    pub fn cycle_range(&self) -> usize {
+        let next = (self.range_index() + 1) % DB_RANGES.len();
+        self.range.store(next, Ordering::Relaxed);
+        next
+    }
+
+    pub fn pre_gain_db(&self) -> f32 {
+        let i = self
+            .pre_gain
+            .load(Ordering::Relaxed)
+            .min(PRE_GAIN_STEPS.len() - 1);
+        PRE_GAIN_STEPS[i]
+    }
+
+    /// Step to the next pre-trace offset, wrapping at the end.
+    pub fn cycle_pre_gain(&self) -> f32 {
+        let next = (self.pre_gain.load(Ordering::Relaxed) + 1) % PRE_GAIN_STEPS.len();
+        self.pre_gain.store(next, Ordering::Relaxed);
+        PRE_GAIN_STEPS[next]
+    }
+}
+
+impl Default for SpectrumView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Display ballistics for one spectrum trace: fast rise, slow fall.
+///
+/// Lives on the GUI thread, not the audio thread — the analyzer must stay a
+/// pure measurement. Also owns the freeze: when frozen the held values are
+/// returned unchanged, so the picture stays put while audio keeps running
+/// underneath it (which is the whole point of freezing — sweep a band over a
+/// resonance that has already gone).
+pub struct TraceBallistics {
+    db: [f32; BINS],
+    /// Set once the first frame has been accepted, so the trace starts at the
+    /// first real measurement instead of sliding up from the floor.
+    primed: bool,
+}
+
+impl TraceBallistics {
+    /// Fast enough that a transient is visible on the next frame, slow enough
+    /// that the noise floor does not strobe.
+    pub const RISE: f32 = 0.55;
+    pub const FALL: f32 = 0.08;
+
+    pub fn new() -> Self {
+        Self {
+            db: [ANALYZER_FLOOR_DB; BINS],
+            primed: false,
+        }
+    }
+
+    /// Current held values, without advancing. Used by the drawing code so a
+    /// frozen frame does not have to copy through `update` twice.
+    pub fn values(&self) -> [f32; BINS] {
+        self.db
+    }
+
+    /// Advance one frame and return the smoothed values.
+    ///
+    /// `frozen` skips the advance entirely: the frame the user froze stays
+    /// exactly as it was, however many editor ticks pass.
+    pub fn update(&mut self, target: &[f32; BINS], frozen: bool) -> [f32; BINS] {
+        // Priming happens even when frozen: freezing before the first frame has
+        // been shown must hold that first frame, not the empty floor.
+        if !self.primed {
+            self.db = *target;
+            self.primed = true;
+            return self.db;
+        }
+        if frozen {
+            return self.db;
+        }
+        for (cur, &next) in self.db.iter_mut().zip(target.iter()) {
+            let k = if next > *cur { Self::RISE } else { Self::FALL };
+            *cur += (next - *cur) * k;
+        }
+        self.db
+    }
+}
+
+impl Default for TraceBallistics {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -152,6 +333,10 @@ impl Default for SpectrumRing {
 pub struct SpectrumTaps {
     pub input: SpectrumRing,
     pub output: SpectrumRing,
+    /// How the analyzer is being shown — freeze, tilt, range, trace offsets.
+    /// Shared rather than passed in at construction because the tilt has to
+    /// reach the audio thread and the rest has to survive an editor close.
+    pub view: SpectrumView,
     /// Host sample rate, published by the audio thread so the frequency axis
     /// can label its bins. Zero until the first `initialize`.
     sample_rate: atomic_float::AtomicF32,
@@ -162,6 +347,7 @@ impl SpectrumTaps {
         Self {
             input: SpectrumRing::new(),
             output: SpectrumRing::new(),
+            view: SpectrumView::new(),
             sample_rate: atomic_float::AtomicF32::new(0.0),
         }
     }
@@ -209,6 +395,14 @@ pub struct SpectrumAnalyzer {
     scratch_complex: Vec<Complex<f32>>,
     #[allow(dead_code)] // kept for future band-edge queries
     sample_rate: f32,
+    /// Per-band display tilt offsets, in dB, computed once for this rate.
+    /// Precomputed because the analyzer publishes ~170 frames a second and the
+    /// offset only depends on the frequency of each band's edge.
+    tilt_offsets: [f32; BINS],
+    /// Whether the tilt is currently applied. Set from the audio thread once
+    /// per block, so a GUI toggle takes effect on the next frame without the
+    /// audio thread ever touching a lock.
+    tilt_on: bool,
     seq: u64,
     /// Hann window coefficients for FFT_SIZE
     window: Vec<f32>,
@@ -225,6 +419,8 @@ impl SpectrumAnalyzer {
             .collect();
         // Hann window coherent gain = 0.5; FFT normalization = 1/(N/2) for magnitudes.
         let norm = 2.0 / (0.5 * FFT_SIZE as f32);
+        let tilt_offsets =
+            core::array::from_fn(|b| tilt_db(bin_edge_hz(b, sample_rate), TILT_DB_PER_OCT));
         Self {
             scratch: vec![0.0; FFT_SIZE],
             scratch_right: vec![0.0; FFT_SIZE],
@@ -234,12 +430,20 @@ impl SpectrumAnalyzer {
             fft,
             scratch_complex: vec![Complex::new(0.0, 0.0); FFT_SIZE],
             sample_rate,
+            tilt_offsets,
+            tilt_on: false,
             // Start at 1 so every published frame outranks the seq=0 silent
             // sentinel in SpectrumFrame::silent().
             seq: 1,
             window,
             norm,
         }
+    }
+
+    /// Turn the display tilt on or off. Called once per block from the audio
+    /// thread; the flag is a plain `bool` so this is free.
+    pub fn set_tilt(&mut self, on: bool) {
+        self.tilt_on = on;
     }
 
     /// Feed a block of mono samples; runs the FFT and publishes whenever the
@@ -362,7 +566,16 @@ impl SpectrumAnalyzer {
             }
             lo = edge.max(lo);
             let db = 20.0 * (mag * self.norm).max(1e-6).log10();
-            *out = db.clamp(-96.0, 12.0);
+            // Tilt is applied here, in the analysis path, not by skewing the
+            // drawing: the pre and post taps and the EQ curve all have to be
+            // in the same dB frame or the gap between them stops meaning
+            // "what the EQ did".
+            let db = if self.tilt_on {
+                db + self.tilt_offsets[b]
+            } else {
+                db
+            };
+            *out = db.clamp(ANALYZER_FLOOR_DB, ANALYZER_CEIL_DB);
         }
         frame
     }
@@ -379,7 +592,7 @@ mod tests {
     #[test]
     fn silent_frame_floor() {
         let f = SpectrumFrame::silent();
-        assert!(f.db.iter().all(|&d| d == -96.0));
+        assert!(f.db.iter().all(|&d| d == ANALYZER_FLOOR_DB));
     }
 
     #[test]
@@ -702,5 +915,163 @@ mod tests {
             "centred {centred:.1} dB vs panned {panned:.1} dB (delta {delta:.1})"
         );
         assert!(panned > -20.0, "a panned source must still be visible");
+    }
+
+    // ---- display tilt ---------------------------------------------------
+
+    #[test]
+    fn tilt_is_flat_at_the_reference_and_rises_per_octave() {
+        assert!(tilt_db(TILT_REF_HZ, TILT_DB_PER_OCT).abs() < 1e-4);
+        let one_octave = tilt_db(2.0 * TILT_REF_HZ, TILT_DB_PER_OCT);
+        let two_octaves = tilt_db(4.0 * TILT_REF_HZ, TILT_DB_PER_OCT);
+        assert!((one_octave - TILT_DB_PER_OCT).abs() < 1e-3);
+        assert!((two_octaves - 2.0 * TILT_DB_PER_OCT).abs() < 1e-3);
+        // Below the reference it falls, symmetrically.
+        assert!((tilt_db(TILT_REF_HZ / 2.0, TILT_DB_PER_OCT) + TILT_DB_PER_OCT).abs() < 1e-3);
+        assert_eq!(tilt_db(0.0, TILT_DB_PER_OCT), tilt_db(1.0, TILT_DB_PER_OCT));
+    }
+
+    #[test]
+    fn tilt_is_applied_in_the_analysis_path() {
+        // Not in the drawing: the published frame itself has to carry the
+        // offset, because the GUI is not the only consumer and a drawing-time
+        // tilt would leave the pre/post gap measured in a different frame
+        // than the curve.
+        let rate = 48_000.0f32;
+        let tone = tone_at(8_000.0, 0.5, rate, FFT_SIZE * 4);
+
+        let measure = |tilt: bool| {
+            let ring = SpectrumRing::new();
+            let mut analyzer = SpectrumAnalyzer::new(rate);
+            analyzer.set_tilt(tilt);
+            analyzer.push_block(&ring, &tone);
+            let frame = ring.read_newest();
+            let peak = (0..BINS)
+                .max_by(|a, b| frame.db[*a].total_cmp(&frame.db[*b]))
+                .unwrap();
+            (peak, frame.db[peak])
+        };
+
+        let (flat_peak, flat_db) = measure(false);
+        let (tilted_peak, tilted_db) = measure(true);
+        assert_eq!(flat_peak, tilted_peak, "tilt must not move the peak");
+
+        let expected = tilt_db(bin_edge_hz(flat_peak, rate), TILT_DB_PER_OCT);
+        assert!(
+            (tilted_db - flat_db - expected).abs() < 0.5,
+            "8 kHz should rise by {expected:.1} dB under tilt, rose by {:.1} \
+             ({flat_db:.1} -> {tilted_db:.1})",
+            tilted_db - flat_db
+        );
+    }
+
+    #[test]
+    fn tilt_does_not_change_what_the_eq_did() {
+        // Both taps get the same offset, so the gap between them — the thing
+        // the overlay exists to show — must be identical tilted or not.
+        use crate::dsp::BiquadFilter;
+        use crate::FilterType;
+
+        let rate = 48_000.0f32;
+        let input = tone_at(1_000.0, 0.5, rate, FFT_SIZE * 4);
+        let mut eq = BiquadFilter::new();
+        eq.update_coefficients(1_000.0, -20.0, 1.0, FilterType::Bell, rate);
+        let output: Vec<f32> = input.iter().map(|&s| eq.process(s)).collect();
+
+        let gap = |tilt: bool| {
+            let taps = SpectrumTaps::new();
+            let mut pre = SpectrumAnalyzer::new(rate);
+            let mut post = SpectrumAnalyzer::new(rate);
+            pre.set_tilt(tilt);
+            post.set_tilt(tilt);
+            pre.push_block(&taps.input, &input);
+            post.push_block(&taps.output, &output);
+            let peak = |ring: &SpectrumRing| {
+                ring.read_newest()
+                    .db
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max)
+            };
+            peak(&taps.input) - peak(&taps.output)
+        };
+
+        let flat_gap = gap(false);
+        let tilted_gap = gap(true);
+        assert!(
+            (flat_gap - tilted_gap).abs() < 0.2,
+            "tilt changed the measured EQ gain: {flat_gap:.1} dB flat vs \
+             {tilted_gap:.1} dB tilted"
+        );
+    }
+
+    // ---- freeze ---------------------------------------------------------
+
+    #[test]
+    fn freeze_holds_the_frame_while_audio_moves() {
+        let mut ballistics = TraceBallistics::new();
+        let mut music = [ANALYZER_FLOOR_DB; BINS];
+        music[10] = -12.0;
+        let first = ballistics.update(&music, false);
+        assert_eq!(first[10], -12.0, "the first frame is taken as-is");
+
+        // Audio keeps moving underneath the frozen display.
+        let quiet = [-110.0f32; BINS];
+        for _ in 0..50 {
+            let shown = ballistics.update(&quiet, true);
+            assert_eq!(shown, first, "a frozen frame must not move");
+        }
+    }
+
+    #[test]
+    fn unfreezing_resumes_from_where_it_stopped() {
+        let mut ballistics = TraceBallistics::new();
+        let mut music = [-40.0f32; BINS];
+        ballistics.update(&music, false);
+        for _ in 0..10 {
+            ballistics.update(&[-100.0f32; BINS], true);
+        }
+        assert_eq!(ballistics.values()[0], -40.0);
+
+        // Resuming decays *towards* the new target from the held value — it
+        // must not snap, or unfreezing would look like a glitch.
+        music = [-100.0f32; BINS];
+        let resumed = ballistics.update(&music, false);
+        assert!(
+            resumed[0] < -40.0 && resumed[0] > -100.0,
+            "unfreeze should glide from -40 towards -100, got {:.1}",
+            resumed[0]
+        );
+    }
+
+    #[test]
+    fn the_range_selector_cycles_through_every_floor_and_wraps() {
+        let view = SpectrumView::new();
+        let start = view.range_index();
+        assert_eq!(view.floor_db(), DB_RANGES[start]);
+        let mut seen = vec![start];
+        for _ in 0..DB_RANGES.len() - 1 {
+            seen.push(view.cycle_range());
+        }
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..DB_RANGES.len()).collect::<Vec<_>>());
+        // One more step wraps back to the start rather than sticking.
+        assert_eq!(view.cycle_range(), start);
+    }
+
+    #[test]
+    fn the_pre_gain_offset_cycles_back_to_zero() {
+        let view = SpectrumView::new();
+        assert_eq!(view.pre_gain_db(), 0.0);
+        let mut values = vec![view.pre_gain_db()];
+        for _ in 0..PRE_GAIN_STEPS.len() - 1 {
+            values.push(view.cycle_pre_gain());
+        }
+        assert!(
+            values.contains(&-6.0) && values.contains(&-12.0),
+            "{values:?}"
+        );
+        assert_eq!(view.cycle_pre_gain(), 0.0);
     }
 }
