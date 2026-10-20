@@ -128,6 +128,9 @@ struct GraphProgram {
     _peak_meter: Arc<AtomicF32>,
     /// Both analyzer taps: input (pre-EQ) and output (post-EQ).
     taps: Arc<crate::dsp::spectrum::SpectrumTaps>,
+    /// Live dynamic gain per band. Read for the node readout so a dynamic band
+    /// shows what it is doing, not just its ceiling.
+    dyn_meters: Arc<crate::dsp::dynamics::BandMeters>,
     /// Visually-smoothed spectrum bars, one vector per tap, shared lock-free
     /// (GUI thread writes, same thread reads; atomic to satisfy Send+Sync on
     /// the Arc).
@@ -595,9 +598,23 @@ impl GraphProgram {
                 );
             }
 
-            // Frequency + gain readout while dragging or while selected
+            // Frequency + gain readout while dragging or while selected. A
+            // dynamic band shows the gain it is applying right now: the knob's
+            // value is only its ceiling, and the whole point of the feature is
+            // that the two differ.
             if is_drag || is_selected {
-                let label = format!("{:.0} Hz  {:+.1} dB", bp.freq.value(), bp.gain.value());
+                let dynamic = bp.dyn_enable.value()
+                    && FilterType::from_i32(bp.filter_type.value()).has_gain();
+                let gain = if dynamic {
+                    self.dyn_meters.read(i)
+                } else {
+                    bp.gain.value()
+                };
+                let label = if dynamic {
+                    format!("{:.0} Hz  {:+.1} dB dyn", bp.freq.value(), gain)
+                } else {
+                    format!("{:.0} Hz  {:+.1} dB", bp.freq.value(), gain)
+                };
                 let text_x = (center.x + 10.0).min(bounds.x + bounds.width - 95.0);
                 frame.fill_text(CanvasText {
                     content: label,
@@ -671,6 +688,7 @@ impl Graph {
         context: Arc<dyn GuiContext>,
         peak_meter: Arc<AtomicF32>,
         taps: Arc<crate::dsp::spectrum::SpectrumTaps>,
+        dyn_meters: Arc<crate::dsp::dynamics::BandMeters>,
         selected: Arc<AtomicUsize>,
     ) -> Self {
         Self {
@@ -684,6 +702,7 @@ impl Graph {
                 context,
                 _peak_meter: peak_meter,
                 taps,
+                dyn_meters,
                 smoothed_in: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
                 smoothed_out: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
                 spec_x: spectrum_bin_x(),
@@ -1051,7 +1070,8 @@ mod tests {
     use super::*;
     use crate::dsp::spectrum::SpectrumTaps;
     use crate::test_support::{
-        test_params, test_params_with_post_spectrum, NullGuiContext, RecordingGuiContext,
+        test_params, test_params_with_dynamics, test_params_with_post_spectrum, NullGuiContext,
+        RecordingGuiContext,
     };
     use atomic_float::AtomicF32;
     use iced_graphics::Primitive;
@@ -1092,6 +1112,7 @@ mod tests {
             context,
             _peak_meter: Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             taps,
+            dyn_meters: Arc::new(crate::dsp::dynamics::BandMeters::new()),
             smoothed_in: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
             smoothed_out: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
             spec_x: spectrum_bin_x(),
@@ -1331,6 +1352,53 @@ mod tests {
         assert!(
             !layer_vertices(&layers, INPUT_SPECTRUM).is_empty(),
             "the input spectrum must keep drawing when the overlay is off"
+        );
+    }
+
+    /// The node readout of a dynamic band must show what the band is applying
+    /// now, not the ceiling the knob is parked at.
+    #[test]
+    fn a_dynamic_band_labels_its_live_gain_not_its_ceiling() {
+        let params = test_params_with_dynamics(&[(1_000.0, -12.0, 1.0, FilterType::Bell)]);
+        let program = test_program_with(params, Arc::new(NullGuiContext));
+        program.select(Some(0));
+        program.dyn_meters.publish(0, -7.5);
+
+        let layers = program.draw(bounds(), None, None);
+        let mut labels = Vec::new();
+        texts(&layers[NODES].clone().into_primitive(), &mut labels);
+
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.contains("-7.5 dB") && l.contains("dyn")),
+            "expected the live gain with a 'dyn' marker, got {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l.contains("-12.0 dB")),
+            "the static ceiling must not be shown as the current gain: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_static_band_ignores_the_meter() {
+        // Same meter value, dynamics off: the label must be the knob's value.
+        let params = test_params(&[(1_000.0, -12.0, 1.0, FilterType::Bell)]);
+        let program = test_program_with(params, Arc::new(NullGuiContext));
+        program.select(Some(0));
+        program.dyn_meters.publish(0, -7.5);
+
+        let layers = program.draw(bounds(), None, None);
+        let mut labels = Vec::new();
+        texts(&layers[NODES].clone().into_primitive(), &mut labels);
+
+        assert!(
+            labels.iter().any(|l| l.contains("-12.0 dB")),
+            "a static band should still report its own gain, got {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l.contains("dyn")),
+            "a static band must not be labelled dynamic: {labels:?}"
         );
     }
 

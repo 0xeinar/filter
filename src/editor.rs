@@ -5,6 +5,7 @@ use nih_plug_iced::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crate::dsp::dynamics::BandMeters;
 use crate::dsp::spectrum::SpectrumTaps;
 use crate::ui;
 use crate::ui::selection;
@@ -56,9 +57,13 @@ pub fn create(
     params: Arc<FilterParams>,
     peak_meter: Arc<AtomicF32>,
     spectrum_taps: Arc<SpectrumTaps>,
+    dyn_meters: Arc<BandMeters>,
     editor_state: Arc<IcedState>,
 ) -> Option<Box<dyn Editor>> {
-    create_iced_editor::<FilterEditor>(editor_state, (params, peak_meter, spectrum_taps))
+    create_iced_editor::<FilterEditor>(
+        editor_state,
+        (params, peak_meter, spectrum_taps, dyn_meters),
+    )
 }
 
 mod colors {
@@ -175,6 +180,9 @@ struct FilterEditor {
     params: Arc<FilterParams>,
     context: Arc<dyn GuiContext>,
     peak_meter: Arc<AtomicF32>,
+    /// Live dynamic gain per band, so the DYN row can show what the band is
+    /// applying right now rather than only its ceiling.
+    dyn_meters: Arc<BandMeters>,
     graph: ui::Graph,
     /// Shared with the graph: one of the editor's few pieces of state that
     /// is not a host parameter.
@@ -325,10 +333,15 @@ impl FilterEditor {
 impl IcedEditor for FilterEditor {
     type Executor = executor::Default;
     type Message = Message;
-    type InitializationFlags = (Arc<FilterParams>, Arc<AtomicF32>, Arc<SpectrumTaps>);
+    type InitializationFlags = (
+        Arc<FilterParams>,
+        Arc<AtomicF32>,
+        Arc<SpectrumTaps>,
+        Arc<BandMeters>,
+    );
 
     fn new(
-        (params, peak_meter, spectrum_taps): Self::InitializationFlags,
+        (params, peak_meter, spectrum_taps, dyn_meters): Self::InitializationFlags,
         context: Arc<dyn GuiContext>,
     ) -> (Self, Command<Self::Message>) {
         let selection = Arc::new(AtomicUsize::new(selection::NONE));
@@ -337,12 +350,14 @@ impl IcedEditor for FilterEditor {
             context.clone(),
             peak_meter.clone(),
             spectrum_taps,
+            dyn_meters.clone(),
             selection.clone(),
         );
         let editor = FilterEditor {
             params,
             context,
             peak_meter,
+            dyn_meters,
             graph,
             selection,
             num_bands_slider_state: Default::default(),
@@ -608,9 +623,14 @@ impl IcedEditor for FilterEditor {
                 );
             }
             if bp.dyn_enable.value() && ftype.has_gain() {
-                // The gain above is the *maximum* this band can apply; without
-                // saying so the panel reads as if that gain were always on.
-                readouts = readouts.push(Text::new("DYN").size(11).color(colors::band_color(i)));
+                // The gain above is the *maximum* this band can apply, so show
+                // what it is applying right now — otherwise the panel reads as
+                // if that gain were always on, and you cannot see the band work.
+                readouts = readouts.push(
+                    Text::new(format!("DYN {:+.1} dB", self.dyn_meters.read(i)))
+                        .size(11)
+                        .color(colors::band_color(i)),
+                );
             }
 
             let top = Row::new()
@@ -807,6 +827,7 @@ mod tests {
             params,
             Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             Arc::new(SpectrumTaps::new()),
+            Arc::new(BandMeters::new()),
         );
         #[allow(clippy::arc_with_non_send_sync)]
         let ctx: Arc<dyn GuiContext> = context.clone();
@@ -821,6 +842,7 @@ mod tests {
             params,
             Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             Arc::new(SpectrumTaps::new()),
+            Arc::new(BandMeters::new()),
         );
         #[allow(clippy::arc_with_non_send_sync)]
         let ctx: Arc<dyn GuiContext> = context;
@@ -871,6 +893,7 @@ mod tests {
             params,
             Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             Arc::new(SpectrumTaps::new()),
+            Arc::new(BandMeters::new()),
         );
         #[allow(clippy::arc_with_non_send_sync)]
         let ctx: Arc<dyn GuiContext> = Arc::new(NullGuiContext);
