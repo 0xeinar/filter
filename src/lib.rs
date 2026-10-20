@@ -16,6 +16,7 @@
 use atomic_float::AtomicF32;
 use nih_plug::prelude::*;
 use nih_plug_iced::IcedState;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -96,6 +97,24 @@ pub struct Filter {
     detectors: [dsp::dynamics::Detector; MAX_BANDS],
     /// Snapshot of "this band is running dynamically" for the current block.
     band_dyn: [bool; MAX_BANDS],
+    /// Soloed band, shared with the GUI. `NO_SOLO` means nothing is soloed.
+    ///
+    /// Deliberately not a host parameter: solo is a monitoring state, not part
+    /// of the sound being saved. Automating it would make the mix change under
+    /// the engineer's hand, and a preset that carried it would load silent.
+    solo: Arc<AtomicUsize>,
+    /// Per-band wet ramp, 0..1. Enabling, disabling and soloing all move this
+    /// instead of switching the cascade on and off: a band that appears or
+    /// disappears between two samples steps the waveform, which is a click.
+    band_fade: [f32; MAX_BANDS],
+    /// Whether `band_fade` has been primed from the parameters as they are on
+    /// the first processed block — otherwise a band that is enabled when the
+    /// plugin loads would fade in from silence over the first 20 ms.
+    fade_primed: bool,
+    /// This band just started fading in, so its biquad memory must be cleared
+    /// before the fade: otherwise it starts from whatever it last heard, which
+    /// is exactly the transient the fade exists to avoid.
+    band_needs_reset: [bool; MAX_BANDS],
     /// Live dynamic gain per band, for the GUI readout.
     dyn_meters: Arc<dsp::dynamics::BandMeters>,
     /// Undo/redo history and the A/B pair (GUI-thread only).
@@ -124,6 +143,16 @@ const AUTO_GAIN_INTERVAL_MS: f64 = 30.0;
 
 /// Longest dry delay line the bypass crossfade ever needs.
 const MAX_LATENCY: usize = dsp::oversample::LATENCY_4X as usize + 1;
+
+/// "No band is soloed." A sentinel rather than an `Option` because the value
+/// crosses a thread boundary through an atomic.
+pub const NO_SOLO: usize = usize::MAX;
+
+/// Length of a band's fade when it is switched in or out, in milliseconds.
+///
+/// The same figure the bypass crossfade uses: long enough that neither a step
+/// nor a swell is audible, short enough that solo still feels instant.
+const BAND_FADE_MS: f32 = 20.0;
 
 /// Per-band parameters
 #[derive(Params)]
@@ -278,7 +307,14 @@ fn oversampling_factor(params: &FilterParams) -> usize {
     }
 }
 
-/// Run every enabled band's cascade over `buf`, in place.
+/// Run every running band's cascade over `buf`, in place.
+///
+/// A band is not simply on or off: it carries a wet ramp `(from, to)` that is
+/// blended across this buffer. Switching a filter by skipping it steps the
+/// waveform — the cascade's output jumps to the dry signal in one sample — and
+/// that click is what solo would otherwise inherit on every press. `(0.0, 0.0)`
+/// means the band is fully out and costs nothing; `(1.0, 1.0)` is the steady
+/// state and costs one comparison.
 ///
 /// Split out of `process()` so the same code filters at the host rate and at an
 /// oversampled rate — an oversampled copy of this loop would be a second
@@ -287,21 +323,27 @@ fn oversampling_factor(params: &FilterParams) -> usize {
 fn run_cascade(
     coeffs: &[[dsp::BiquadCoeffs; dsp::biquad::MAX_SECTIONS]; MAX_BANDS],
     sections: &[usize; MAX_BANDS],
-    enabled: &[bool; MAX_BANDS],
+    fades: &[(f32, f32); MAX_BANDS],
     num_active: usize,
     states: &mut [[dsp::BiquadState; dsp::biquad::MAX_SECTIONS]; MAX_BANDS],
     buf: &mut [f32],
 ) {
-    for sample in buf.iter_mut() {
+    let len = buf.len() as f32;
+    for (i, sample) in buf.iter_mut().enumerate() {
         let mut value = *sample;
+        // 1-based: the first sample of a fade is already a step in, so a ramp
+        // never starts by re-emitting the previous state in full.
+        let t = (i + 1) as f32 / len;
         for band_idx in 0..num_active {
-            if !enabled[band_idx] {
+            let (from, to) = fades[band_idx];
+            if from <= 0.0 && to <= 0.0 {
                 continue;
             }
             let count = sections[band_idx];
             if count == 0 {
                 continue;
             }
+            let dry = value;
             // One section for a bell or shelf, two for a tilt, up to eight for
             // a 96 dB/oct cut. Slicing to the live count keeps the inner loop
             // bounds-check-free after the first iteration.
@@ -310,6 +352,10 @@ fn run_cascade(
                 .zip(states[band_idx][..count].iter_mut())
             {
                 value = state.process(coeff, value);
+            }
+            if from != 1.0 || to != 1.0 {
+                let wet = from + (to - from) * t;
+                value = dry + (value - dry) * wet;
             }
         }
         *sample = value;
@@ -674,6 +720,10 @@ impl Default for Filter {
             comp_samples: 0,
             detectors: core::array::from_fn(|_| dsp::dynamics::Detector::default()),
             band_dyn: [false; MAX_BANDS],
+            solo: Arc::new(AtomicUsize::new(NO_SOLO)),
+            band_fade: [0.0; MAX_BANDS],
+            fade_primed: false,
+            band_needs_reset: [false; MAX_BANDS],
             dyn_meters: Arc::new(dsp::dynamics::BandMeters::new()),
         }
     }
@@ -767,6 +817,7 @@ impl Plugin for Filter {
             self.peak_meter.clone(),
             self.spectrum_taps.clone(),
             self.dyn_meters.clone(),
+            self.solo.clone(),
             self.patch_state.clone(),
             self.params.editor_state.clone(),
         )
@@ -962,25 +1013,64 @@ impl Filter {
 
                 // --- 1. Advance smoothers once per sub-block, per band ---
                 let mut any_band_active = false;
+                let solo = self.solo.load(Ordering::Relaxed);
+                // The ramp state for this sub-block, handed to the cascade.
+                let mut fades = [(0.0f32, 0.0f32); MAX_BANDS];
+                // One sub-block is ~0.33 ms and the fade is 20 ms, so a band
+                // reaches its new state over ~60 sub-blocks rather than in one.
+                // Jumping in a single sub-block would still be a 60 dB/ms edge.
+                let fade_step =
+                    block_len as f32 / (BAND_FADE_MS * 0.001 * self.sample_rate).max(1.0);
+                // The first processed block adopts the parameters as they are:
+                // a band that is already enabled when the plugin loads must not
+                // swell in over the first 20 ms.
+                let prime = !self.fade_primed;
                 // Multiple parallel fixed-size arrays are indexed by band here;
                 // iterator adapters can't express that cleanly.
                 #[allow(clippy::needless_range_loop)]
                 for band_idx in 0..num_active {
                     let bp = &self.params.band_params[band_idx];
-                    let enabled = bp.enable.value();
                     let ftype = FilterType::from_i32(bp.filter_type.value());
 
-                    // Rising edge: the smoother idled while the band was off, so
-                    // snap it to the current value instead of gliding in from a
-                    // stale one.
-                    if enabled && !self.band_enabled[band_idx] {
+                    // Solo masks every other band out here, at the "wanted"
+                    // state, rather than in the cascade: a soloed band then runs
+                    // exactly the code it runs unsoloed — dynamics included —
+                    // and the static-band short-circuit below is untouched.
+                    let wanted = bp.enable.value() && (solo == NO_SOLO || solo == band_idx);
+                    let target = if wanted { 1.0 } else { 0.0 };
+                    let fade_from = if prime {
+                        target
+                    } else {
+                        self.band_fade[band_idx]
+                    };
+                    let fade_to = if fade_from < target {
+                        (fade_from + fade_step).min(target)
+                    } else {
+                        (fade_from - fade_step).max(target)
+                    };
+                    // "Starting from nothing": the first processed block counts,
+                    // because the smoothers have never been advanced and would
+                    // otherwise glide up from 0 — a 0 Hz bake is a NaN filter.
+                    let starting = target > 0.0 && (prime || fade_from <= 0.0);
+
+                    if starting {
+                        // The smoother idled while the band was out and the
+                        // biquad memory is from the last time it was audible;
+                        // both would be a transient at the very moment the fade
+                        // is supposed to hide one.
                         bp.freq.smoothed.reset(bp.freq.value());
                         bp.gain.smoothed.reset(bp.gain.value());
                         bp.q.smoothed.reset(bp.q.value());
-                        // A band that was off (or had no detector running) must
-                        // not resume with a stale envelope.
                         self.detectors[band_idx].reset();
+                        if !prime {
+                            self.band_needs_reset[band_idx] = true;
+                        }
                     }
+                    fades[band_idx] = (fade_from, fade_to);
+
+                    // A band that is fading is still running: the blend needs
+                    // something to blend.
+                    let running = fade_from > 0.0 || fade_to > 0.0;
 
                     // Dynamics only mean anything for a type that has a gain.
                     // A cut passes 0 dB at every level, so its "gain" is not a
@@ -988,17 +1078,17 @@ impl Filter {
                     // A range of zero is not a dynamic band — it is Pro-Q's
                     // "clear dynamics", and treating it as one would run a
                     // detector and rebake coefficients for nothing.
-                    let dyn_on = enabled
+                    let dyn_on = running
                         && ftype.has_gain()
                         && bp.dyn_enable.value()
                         && bp.dyn_range.value().abs() >= dsp::dynamics::MIN_RANGE_DB;
                     self.band_dyn[band_idx] = dyn_on;
 
                     self.band_types[band_idx] = ftype;
-                    self.band_enabled[band_idx] = enabled;
+                    self.band_enabled[band_idx] = running;
                     let slope = Slope::from_i32(bp.slope.value()).db_per_oct();
 
-                    if enabled {
+                    if running {
                         any_band_active = true;
                         // A band only needs work when a smoother is still
                         // gliding or the target/type moved since the last bake.
@@ -1006,7 +1096,8 @@ impl Filter {
                         // A dynamic band rebakes every sub-block by design: its
                         // gain follows the envelope, which moves even when no
                         // parameter does.
-                        let moving = factor_changed
+                        let moving = starting
+                            || factor_changed
                             || dyn_on
                             || bp.freq.smoothed.is_smoothing()
                             || bp.gain.smoothed.is_smoothing()
@@ -1156,6 +1247,17 @@ impl Filter {
                     if channel_idx >= MAX_CHANNELS {
                         continue;
                     }
+                    // A band that is fading in starts from silence. Its biquad
+                    // memory still holds the last audio it heard, and the fade
+                    // would otherwise begin with that tail — audible exactly at
+                    // the moment the fade exists to prevent it.
+                    #[allow(clippy::needless_range_loop)]
+                    for band_idx in 0..num_active {
+                        if self.band_needs_reset[band_idx] {
+                            self.band_states[channel_idx][band_idx] =
+                                [dsp::BiquadState::default(); dsp::biquad::MAX_SECTIONS];
+                        }
+                    }
                     let Some(channel_samples) =
                         full_channel.get_mut(sub_offset..sub_offset + block_len)
                     else {
@@ -1177,7 +1279,7 @@ impl Filter {
                             run_cascade(
                                 &self.band_coeffs,
                                 &self.band_sections,
-                                &self.band_enabled,
+                                &fades,
                                 num_active,
                                 &mut self.band_states[channel_idx],
                                 channel_samples,
@@ -1192,7 +1294,7 @@ impl Filter {
                             run_cascade(
                                 &self.band_coeffs,
                                 &self.band_sections,
-                                &self.band_enabled,
+                                &fades,
                                 num_active,
                                 &mut self.band_states[channel_idx],
                                 &mut self.os_buf[channel_idx][..os_len],
@@ -1242,6 +1344,15 @@ impl Filter {
                         }
                     }
                 }
+
+                // The ramp has covered its span: the next sub-block starts
+                // where this one ended, and a band that was reset for a fade-in
+                // keeps a clean memory from here on.
+                for (band_idx, (_, fade_to)) in fades.iter().enumerate().take(num_active) {
+                    self.band_fade[band_idx] = *fade_to;
+                    self.band_needs_reset[band_idx] = false;
+                }
+                self.fade_primed = true;
             }
         }
 
