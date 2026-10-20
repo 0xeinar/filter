@@ -1,3 +1,18 @@
+// nih-plug's VST3 export macro expands to an expression ending in a semicolon
+// (rust#79813). Newer compilers reject that under `-D warnings`, and there is
+// nothing on this side of the macro to change.
+//
+// Two names because the lint was renamed and this has to build on both: 1.95
+// knows `semicolon_in_expressions_from_macros`, newer toolchains know
+// `semicolon_in_expressions_from_non_local_macros`. `unknown_lints` is what
+// keeps whichever name the compiler does not recognise from becoming an error
+// of its own; it is scoped to this crate and is the only reason it is here.
+#![allow(
+    unknown_lints,
+    semicolon_in_expressions_from_macros,
+    semicolon_in_expressions_from_non_local_macros
+)]
+
 use atomic_float::AtomicF32;
 use nih_plug::prelude::*;
 use nih_plug_iced::IcedState;
