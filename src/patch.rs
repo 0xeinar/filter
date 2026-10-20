@@ -10,6 +10,8 @@
 
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use nih_plug::prelude::{GuiContext, Param, ParamSetter};
 
 use crate::{FilterParams, MAX_BANDS};
@@ -24,7 +26,7 @@ pub const SETTLE: Duration = Duration::from_millis(400);
 pub const HISTORY_LIMIT: usize = 50;
 
 /// Every parameter of one band.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BandPatch {
     pub freq: f32,
     pub gain: f32,
@@ -40,7 +42,7 @@ pub struct BandPatch {
 }
 
 /// A complete plugin state: the global parameters plus every band.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Patch {
     pub num_bands: i32,
     pub output_gain: f32,
@@ -278,6 +280,45 @@ impl AbSlots {
         self.slots[self.active] = current.clone();
         self.slots[other] = current.clone();
     }
+
+    /// Write the live state into the active slot. Returns whether it changed
+    /// anything, so the caller can avoid republishing an identical snapshot
+    /// every frame.
+    pub fn store_active(&mut self, current: &Patch) -> bool {
+        if self.slots[self.active] == *current {
+            return false;
+        }
+        self.slots[self.active] = current.clone();
+        true
+    }
+
+    /// Overwrite both slots (used when restoring a session).
+    fn restore(&mut self, slots: [Patch; 2], active: usize) {
+        self.slots = slots;
+        self.active = active.min(1);
+    }
+}
+
+/// Schema version of the persisted A/B pair.
+///
+/// Bump this whenever `Patch` gains, loses or reorders a field. A snapshot from
+/// an older version is ignored rather than deserialized into a plausible but
+/// wrong state: `serde` would happily accept a blob missing the fields added
+/// since, and the band parameters would then silently land on their defaults.
+pub const AB_SCHEMA: u32 = 1;
+
+/// The A/B pair as it is stored in the session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AbSnapshot {
+    pub version: u32,
+    pub active: u8,
+    pub slots: [Patch; 2],
+}
+
+impl AbSnapshot {
+    pub fn is_current(&self) -> bool {
+        self.version == AB_SCHEMA
+    }
 }
 
 /// History and the A/B pair behind one lock, shared by the editor (which draws
@@ -299,10 +340,55 @@ impl PatchState {
         }
     }
 
+    /// Rebuild from a persisted snapshot, if there is a usable one.
+    ///
+    /// The history always starts from the *live* parameters, not from a slot:
+    /// after a reload there is nothing to undo back into, and seeding the
+    /// history with a slot would let undo jump to a state the user never heard
+    /// in this session.
+    pub fn restored(params: &FilterParams, snapshot: Option<&AbSnapshot>) -> Self {
+        let live = Patch::capture(params);
+        let mut state = Self {
+            history: History::new(live),
+            ab: AbSlots::new(Patch::capture(params)),
+        };
+        if let Some(snapshot) = snapshot.filter(|s| s.is_current()) {
+            state
+                .ab
+                .restore(snapshot.slots.clone(), snapshot.active as usize);
+        }
+        state
+    }
+
+    /// A snapshot of both slots for persistence.
+    pub fn snapshot(&self) -> AbSnapshot {
+        AbSnapshot {
+            version: AB_SCHEMA,
+            active: self.ab.active() as u8,
+            slots: [self.ab.slot(0).clone(), self.ab.slot(1).clone()],
+        }
+    }
+
+    /// Keep the live slot in step with the parameters.
+    ///
+    /// Without this the active slot only catches up when you switch away from
+    /// it, so an edit made and left in place would be lost on reload while the
+    /// *other* slot survived — the worst of both.
+    pub fn sync(&mut self, live: &Patch) -> bool {
+        self.ab.store_active(live)
+    }
+
     /// Record a settled change, if there is one. Called once per GUI frame.
     pub fn observe(&mut self, params: &FilterParams, now: Instant) -> bool {
         let current = Patch::capture(params);
-        self.history.observe(&current, now)
+        self.observe_patch(&current, now)
+    }
+
+    /// As `observe`, for a patch the caller already captured — the editor needs
+    /// the same patch for `sync`, and capturing it twice per frame is wasted
+    /// work on a 24-band state.
+    pub fn observe_patch(&mut self, current: &Patch, now: Instant) -> bool {
+        self.history.observe(current, now)
     }
 
     /// Step back one edit and write it to the host. Returns whether anything
@@ -571,5 +657,111 @@ mod tests {
         assert_eq!(ab.slot(1), &edited);
         // Copying must not switch: you stay where you were editing.
         assert_eq!(ab.active(), 0);
+    }
+
+    // ---- persistence ----------------------------------------------------
+
+    #[test]
+    fn a_snapshot_round_trips_through_the_session_blob() {
+        // Both slots, including the inactive one that the user cannot see —
+        // that is the whole point: B is the reference version.
+        let params = test_params(&[(1_000.0, 0.0, 1.0, crate::FilterType::Bell)]);
+        let mut state = PatchState::new(&params);
+
+        let mut edited = patch(&params);
+        edited.bands[0].gain = 6.0;
+        edited.num_bands = 3;
+        state.ab.toggle(&edited); // B is now live, A holds `edited`
+        let in_b = patch(&params);
+        state.ab.toggle(&in_b); // back to A
+
+        let blob = serde_json::to_string(&state.snapshot()).expect("snapshot must serialize");
+        let restored: AbSnapshot = serde_json::from_str(&blob).expect("and deserialize");
+
+        assert!(restored.is_current());
+        assert_eq!(restored.active, 0);
+        assert_eq!(restored.slots[0].bands[0].gain, 6.0, "A keeps its edit");
+        assert_eq!(
+            restored.slots[1],
+            patch(&params),
+            "B keeps the untouched copy"
+        );
+    }
+
+    #[test]
+    fn restoring_rebuilds_both_slots_and_the_active_one() {
+        let params = test_params(&[(1_000.0, 0.0, 1.0, crate::FilterType::Bell)]);
+        let mut a = patch(&params);
+        a.bands[0].gain = -3.0;
+        let mut b = patch(&params);
+        b.bands[0].gain = 4.5;
+
+        let snapshot = AbSnapshot {
+            version: AB_SCHEMA,
+            active: 1,
+            slots: [a.clone(), b.clone()],
+        };
+        let state = PatchState::restored(&params, Some(&snapshot));
+
+        assert_eq!(
+            state.ab.active(),
+            1,
+            "the live slot is restored, not just the data"
+        );
+        assert_eq!(state.ab.slot(0), &a);
+        assert_eq!(state.ab.slot(1), &b);
+        // Nothing to undo: a fresh session has no history to walk back into.
+        assert!(!state.history.can_undo());
+    }
+
+    #[test]
+    fn an_edit_left_in_the_active_slot_is_persisted() {
+        // The regression this is for: the active slot only caught up when you
+        // switched away from it, so an edit made and left in place vanished on
+        // reload while the other slot survived.
+        let params = test_params(&[(1_000.0, 0.0, 1.0, crate::FilterType::Bell)]);
+        let mut state = PatchState::new(&params);
+
+        let mut live = patch(&params);
+        live.bands[0].gain = -8.0;
+        assert!(state.sync(&live), "a changed live state must be stored");
+        assert_eq!(state.snapshot().slots[0].bands[0].gain, -8.0);
+
+        // Unchanged state is not republished every frame.
+        assert!(
+            !state.sync(&live),
+            "an identical state must not report a change"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_from_another_schema_is_ignored() {
+        // serde would happily fill missing fields with defaults and hand back a
+        // plausible-looking wrong state; the version is what refuses it.
+        let params = test_params(&[(1_000.0, 0.0, 1.0, crate::FilterType::Bell)]);
+        let mut stale = patch(&params);
+        stale.bands[0].gain = 12.0;
+        let snapshot = AbSnapshot {
+            version: AB_SCHEMA - 1,
+            active: 1,
+            slots: [stale.clone(), stale],
+        };
+
+        let state = PatchState::restored(&params, Some(&snapshot));
+        assert_eq!(state.ab.active(), 0);
+        assert_eq!(
+            state.ab.slot(0),
+            &patch(&params),
+            "an old blob must be ignored, not half-applied"
+        );
+    }
+
+    #[test]
+    fn no_snapshot_means_a_fresh_pair() {
+        let params = test_params(&[(1_000.0, 0.0, 1.0, crate::FilterType::Bell)]);
+        let state = PatchState::restored(&params, None);
+        assert_eq!(state.ab.active(), 0);
+        assert_eq!(state.ab.slot(0), state.ab.slot(1));
+        assert_eq!(state.ab.slot(0), &patch(&params));
     }
 }

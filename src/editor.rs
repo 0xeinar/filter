@@ -568,7 +568,23 @@ impl IcedEditor for FilterEditor {
         // watching the parameters once per frame catches edits from every path
         // — canvas drags, panel sliders, host automation, a second editor — and
         // a drag settles into a single step once it stops moving.
-        self.patch_state_mut().observe(&self.params, Instant::now());
+        // Observe for undo, and keep the persisted A/B pair in step. The sync
+        // is what makes an edit to the active slot survive a reload; the clone
+        // into the persist field only happens when the slot actually changed,
+        // not once per frame.
+        {
+            let mut state = self.patch_state_mut();
+            let live = crate::patch::Patch::capture(&self.params);
+            state.observe_patch(&live, Instant::now());
+            let changed = state.sync(&live);
+            if changed {
+                let snapshot = state.snapshot();
+                drop(state);
+                if let Ok(mut blob) = self.params.ab_state.lock() {
+                    *blob = Some(snapshot);
+                }
+            }
+        }
 
         let num_bands = self.params.num_bands.value() as usize;
         let selected = self.selected(num_bands);

@@ -3,6 +3,8 @@ use nih_plug::prelude::*;
 use nih_plug_iced::IcedState;
 use std::sync::Arc;
 
+#[cfg(test)]
+mod audio_path;
 pub mod dsp;
 #[cfg(test)]
 mod e2e;
@@ -83,6 +85,10 @@ pub struct Filter {
     dyn_meters: Arc<dsp::dynamics::BandMeters>,
     /// Undo/redo history and the A/B pair (GUI-thread only).
     patch_state: Arc<std::sync::Mutex<patch::PatchState>>,
+    /// Whether the persisted A/B pair has been read into `patch_state`. The
+    /// parameter store is hydrated by the host *after* construction, so this
+    /// cannot happen in `default()`.
+    ab_restored: bool,
 }
 
 /// Maximum audio channels the plugin processes (stereo layout + mono).
@@ -158,6 +164,14 @@ pub struct BandParams {
 pub struct FilterParams {
     #[persist = "editor-state"]
     editor_state: Arc<IcedState>,
+
+    /// The A/B pair, persisted so a reload keeps the reference version.
+    ///
+    /// Pro-Q's A/B is how you answer "is this actually better?", and losing the
+    /// reference on reload makes the answer unrepeatable. The blob carries a
+    /// schema version; see `patch::AB_SCHEMA`.
+    #[persist = "ab-slots"]
+    pub ab_state: Arc<std::sync::Mutex<Option<patch::AbSnapshot>>>,
 
     #[id = "num-bands"]
     pub num_bands: IntParam,
@@ -563,6 +577,7 @@ impl Default for Filter {
         let params = Arc::new(FilterParams::default());
         Self {
             patch_state: Arc::new(std::sync::Mutex::new(patch::PatchState::new(&params))),
+            ab_restored: false,
             params,
             peak_meter_decay_weight: 1.0,
             peak_meter: Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
@@ -606,6 +621,7 @@ impl Default for FilterParams {
     fn default() -> Self {
         Self {
             editor_state: editor::default_state(),
+            ab_state: Arc::new(std::sync::Mutex::new(None)),
             num_bands: IntParam::new(
                 "Bands",
                 0,
@@ -668,6 +684,22 @@ impl Plugin for Filter {
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        // Restore the A/B pair the first time an editor opens: by now the host
+        // has hydrated the parameters from the session, which is what the slots
+        // are checked against.
+        if !self.ab_restored {
+            let snapshot = self
+                .params
+                .ab_state
+                .lock()
+                .ok()
+                .and_then(|blob| blob.clone());
+            self.patch_state = Arc::new(std::sync::Mutex::new(patch::PatchState::restored(
+                &self.params,
+                snapshot.as_ref(),
+            )));
+            self.ab_restored = true;
+        }
         editor::create(
             self.params.clone(),
             self.peak_meter.clone(),
@@ -684,10 +716,40 @@ impl Plugin for Filter {
         buffer_config: &BufferConfig,
         context: &mut impl InitContext<Self>,
     ) -> bool {
-        self.peak_meter_decay_weight = 0.25f64
-            .powf((buffer_config.sample_rate as f64 * PEAK_METER_DECAY_MS / 1000.0).recip())
-            as f32;
-        self.sample_rate = buffer_config.sample_rate;
+        self.configure(buffer_config.sample_rate);
+        context.set_latency_samples(self.reported_latency);
+        true
+    }
+
+    fn process(
+        &mut self,
+        buffer: &mut Buffer,
+        _aux: &mut AuxiliaryBuffers,
+        context: &mut impl ProcessContext<Self>,
+    ) -> ProcessStatus {
+        // `process_buffer` is the whole audio path and takes nothing from
+        // nih-plug that a test cannot build, so the tests run *this* code
+        // instead of a copy of it. Only latency reporting needs the context.
+        let latency = self.process_buffer(buffer, self.params.editor_state.is_open());
+        if latency != self.reported_latency {
+            context.set_latency_samples(latency);
+            self.reported_latency = latency;
+        }
+        ProcessStatus::Normal
+    }
+}
+
+impl Filter {
+    /// Everything that depends on the sample rate, in one place.
+    ///
+    /// Called from `initialize` and from the tests: a test that built a
+    /// `Filter` without this would run with default-constructed detectors
+    /// (tuned for a different rate) and measure nonsense — which is exactly
+    /// what the first version of `audio_path` did.
+    pub fn configure(&mut self, sample_rate: f32) {
+        self.peak_meter_decay_weight =
+            0.25f64.powf((sample_rate as f64 * PEAK_METER_DECAY_MS / 1000.0).recip()) as f32;
+        self.sample_rate = sample_rate;
         for sections in &mut self.band_coeffs {
             sections[0].update(1000.0, 0.0, 1.0, FilterType::Bell, self.sample_rate);
         }
@@ -712,16 +774,18 @@ impl Plugin for Filter {
             detector.reset();
         }
         self.reported_latency = dsp::oversample::latency_samples(factor);
-        context.set_latency_samples(self.reported_latency);
-        true
     }
 
-    fn process(
-        &mut self,
-        buffer: &mut Buffer,
-        _aux: &mut AuxiliaryBuffers,
-        context: &mut impl ProcessContext<Self>,
-    ) -> ProcessStatus {
+    /// The entire audio path for one host buffer: oversampling, the band
+    /// cascade, dynamics, output stage, bypass crossfade and both analyzer
+    /// taps. Returns the latency the host should compensate.
+    ///
+    /// Split out of `Plugin::process` because `ProcessContext` cannot be
+    /// constructed outside nih-plug — every audio test used to mirror this
+    /// loop instead, which meant the thing under test was a *copy*. Two of the
+    /// bugs found in this project were two implementations of the same idea
+    /// drifting apart; this removes the second implementation.
+    pub fn process_buffer(&mut self, buffer: &mut Buffer, editor_open: bool) -> u32 {
         let num_active = self.params.num_bands.value() as usize;
 
         // --- Oversampling factor for this block ---
@@ -745,17 +809,11 @@ impl Plugin for Filter {
             // every band for this block.
             factor_changed = true;
         }
-        if latency != self.reported_latency {
-            context.set_latency_samples(latency);
-            self.reported_latency = latency;
-        }
         let os_rate = self.sample_rate * factor as f32;
 
         // Spectrum analysis runs on the INPUT signal, before any band touches
-        // the buffer. Channel 0 only (the earlier code averaged L/R; for a
-        // log-frequency display the difference is below the pixel grid).
-        // Editor-open check: skip the FFT entirely when the GUI is closed.
-        let editor_open = self.params.editor_state.is_open();
+        // the buffer. Editor-open check: skip the FFT entirely when the GUI is
+        // closed.
         if editor_open {
             if let Some(analyzer) = self.spectrum_analyzer_in.as_mut() {
                 push_analyzer_block(analyzer, &self.spectrum_taps, false, buffer.as_slice());
@@ -818,13 +876,25 @@ impl Plugin for Filter {
                 let mut det_in = [0.0f32; COEFF_BLOCK];
                 if any_dynamic {
                     for (i, slot) in det_in[..block_len].iter_mut().enumerate() {
-                        let mut peak = 0.0f32;
+                        // The *louder* channel wins, but its sign is kept. This
+                        // used to store `abs()`, and the detector band-passes
+                        // before rectifying — so a rectified 1 kHz sine (DC plus
+                        // 2 kHz, no energy at 1 kHz) got thrown away by the
+                        // detector's own band-pass. The band then read ~18 dB
+                        // below the truth and a dynamic band barely engaged.
+                        // `tests/dynamic_eq.rs` never caught it because its
+                        // harness fed the detector raw samples: the mirror was
+                        // measuring a different algorithm.
+                        let mut loudest = 0.0f32;
                         for channel in 0..num_channels {
                             if let Some(samples) = block.get(channel) {
-                                peak = peak.max(samples[sub_offset + i].abs());
+                                let value = samples[sub_offset + i];
+                                if value.abs() > loudest.abs() {
+                                    loudest = value;
+                                }
                             }
                         }
-                        *slot = peak;
+                        *slot = loudest;
                     }
                 }
 
@@ -1113,7 +1183,7 @@ impl Plugin for Filter {
             }
         }
 
-        ProcessStatus::Normal
+        latency
     }
 }
 
