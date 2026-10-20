@@ -199,6 +199,16 @@ fn chip_at(pos: Point, view: &SpectrumView, bounds: Rectangle) -> Option<Chip> {
 /// A cut passes 0 dB and ignores its gain parameter, so its node belongs on
 /// the 0 dB line where its curve actually starts — not floating wherever the
 /// (unused) gain happens to sit.
+/// Whether the band's dynamics will actually move it.
+///
+/// `dyn_enable` alone is not enough: a range of 0 dB is Pro-Q's "clear
+/// dynamics", and a band in that state is static however the switch is set.
+fn dyn_is_active(bp: &crate::BandParams) -> bool {
+    bp.dyn_enable.value()
+        && bp.dyn_range.value().abs() >= crate::dsp::dynamics::MIN_RANGE_DB
+        && FilterType::from_i32(bp.filter_type.value()).has_gain()
+}
+
 fn node_gain_db(bp: &crate::BandParams) -> f32 {
     if FilterType::from_i32(bp.filter_type.value()).has_gain() {
         bp.gain.value()
@@ -241,7 +251,7 @@ struct GraphProgram {
     /// Both analyzer taps: input (pre-EQ) and output (post-EQ).
     taps: Arc<crate::dsp::spectrum::SpectrumTaps>,
     /// Live dynamic gain per band. Read for the node readout so a dynamic band
-    /// shows what it is doing, not just its ceiling.
+    /// shows how far it has moved, not just where the knob sits.
     dyn_meters: Arc<crate::dsp::dynamics::BandMeters>,
     /// Undo history and A/B slots. The canvas owns the keyboard, so the undo
     /// shortcut lands here and is forwarded to the editor as a message.
@@ -308,6 +318,10 @@ impl CachedLayers {
             // the cached geometry just like a freq/gain edit does.
             bp.slope.value().hash(&mut h);
             bp.enable.value().hash(&mut h);
+            // The range curve is drawn from these, so a dynamic edit has to
+            // invalidate the cached geometry like any other.
+            bp.dyn_enable.value().hash(&mut h);
+            bp.dyn_range.value().to_bits().hash(&mut h);
         }
         for v in [bounds.x, bounds.y, bounds.width, bounds.height] {
             v.to_bits().hash(&mut h);
@@ -687,6 +701,38 @@ impl GraphProgram {
                 &line,
                 Stroke::default().with_color(stroke_color).with_width(1.0),
             );
+
+            // A dynamic band gets a second, dashed-ish faint curve at the far
+            // end of its range, so the drawing says where the band can go as
+            // well as where it sits. Without it the range is invisible: the
+            // static curve is all you would see, and the band would look
+            // static while audibly ducking.
+            let range_db = self.params.band_params[i].dyn_range.value();
+            if dyn_is_active(&self.params.band_params[i]) && range_db.abs() > 0.0 {
+                let far = BandSpec {
+                    gain_db: spec.gain_db + range_db,
+                    ..*spec
+                };
+                let line = Path::new(|p| {
+                    for j in 0..POINTS {
+                        let x01 = j as f32 / (POINTS - 1) as f32;
+                        let freq = FREQ_MIN * (FREQ_MAX / FREQ_MIN).powf(x01);
+                        let db = band_response_db(&far, freq);
+                        let pt = to_px(bounds, freq, db.clamp(-DB_MAX - 6.0, DB_MAX + 6.0));
+                        if j == 0 {
+                            p.move_to(pt);
+                        } else {
+                            p.line_to(pt);
+                        }
+                    }
+                });
+                frame.stroke(
+                    &line,
+                    Stroke::default()
+                        .with_color(Color { a: 0.18, ..color })
+                        .with_width(1.0),
+                );
+            }
         }
     }
 
@@ -746,24 +792,28 @@ impl GraphProgram {
                 );
             }
 
-            // Frequency + gain readout while dragging or while selected. A
-            // dynamic band shows the gain it is applying right now: the knob's
-            // value is only its ceiling, and the whole point of the feature is
-            // that the two differ.
+            // Frequency + gain readout while dragging or while selected.
+            //
+            // A dynamic band shows the static gain *and* the dynamic part: with
+            // Pro-Q's model the knob stays a static gain and the range moves
+            // the band away from it, so a label that showed only one of the two
+            // would be wrong about the sound in one direction or the other.
             if is_drag || is_selected {
                 let dynamic = bp.dyn_enable.value()
-                    && FilterType::from_i32(bp.filter_type.value()).has_gain();
-                let gain = if dynamic {
-                    self.dyn_meters.read(i)
-                } else {
-                    bp.gain.value()
-                };
+                    && FilterType::from_i32(bp.filter_type.value()).has_gain()
+                    && bp.dyn_range.value().abs() >= crate::dsp::dynamics::MIN_RANGE_DB;
+                let static_gain = bp.gain.value();
                 let label = if dynamic {
-                    format!("{:.0} Hz  {:+.1} dB dyn", bp.freq.value(), gain)
+                    format!(
+                        "{:.0} Hz  {:+.1} dB ({:+.1} dyn)",
+                        bp.freq.value(),
+                        static_gain,
+                        self.dyn_meters.read(i)
+                    )
                 } else {
-                    format!("{:.0} Hz  {:+.1} dB", bp.freq.value(), gain)
+                    format!("{:.0} Hz  {:+.1} dB", bp.freq.value(), static_gain)
                 };
-                let text_x = (center.x + 10.0).min(bounds.x + bounds.width - 95.0);
+                let text_x = (center.x + 10.0).min(bounds.x + bounds.width - 140.0);
                 frame.fill_text(CanvasText {
                     content: label,
                     position: Point::new(text_x, center.y - 16.0),
@@ -1671,10 +1721,13 @@ mod tests {
         );
     }
 
-    /// The node readout of a dynamic band must show what the band is applying
-    /// now, not the ceiling the knob is parked at.
+    /// A dynamic band's readout must carry both numbers.
+    ///
+    /// With the Pro-Q model the knob is a static gain and the range moves the
+    /// band away from it, so a label showing only one of the two says the wrong
+    /// thing about the sound in one direction or the other.
     #[test]
-    fn a_dynamic_band_labels_its_live_gain_not_its_ceiling() {
+    fn a_dynamic_band_labels_its_static_gain_and_the_live_part() {
         let params = test_params_with_dynamics(&[(1_000.0, -12.0, 1.0, FilterType::Bell)]);
         let program = test_program_with(params, Arc::new(NullGuiContext));
         program.select(Some(0));
@@ -1684,15 +1737,19 @@ mod tests {
         let mut labels = Vec::new();
         texts(&layers[NODES].clone().into_primitive(), &mut labels);
 
+        let label = labels
+            .iter()
+            .find(|l| l.contains("1000 Hz"))
+            .unwrap_or_else(|| panic!("no readout drawn; got {labels:?}"));
+        // The fixture makes the band dynamic by moving its gain into the range,
+        // so the static gain is 0 and the live part is what the meter says.
         assert!(
-            labels
-                .iter()
-                .any(|l| l.contains("-7.5 dB") && l.contains("dyn")),
-            "expected the live gain with a 'dyn' marker, got {labels:?}"
+            label.contains("+0.0 dB"),
+            "the static gain is missing from {label:?}"
         );
         assert!(
-            !labels.iter().any(|l| l.contains("-12.0 dB")),
-            "the static ceiling must not be shown as the current gain: {labels:?}"
+            label.contains("(-7.5 dyn)"),
+            "the live dynamic part is missing from {label:?}"
         );
     }
 
