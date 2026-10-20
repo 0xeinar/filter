@@ -11,6 +11,7 @@ A surgical parametric EQ plugin built in Rust. Inspired by FabFilter Pro-Q — d
 - **Dark themed GUI** — FabFilter-style aesthetic, colored band labels
 - **CLAP + VST3** — works in Ableton, Bitwig, Reaper, FL Studio
 - **Sample-accurate automation**
+- **Undo/redo and A/B compare** — 50 steps each way, coalesced into gestures
 - **Dynamic EQ** — any gain type can follow the level inside its own band
 - **Output stage** — ±24 dB trim, pink-weighted auto-gain, click-free bypass
 - **Spectrum** — input and post-EQ traces overlaid, so the curve is visible in the signal
@@ -74,6 +75,28 @@ not see it.
 through a −12 dB band at −30 dB threshold comes out at −22 dBFS, the same band
 passes a −45 dBFS tone untouched, and an 8 kHz tone does not open a 1 kHz band
 at all.
+
+## Undo, redo and A/B
+
+Every edit is undoable with **Cmd/Ctrl+Z**, redone with **Cmd/Ctrl+Shift+Z** (or
+Ctrl+Y). The history is not hooked into each edit path: the editor watches the
+parameters once per frame and records a step when they have been **still for
+400 ms**. One drag is therefore one undo step instead of one per frame, and
+edits that never pass through this GUI — host automation, a preset load, a
+second editor window — are caught too, because the observation is on the
+parameters, not on the gestures.
+
+Undo writes back only the parameters that differ. A three-knob change costs
+three writes, not 264; hosts treat every write as automation input, so the
+distinction is not just tidiness.
+
+**A/B** is a pair of complete states in the header. Clicking the inactive letter
+switches; `A>B` / `B>A` copies the live state into the other slot without
+switching, which is how you keep a reference version while you edit. Both slots
+start identical, so a switch does nothing until one of them is edited. Switching
+is deliberately **not** an undo step: the history is rebased onto the slot you
+landed in, so undo after a switch walks back that slot's own edits instead of
+flipping slots again.
 
 ## Layout
 
@@ -145,8 +168,8 @@ Rescan plugins in your DAW after copying.
 # Run all tests
 cargo test
 
-# 183 tests:
-#  148 unit tests — biquad coefficients, frequency response, stability,
+# 196 tests:
+#  161 unit tests — biquad coefficients, frequency response, stability,
 #                   dynamic-EQ detector (ballistics, selectivity, threshold
 #                   law, stability),
 #                   response-curve math (log mapping, combined EQ response),

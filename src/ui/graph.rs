@@ -131,6 +131,9 @@ struct GraphProgram {
     /// Live dynamic gain per band. Read for the node readout so a dynamic band
     /// shows what it is doing, not just its ceiling.
     dyn_meters: Arc<crate::dsp::dynamics::BandMeters>,
+    /// Undo history and A/B slots. The canvas owns the keyboard, so the undo
+    /// shortcut lands here and is forwarded to the editor as a message.
+    patch_state: Arc<std::sync::Mutex<crate::patch::PatchState>>,
     /// Visually-smoothed spectrum bars, one vector per tap, shared lock-free
     /// (GUI thread writes, same thread reads; atomic to satisfy Send+Sync on
     /// the Arc).
@@ -263,6 +266,14 @@ impl GraphProgram {
     }
 
     /// Selected band, or `None`.
+    /// Lock the shared history. A panic elsewhere must not brick the editor,
+    /// so a poisoned lock is taken back rather than unwrapped.
+    fn lock_patch_state(&self) -> std::sync::MutexGuard<'_, crate::patch::PatchState> {
+        self.patch_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn selected(&self) -> Option<usize> {
         let sel = self.selected.load(Ordering::Relaxed);
         if selection::is_none(sel) {
@@ -689,6 +700,7 @@ impl Graph {
         peak_meter: Arc<AtomicF32>,
         taps: Arc<crate::dsp::spectrum::SpectrumTaps>,
         dyn_meters: Arc<crate::dsp::dynamics::BandMeters>,
+        patch_state: Arc<std::sync::Mutex<crate::patch::PatchState>>,
         selected: Arc<AtomicUsize>,
     ) -> Self {
         Self {
@@ -703,6 +715,7 @@ impl Graph {
                 _peak_meter: peak_meter,
                 taps,
                 dyn_meters,
+                patch_state,
                 smoothed_in: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
                 smoothed_out: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
                 spec_x: spectrum_bin_x(),
@@ -947,12 +960,40 @@ impl GraphView {
             return canvas::event::Status::Ignored;
         };
 
+        use keyboard::KeyCode;
+
+        // Undo/redo live before the selection check: undo must work with no
+        // band selected, which is exactly when you have just deleted one.
+        // The canvas owns the keyboard, so the work happens here rather than
+        // being forwarded as a message — `handle_keyboard_event` returns only a
+        // status, and the canvas already holds the params, the context and the
+        // shared history.
+        if modifiers.command() || modifiers.control() {
+            let handled = match key_code {
+                KeyCode::Z if modifiers.shift() => {
+                    let mut state = program.lock_patch_state();
+                    state.redo(&program.params, program.context.as_ref())
+                }
+                KeyCode::Z => {
+                    let mut state = program.lock_patch_state();
+                    state.undo(&program.params, program.context.as_ref())
+                }
+                KeyCode::Y => {
+                    let mut state = program.lock_patch_state();
+                    state.redo(&program.params, program.context.as_ref())
+                }
+                _ => false,
+            };
+            if handled {
+                return canvas::event::Status::Captured;
+            }
+        }
+
         let num_active = program.params.num_bands.value() as usize;
         let Some(band) = program.selected().filter(|&b| b < num_active) else {
             return canvas::event::Status::Ignored;
         };
 
-        use keyboard::KeyCode;
         match key_code {
             KeyCode::Left | KeyCode::Right => {
                 let semitones = if modifiers.shift() {
@@ -1107,12 +1148,26 @@ mod tests {
         context: Arc<dyn GuiContext>,
         taps: Arc<SpectrumTaps>,
     ) -> GraphProgram {
+        let patch_state = Arc::new(std::sync::Mutex::new(crate::patch::PatchState::new(
+            &params,
+        )));
+        test_program_with_history(params, context, taps, patch_state)
+    }
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn test_program_with_history(
+        params: Arc<FilterParams>,
+        context: Arc<dyn GuiContext>,
+        taps: Arc<SpectrumTaps>,
+        patch_state: Arc<std::sync::Mutex<crate::patch::PatchState>>,
+    ) -> GraphProgram {
         GraphProgram {
             params,
             context,
             _peak_meter: Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             taps,
             dyn_meters: Arc::new(crate::dsp::dynamics::BandMeters::new()),
+            patch_state,
             smoothed_in: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
             smoothed_out: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
             spec_x: spectrum_bin_x(),
@@ -1378,6 +1433,93 @@ mod tests {
             !labels.iter().any(|l| l.contains("-12.0 dB")),
             "the static ceiling must not be shown as the current gain: {labels:?}"
         );
+    }
+
+    /// Cmd/Ctrl+Z on the canvas must reach the shared history and write the
+    /// previous values back to the host. The canvas owns the keyboard, so this
+    /// is the only path the shortcut can take.
+    #[test]
+    fn command_z_undoes_through_the_canvas() {
+        use crate::patch::{Patch, PatchState, SETTLE};
+        use std::time::Instant;
+
+        let before = test_params(&[(1_000.0, 0.0, 1.0, FilterType::Bell)]);
+        // The "live" parameters are one edit ahead of the history.
+        let live = test_params(&[(1_000.0, 6.0, 1.0, FilterType::Bell)]);
+        let ctx = Arc::new(RecordingGuiContext::default());
+
+        let state = Arc::new(std::sync::Mutex::new(PatchState::new(&before)));
+        {
+            // Settle one edit into the history: A -> B.
+            let mut state = state.lock().unwrap();
+            let t0 = Instant::now();
+            let edited = Patch::capture(&live);
+            state.history.observe(&edited, t0);
+            state.history.observe(&edited, t0 + SETTLE);
+            assert!(state.history.can_undo(), "the fixture needs a step");
+        }
+
+        let program = {
+            let ctx_dyn: Arc<dyn GuiContext> = ctx.clone();
+            test_program_with_history(live, ctx_dyn, Arc::new(SpectrumTaps::new()), state.clone())
+        };
+        // GUI-thread-only, same contract as Graph::new.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let view = GraphView {
+            program: Arc::new(program),
+        };
+        let status = view.handle_keyboard_event(keyboard::Event::KeyPressed {
+            key_code: keyboard::KeyCode::Z,
+            modifiers: keyboard::Modifiers::COMMAND,
+        });
+
+        assert_eq!(status, canvas::event::Status::Captured);
+        assert_eq!(
+            ctx.writes().len(),
+            1,
+            "undo should write exactly the parameter that changed"
+        );
+        // The gain goes back to 0 dB.
+        let gain = &test_params(&[(1_000.0, 0.0, 1.0, FilterType::Bell)]).band_params[0].gain;
+        assert!((ctx.writes()[0] - gain.preview_normalized(0.0)).abs() < 1e-6);
+
+        // Redo puts it back.
+        let program_redo = {
+            let ctx_dyn: Arc<dyn GuiContext> = ctx.clone();
+            test_program_with_history(
+                test_params(&[(1_000.0, 0.0, 1.0, FilterType::Bell)]),
+                ctx_dyn,
+                Arc::new(SpectrumTaps::new()),
+                state,
+            )
+        };
+        #[allow(clippy::arc_with_non_send_sync)]
+        let view = GraphView {
+            program: Arc::new(program_redo),
+        };
+        let status = view.handle_keyboard_event(keyboard::Event::KeyPressed {
+            key_code: keyboard::KeyCode::Z,
+            modifiers: keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+        });
+        assert_eq!(status, canvas::event::Status::Captured);
+        assert_eq!(ctx.writes().len(), 2, "redo should write the gain back");
+    }
+
+    #[test]
+    fn command_z_with_nothing_to_undo_is_left_for_the_host() {
+        // Falling through matters: the host has its own undo, and swallowing
+        // the key with an empty stack would break it.
+        let program = test_program(&[(1_000.0, 0.0, 1.0, FilterType::Bell)]);
+        // GUI-thread-only, same contract as Graph::new.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let view = GraphView {
+            program: Arc::new(program),
+        };
+        let status = view.handle_keyboard_event(keyboard::Event::KeyPressed {
+            key_code: keyboard::KeyCode::Z,
+            modifiers: keyboard::Modifiers::COMMAND,
+        });
+        assert_eq!(status, canvas::event::Status::Ignored);
     }
 
     #[test]
