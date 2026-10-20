@@ -54,11 +54,14 @@ fn band_specs(params: &FilterParams, num_active: usize) -> [BandSpec; MAX_BANDS]
     crate::band_specs(params, num_active)
 }
 
-/// x position (0..1) of each spectrum bin's upper edge, precomputed once.
-/// Depends only on the FFT bin → frequency mapping, which is fixed.
-fn spectrum_bin_x() -> Vec<f32> {
+/// x position (0..1) of each spectrum bin's upper edge at `sample_rate`.
+///
+/// Not a constant: a bin's frequency scales with the rate, so the bars move
+/// when the host switches from 44.1 to 96 kHz. Recomputed when the published
+/// rate changes, cached otherwise.
+fn spectrum_bin_x(sample_rate: f32) -> Vec<f32> {
     (0..BINS)
-        .map(|i| freq_to_x(crate::dsp::spectrum::bin_edge_hz(i).min(FREQ_MAX)))
+        .map(|i| freq_to_x(crate::dsp::spectrum::bin_edge_hz(i, sample_rate).min(FREQ_MAX)))
         .collect()
 }
 
@@ -142,7 +145,10 @@ struct GraphProgram {
     /// Precomputed x position (0..1 across the graph) for every spectrum bin.
     /// The bin → frequency mapping never changes, so this saves a `powf` and a
     /// `log10` per bin per frame — 192 of them at 60 fps.
-    spec_x: Vec<f32>,
+    spec_x: RefCell<Vec<f32>>,
+    /// Sample rate `spec_x` was built for. The axis is rebuilt when the audio
+    /// thread reports a different one, which happens on a device change.
+    spec_rate: std::cell::Cell<f32>,
     /// Cached geometry for the layers that only change when a parameter does
     /// (grid, band curves, combined curve). Without this, every frame rebuilt
     /// up to 24 × 120 `band_response_db` evaluations — each with a `powf`,
@@ -385,11 +391,12 @@ impl GraphProgram {
     fn draw_input_spectrum(&self, frame: &mut Frame, bounds: Rectangle) {
         let mut db = [0.0f32; BINS];
         self.smooth_spectrum(&self.taps.input, &self.smoothed_in, &mut db);
+        let spec_x = self.spec_x.borrow();
 
         let mut path_pts: Vec<Point> = Vec::with_capacity(BINS + 2);
         path_pts.push(Point::new(bounds.x, bounds.y + bounds.height));
         for (i, &value) in db.iter().enumerate() {
-            let x = bounds.x + self.spec_x[i] * bounds.width;
+            let x = bounds.x + spec_x[i] * bounds.width;
             path_pts.push(Point::new(x, spectrum_y(bounds, value)));
         }
         // Close down to the bottom-right corner; the bottom-left corner is the
@@ -432,11 +439,12 @@ impl GraphProgram {
     fn draw_output_spectrum(&self, frame: &mut Frame, bounds: Rectangle) {
         let mut db = [0.0f32; BINS];
         self.smooth_spectrum(&self.taps.output, &self.smoothed_out, &mut db);
+        let spec_x = self.spec_x.borrow();
 
         let line = Path::new(|p| {
             for (i, &value) in db.iter().enumerate() {
                 let pt = Point::new(
-                    bounds.x + self.spec_x[i] * bounds.width,
+                    bounds.x + spec_x[i] * bounds.width,
                     spectrum_y(bounds, value),
                 );
                 if i == 0 {
@@ -644,6 +652,10 @@ impl GraphProgram {
         hover: Option<usize>,
         dragging: Option<usize>,
     ) -> Vec<Geometry> {
+        // A device change can move the whole frequency axis; do this before the
+        // cache key is computed, because it invalidates every cached point.
+        self.refresh_axis();
+
         // The grid, per-band curves and the combined curve only change when a
         // parameter (or the canvas geometry) does. nih-plug redraws the whole
         // editor every frame with `always_redraw`, but the EQ picture is
@@ -693,6 +705,22 @@ pub struct Graph {
     program: Arc<GraphProgram>,
 }
 
+impl GraphProgram {
+    /// Rebuild the spectrum bar positions if the audio thread has published a
+    /// different sample rate. Called once per draw, before either overlay: a
+    /// stale axis would place every bar at the wrong frequency.
+    fn refresh_axis(&self) {
+        let rate = self.taps.sample_rate();
+        if rate != self.spec_rate.get() {
+            *self.spec_x.borrow_mut() = spectrum_bin_x(rate);
+            self.spec_rate.set(rate);
+            // The curves are cached geometry; a new axis means every cached
+            // point is now at the wrong x.
+            *self.cache.borrow_mut() = None;
+        }
+    }
+}
+
 impl Graph {
     pub fn new(
         params: Arc<FilterParams>,
@@ -709,22 +737,27 @@ impl Graph {
             // declares (unsafely, with justification) Send+Sync. Access stays
             // on the GUI thread — same contract as the slider states.
             #[allow(clippy::arc_with_non_send_sync)]
-            program: Arc::new(GraphProgram {
-                params,
-                context,
-                _peak_meter: peak_meter,
-                taps,
-                dyn_meters,
-                patch_state,
-                smoothed_in: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
-                smoothed_out: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
-                spec_x: spectrum_bin_x(),
-                cache: RefCell::new(None),
-                drag: Cell::new(None),
-                hover: Cell::new(None),
-                fine_scroll: Cell::new(false),
-                last_click: Cell::new(None),
-                selected,
+            program: Arc::new({
+                let spec_x = RefCell::new(spectrum_bin_x(taps.sample_rate()));
+                let spec_rate = Cell::new(taps.sample_rate());
+                GraphProgram {
+                    params,
+                    context,
+                    _peak_meter: peak_meter,
+                    taps,
+                    dyn_meters,
+                    patch_state,
+                    smoothed_in: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
+                    smoothed_out: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
+                    spec_x,
+                    spec_rate,
+                    cache: RefCell::new(None),
+                    drag: Cell::new(None),
+                    hover: Cell::new(None),
+                    fine_scroll: Cell::new(false),
+                    last_click: Cell::new(None),
+                    selected,
+                }
             }),
         }
     }
@@ -1161,6 +1194,7 @@ mod tests {
         taps: Arc<SpectrumTaps>,
         patch_state: Arc<std::sync::Mutex<crate::patch::PatchState>>,
     ) -> GraphProgram {
+        let rate = taps.sample_rate();
         GraphProgram {
             params,
             context,
@@ -1170,7 +1204,8 @@ mod tests {
             patch_state,
             smoothed_in: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
             smoothed_out: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
-            spec_x: spectrum_bin_x(),
+            spec_x: RefCell::new(spectrum_bin_x(rate)),
+            spec_rate: Cell::new(rate),
             cache: RefCell::new(None),
             drag: Cell::new(None),
             hover: Cell::new(None),
@@ -1182,6 +1217,42 @@ mod tests {
 
     fn test_program(bands: &[(f32, f32, f32, FilterType)]) -> GraphProgram {
         test_program_with(test_params(bands), Arc::new(NullGuiContext))
+    }
+
+    #[test]
+    fn the_axis_follows_the_published_sample_rate() {
+        // The wiring, not the arithmetic: `bin_edge_hz` is unit-tested, but it
+        // only helps if the canvas actually reads the rate the audio thread
+        // published instead of a constant. A device change from 48 to 96 kHz
+        // must move every bar one octave to the right.
+        let taps = Arc::new(SpectrumTaps::new());
+        taps.set_sample_rate(48_000.0);
+        let program = test_program_with_taps(
+            test_params(&[(1_000.0, 0.0, 1.0, FilterType::Bell)]),
+            Arc::new(NullGuiContext),
+            taps.clone(),
+        );
+
+        let mid = BINS / 2;
+        let before = program.spec_x.borrow()[mid];
+        assert_eq!(program.spec_rate.get(), 48_000.0);
+
+        taps.set_sample_rate(96_000.0);
+        // The draw path refreshes the axis once per frame; call the same hook.
+        program.refresh_axis();
+
+        let after = program.spec_x.borrow()[mid];
+        assert_eq!(program.spec_rate.get(), 96_000.0);
+        assert!(
+            after > before + 0.05,
+            "band {mid} sits at x={before} at 48 kHz and x={after} at 96 kHz — \
+             one octave is a measurable shift on a log axis"
+        );
+
+        // And it does not rebuild when nothing changed.
+        let cached = program.spec_x.borrow().clone();
+        program.refresh_axis();
+        assert_eq!(*program.spec_x.borrow(), cached);
     }
 
     /// Every vertex of every mesh in a primitive tree, as
@@ -1852,7 +1923,7 @@ mod tests {
         for i in 0..BINS {
             // Same band→frequency mapping the canvas uses to place the bar, so
             // the dump's geometry is self-consistent (and measurable).
-            let freq = crate::dsp::spectrum::bin_edge_hz(i);
+            let freq = crate::dsp::spectrum::bin_edge_hz(i, taps.sample_rate());
             let level = -18.0 - 12.0 * (i as f32 / BINS as f32);
             input[i] = level;
             let delta: f32 = specs
