@@ -2,6 +2,11 @@
 # Pre-push hook: run formatting check + tests before pushing
 
 set -e
+# Without pipefail the exit status of `cargo test | grep ...` is grep's, so a
+# failing suite still exited 0 as long as grep matched a line — and "test
+# result: FAILED" matches the same pattern as "ok". The hook then printed
+# "Tests passed" and pushed a red tree.
+set -o pipefail
 
 echo "→ cargo fmt --check..."
 cargo fmt --all -- --check

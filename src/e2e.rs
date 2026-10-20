@@ -18,7 +18,6 @@
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use atomic_float::AtomicF32;
 use nih_plug::prelude::*;
 use nih_plug_iced::backend::widget::canvas::Cursor;
 use nih_plug_iced::{keyboard, mouse, Point, Rectangle};
@@ -49,9 +48,9 @@ impl Harness {
         let graph = Graph::new(
             params.clone(),
             context.clone(),
-            Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             Arc::new(SpectrumTaps::new()),
             Arc::new(crate::dsp::dynamics::BandMeters::new()),
+            Arc::new(AtomicUsize::new(crate::NO_SOLO)),
             Arc::new(std::sync::Mutex::new(crate::patch::PatchState::new(
                 &params,
             ))),
@@ -272,9 +271,9 @@ fn dragging_a_cut_changes_frequency_and_leaves_gain_alone() {
     let graph = Graph::new(
         params.clone(),
         context.clone(),
-        Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
         Arc::new(SpectrumTaps::new()),
         Arc::new(crate::dsp::dynamics::BandMeters::new()),
+        Arc::new(AtomicUsize::new(crate::NO_SOLO)),
         Arc::new(std::sync::Mutex::new(crate::patch::PatchState::new(
             &params,
         ))),

@@ -275,12 +275,14 @@ struct DragState {
 struct GraphProgram {
     params: Arc<FilterParams>,
     context: Arc<dyn GuiContext>,
-    _peak_meter: Arc<AtomicF32>,
     /// Both analyzer taps: input (pre-EQ) and output (post-EQ).
     taps: Arc<crate::dsp::spectrum::SpectrumTaps>,
     /// Live dynamic gain per band. Read for the node readout so a dynamic band
     /// shows how far it has moved, not just where the knob sits.
     dyn_meters: Arc<crate::dsp::dynamics::BandMeters>,
+    /// Which band is soloed (`NO_SOLO` for none). Shared with the audio thread;
+    /// the canvas draws the badge and owns the `S` shortcut.
+    solo: Arc<std::sync::atomic::AtomicUsize>,
     /// Undo history and A/B slots. The canvas owns the keyboard, so the undo
     /// shortcut lands here and is forwarded to the editor as a message.
     patch_state: Arc<std::sync::Mutex<crate::patch::PatchState>>,
@@ -854,6 +856,19 @@ impl GraphProgram {
                 );
             }
 
+            // A soloed band says so on the node itself. The panel row only
+            // exists for the selected band, and "why can I only hear this one"
+            // is a question the picture should answer without a click.
+            if self.solo.load(Ordering::Relaxed) == i {
+                frame.fill_text(CanvasText {
+                    content: "S".to_string(),
+                    position: Point::new(center.x - 16.0, center.y - 5.0),
+                    color: Color { a: 0.95, ..color },
+                    size: 11.0,
+                    ..CanvasText::default()
+                });
+            }
+
             // Frequency + gain readout while dragging or while selected.
             //
             // A dynamic band shows the static gain *and* the dynamic part: with
@@ -1003,9 +1018,9 @@ impl Graph {
     pub fn new(
         params: Arc<FilterParams>,
         context: Arc<dyn GuiContext>,
-        peak_meter: Arc<AtomicF32>,
         taps: Arc<crate::dsp::spectrum::SpectrumTaps>,
         dyn_meters: Arc<crate::dsp::dynamics::BandMeters>,
+        solo: Arc<std::sync::atomic::AtomicUsize>,
         patch_state: Arc<std::sync::Mutex<crate::patch::PatchState>>,
         selected: Arc<AtomicUsize>,
     ) -> Self {
@@ -1021,9 +1036,9 @@ impl Graph {
                 GraphProgram {
                     params,
                     context,
-                    _peak_meter: peak_meter,
                     taps,
                     dyn_meters,
+                    solo,
                     patch_state,
                     ballistics_in: RefCell::new(TraceBallistics::new()),
                     ballistics_out: RefCell::new(TraceBallistics::new()),
@@ -1370,6 +1385,19 @@ impl GraphView {
                 program.select(None);
                 canvas::event::Status::Captured
             }
+            // Solo the selected band, or clear it if it is already soloed.
+            // One at a time on purpose: the point is to hear one band, and a
+            // set of solos is just a second enable switch.
+            KeyCode::S => {
+                let current = program.solo.load(Ordering::Relaxed);
+                let next = if current == band {
+                    crate::NO_SOLO
+                } else {
+                    band
+                };
+                program.solo.store(next, Ordering::Relaxed);
+                canvas::event::Status::Captured
+            }
             _ => canvas::event::Status::Ignored,
         }
     }
@@ -1445,9 +1473,7 @@ mod tests {
         test_params, test_params_with_dynamics, test_params_with_post_spectrum, NullGuiContext,
         RecordingGuiContext,
     };
-    use atomic_float::AtomicF32;
     use iced_graphics::Primitive;
-    use nih_plug::prelude::util;
     use nih_plug::prelude::Param;
 
     // Layer indices, named. `draw()` returns one geometry per layer in render
@@ -1500,9 +1526,9 @@ mod tests {
         GraphProgram {
             params,
             context,
-            _peak_meter: Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             taps,
             dyn_meters: Arc::new(crate::dsp::dynamics::BandMeters::new()),
+            solo: Arc::new(AtomicUsize::new(crate::NO_SOLO)),
             patch_state,
             ballistics_in: RefCell::new(TraceBallistics::new()),
             ballistics_out: RefCell::new(TraceBallistics::new()),

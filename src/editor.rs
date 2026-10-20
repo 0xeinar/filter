@@ -60,12 +60,20 @@ pub fn create(
     peak_meter: Arc<AtomicF32>,
     spectrum_taps: Arc<SpectrumTaps>,
     dyn_meters: Arc<BandMeters>,
+    solo: Arc<AtomicUsize>,
     patch_state: Arc<Mutex<PatchState>>,
     editor_state: Arc<IcedState>,
 ) -> Option<Box<dyn Editor>> {
     create_iced_editor::<FilterEditor>(
         editor_state,
-        (params, peak_meter, spectrum_taps, dyn_meters, patch_state),
+        (
+            params,
+            peak_meter,
+            spectrum_taps,
+            dyn_meters,
+            solo,
+            patch_state,
+        ),
     )
 }
 
@@ -242,6 +250,9 @@ struct FilterEditor {
     /// Live dynamic offset per band, so the DYN row can show how far the band
     /// has moved from its static gain right now.
     dyn_meters: Arc<BandMeters>,
+    /// Which band is soloed (`NO_SOLO` for none). Shared with the audio thread
+    /// and the canvas, which draws the badge and owns the shortcut.
+    solo: Arc<AtomicUsize>,
     /// Undo/redo history and the A/B pair. Shared with the canvas, which owns
     /// the keyboard and therefore the shortcut.
     patch_state: Arc<Mutex<PatchState>>,
@@ -358,6 +369,8 @@ pub enum Message {
     DynamicsToggled(usize, bool),
     /// Band `index` enabled/disabled its sidechain filter.
     SidechainToggled(usize, bool),
+    /// Solo band `index`, or clear solo when the flag is false.
+    SoloToggled(usize, bool),
     /// Step back one edit.
     Undo,
     /// Step forward again.
@@ -452,20 +465,21 @@ impl IcedEditor for FilterEditor {
         Arc<AtomicF32>,
         Arc<SpectrumTaps>,
         Arc<BandMeters>,
+        Arc<AtomicUsize>,
         Arc<Mutex<PatchState>>,
     );
 
     fn new(
-        (params, peak_meter, spectrum_taps, dyn_meters, patch_state): Self::InitializationFlags,
+        (params, peak_meter, spectrum_taps, dyn_meters, solo, patch_state): Self::InitializationFlags,
         context: Arc<dyn GuiContext>,
     ) -> (Self, Command<Self::Message>) {
         let selection = Arc::new(AtomicUsize::new(selection::NONE));
         let graph = ui::Graph::new(
             params.clone(),
             context.clone(),
-            peak_meter.clone(),
             spectrum_taps,
             dyn_meters.clone(),
+            solo.clone(),
             patch_state.clone(),
             selection.clone(),
         );
@@ -474,6 +488,7 @@ impl IcedEditor for FilterEditor {
             context,
             peak_meter,
             dyn_meters,
+            solo,
             patch_state,
             slot_a_state: std::cell::UnsafeCell::new(button::State::new()),
             slot_b_state: std::cell::UnsafeCell::new(button::State::new()),
@@ -559,6 +574,12 @@ impl IcedEditor for FilterEditor {
             }
             Message::DynamicsToggled(index, on) => {
                 let _ = self.set_band_dynamics(index, on);
+            }
+            Message::SoloToggled(index, on) => {
+                // One solo at a time, and `NO_SOLO` rather than 0 for "none":
+                // band 0 is a real band.
+                let next = if on { index } else { crate::NO_SOLO };
+                self.solo.store(next, Ordering::Relaxed);
             }
             Message::Undo => {
                 self.patch_state_mut()
@@ -846,6 +867,15 @@ impl IcedEditor for FilterEditor {
             })
             .size(14);
 
+            // Solo: exclusive by construction — the audio path holds one index,
+            // so pressing it elsewhere moves the solo rather than adding to it.
+            // Toggling the soloed band's own switch clears it.
+            let solo_on = self.solo.load(Ordering::Relaxed) == i;
+            let solo_toggle = Toggler::new(solo_on, String::new(), move |on| {
+                Message::SoloToggled(i, on)
+            })
+            .size(14);
+
             // A cut is described by its slope, everything else by gain and Q.
             // Showing a gain that nothing reads would be a lie about the state.
             let mut readouts = Row::new().spacing(16).align_items(Alignment::Center).push(
@@ -891,6 +921,12 @@ impl IcedEditor for FilterEditor {
                 .push(type_pick)
                 .push(enable_toggle)
                 .push(Text::new("Enable").size(11).color(colors::TEXT_DIM))
+                .push(solo_toggle)
+                .push(Text::new("Solo").size(11).color(if solo_on {
+                    color
+                } else {
+                    colors::TEXT_DIM
+                }))
                 .push(Column::new().width(Length::Fill))
                 .push(readouts);
 
@@ -1131,6 +1167,7 @@ mod tests {
             Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             Arc::new(SpectrumTaps::new()),
             Arc::new(BandMeters::new()),
+            Arc::new(AtomicUsize::new(crate::NO_SOLO)),
             patch_state,
         );
         #[allow(clippy::arc_with_non_send_sync)]
@@ -1148,6 +1185,7 @@ mod tests {
             Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             Arc::new(SpectrumTaps::new()),
             Arc::new(BandMeters::new()),
+            Arc::new(AtomicUsize::new(crate::NO_SOLO)),
             patch_state,
         );
         #[allow(clippy::arc_with_non_send_sync)]
@@ -1240,6 +1278,7 @@ mod tests {
             Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             Arc::new(SpectrumTaps::new()),
             Arc::new(BandMeters::new()),
+            Arc::new(AtomicUsize::new(crate::NO_SOLO)),
             patch_state,
         );
         #[allow(clippy::arc_with_non_send_sync)]
@@ -1267,6 +1306,7 @@ mod tests {
             Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             Arc::new(SpectrumTaps::new()),
             Arc::new(BandMeters::new()),
+            Arc::new(AtomicUsize::new(crate::NO_SOLO)),
             patch_state,
         );
         #[allow(clippy::arc_with_non_send_sync)]
