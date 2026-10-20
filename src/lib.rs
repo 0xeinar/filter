@@ -58,6 +58,11 @@ pub struct Filter {
     comp_dirty: bool,
     /// Samples since the last compensation update (recompute throttle).
     comp_samples: u32,
+    /// One level detector per band, reused across blocks so their envelopes
+    /// keep their state. Only bands with dynamics enabled ever read these.
+    detectors: [dsp::dynamics::Detector; MAX_BANDS],
+    /// Snapshot of "this band is running dynamically" for the current block.
+    band_dyn: [bool; MAX_BANDS],
 }
 
 /// Maximum audio channels the plugin processes (stereo layout + mono).
@@ -98,6 +103,32 @@ pub struct BandParams {
 
     #[id = "enable"]
     pub enable: BoolParam,
+
+    // ---- dynamics -------------------------------------------------------
+    // A dynamic band's gain is its *maximum* change: the band is inert below
+    // the threshold and reaches the full gain at threshold + range. Five
+    // parameters per band rather than a nested struct because nih-plug's
+    // `#[nested]` on an optional sub-struct would change every existing
+    // band's serialized shape.
+    /// Follow the level inside the band instead of applying the gain always.
+    #[id = "dyn-enable"]
+    pub dyn_enable: BoolParam,
+
+    /// Level, in dBFS inside the band, at which the gain starts to apply.
+    #[id = "dyn-threshold"]
+    pub dyn_threshold: FloatParam,
+
+    /// How many dB above the threshold it takes to reach the full gain.
+    #[id = "dyn-range"]
+    pub dyn_range: FloatParam,
+
+    /// How fast the detector follows a rising level.
+    #[id = "dyn-attack"]
+    pub dyn_attack: FloatParam,
+
+    /// How fast the detector falls back when the level drops.
+    #[id = "dyn-release"]
+    pub dyn_release: FloatParam,
 }
 
 #[derive(Params)]
@@ -210,6 +241,16 @@ impl FilterType {
     /// Types where the band's gain means nothing (a cut passes 0 dB).
     pub fn has_gain(self) -> bool {
         !self.is_cut()
+    }
+
+    /// Types whose shape is set by a Q, as opposed to a corner (and, for cuts,
+    /// a slope). Only used to pick a detector bandwidth: a shelf with a Q of 8
+    /// would listen to a hairline instead of to its corner.
+    pub fn is_bell_like(self) -> bool {
+        !matches!(
+            self,
+            Self::LowShelf | Self::HighShelf | Self::LowCut | Self::HighCut | Self::TiltShelf
+        )
     }
 
     pub fn name(self) -> &'static str {
@@ -367,6 +408,51 @@ impl Default for BandParams {
             // the graph by clicking, or by raising the band count — either way
             // an inactive new band is just confusing.
             enable: BoolParam::new("Enable", true),
+
+            dyn_enable: BoolParam::new("Dynamics", false),
+            dyn_threshold: FloatParam::new(
+                "Threshold",
+                -30.0,
+                FloatRange::Linear {
+                    min: -60.0,
+                    max: 0.0,
+                },
+            )
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+            dyn_range: FloatParam::new(
+                "Range",
+                12.0,
+                FloatRange::Linear {
+                    min: 1.0,
+                    max: 30.0,
+                },
+            )
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(1))
+            .with_step_size(0.5),
+            dyn_attack: FloatParam::new(
+                "Attack",
+                10.0,
+                FloatRange::Skewed {
+                    min: 0.1,
+                    max: 200.0,
+                    factor: FloatRange::skew_factor(-1.5),
+                },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+            dyn_release: FloatParam::new(
+                "Release",
+                150.0,
+                FloatRange::Skewed {
+                    min: 5.0,
+                    max: 2000.0,
+                    factor: FloatRange::skew_factor(-1.5),
+                },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(0)),
         }
     }
 }
@@ -401,6 +487,8 @@ impl Default for Filter {
             comp_db: 0.0,
             comp_dirty: true,
             comp_samples: 0,
+            detectors: core::array::from_fn(|_| dsp::dynamics::Detector::default()),
+            band_dyn: [false; MAX_BANDS],
         }
     }
 }
@@ -495,6 +583,10 @@ impl Plugin for Filter {
         self.comp_dirty = true;
         self.spectrum_analyzer_in = Some(dsp::spectrum::SpectrumAnalyzer::new(self.sample_rate));
         self.spectrum_analyzer_out = Some(dsp::spectrum::SpectrumAnalyzer::new(self.sample_rate));
+        for detector in &mut self.detectors {
+            detector.set_sample_rate(self.sample_rate);
+            detector.reset();
+        }
         true
     }
 
@@ -554,6 +646,15 @@ impl Plugin for Filter {
         // type/enable changed), so a static EQ costs ~zero per block.
         let mut coeffs_changed = [false; MAX_BANDS];
 
+        // Does anything in this block need a level detector? Scanning once per
+        // host block keeps the whole linked-input pass out of the static path.
+        let any_dynamic = (0..num_active).any(|i| {
+            let bp = &self.params.band_params[i];
+            bp.enable.value()
+                && bp.dyn_enable.value()
+                && FilterType::from_i32(bp.filter_type.value()).has_gain()
+        });
+
         for (_block_offset, mut block) in buffer.iter_blocks(MAX_BLOCK) {
             // Sub-block loop: coefficients are re-baked every COEFF_BLOCK
             // samples instead of once per host block, so an automation glide is
@@ -562,6 +663,24 @@ impl Plugin for Filter {
             for sub_offset in (0..block.samples()).step_by(COEFF_BLOCK) {
                 let block_len = (block.samples() - sub_offset).min(COEFF_BLOCK);
                 let num_channels = block.channels();
+
+                // --- 0. Linked detector input for this sub-block ---
+                // The *louder* of the channels, taken while both are still dry.
+                // One detector feeds every channel, so a gain change cannot
+                // apply to L but not R — that would move the phantom centre.
+                // This pass is skipped entirely when no band has dynamics.
+                let mut det_in = [0.0f32; COEFF_BLOCK];
+                if any_dynamic {
+                    for (i, slot) in det_in[..block_len].iter_mut().enumerate() {
+                        let mut peak = 0.0f32;
+                        for channel in 0..num_channels {
+                            if let Some(samples) = block.get(channel) {
+                                peak = peak.max(samples[sub_offset + i].abs());
+                            }
+                        }
+                        *slot = peak;
+                    }
+                }
 
                 // --- 1. Advance smoothers once per sub-block, per band ---
                 let mut any_band_active = false;
@@ -580,7 +699,16 @@ impl Plugin for Filter {
                         bp.freq.smoothed.reset(bp.freq.value());
                         bp.gain.smoothed.reset(bp.gain.value());
                         bp.q.smoothed.reset(bp.q.value());
+                        // A band that was off (or had no detector running) must
+                        // not resume with a stale envelope.
+                        self.detectors[band_idx].reset();
                     }
+
+                    // Dynamics only mean anything for a type that has a gain.
+                    // A cut passes 0 dB at every level, so its "gain" is not a
+                    // parameter the detector could modulate.
+                    let dyn_on = enabled && ftype.has_gain() && bp.dyn_enable.value();
+                    self.band_dyn[band_idx] = dyn_on;
 
                     self.band_types[band_idx] = ftype;
                     self.band_enabled[band_idx] = enabled;
@@ -591,7 +719,11 @@ impl Plugin for Filter {
                         // A band only needs work when a smoother is still
                         // gliding or the target/type moved since the last bake.
                         // Static bands skip both the smoother fill and the trig.
-                        let moving = bp.freq.smoothed.is_smoothing()
+                        // A dynamic band rebakes every sub-block by design: its
+                        // gain follows the envelope, which moves even when no
+                        // parameter does.
+                        let moving = dyn_on
+                            || bp.freq.smoothed.is_smoothing()
                             || bp.gain.smoothed.is_smoothing()
                             || bp.q.smoothed.is_smoothing()
                             || self.last_baked_freq[band_idx] != bp.freq.value()
@@ -653,10 +785,40 @@ impl Plugin for Filter {
                         continue;
                     }
                     let baked_freq = freq_block[block_len - 1];
-                    let baked_gain = gain_block[block_len - 1];
                     let baked_q = q_block[block_len - 1];
                     let baked_type = self.band_types[band_idx];
                     let baked_slope = self.band_slopes[band_idx];
+                    let static_gain = gain_block[block_len - 1];
+                    // Dynamic bands bake the gain the *signal* asks for this
+                    // sub-block, not the one the knob points at. The detector
+                    // runs before the bake so the coefficients for these 16
+                    // samples use the level those samples produced — a
+                    // sub-block of extra latency, 0.33 ms at 48 kHz.
+                    let baked_gain = if self.band_dyn[band_idx] {
+                        let bp = &self.params.band_params[band_idx];
+                        // Shelves and cuts are defined by a corner, not a
+                        // resonance: a Q of 8 there would listen to a hairline.
+                        let detect_q = if baked_type.is_bell_like() {
+                            baked_q
+                        } else {
+                            dsp::dynamics::SHELF_DETECT_Q
+                        };
+                        let level = self.detectors[band_idx].update(
+                            &det_in[..block_len],
+                            baked_freq,
+                            detect_q,
+                            bp.dyn_attack.value(),
+                            bp.dyn_release.value(),
+                        );
+                        dsp::dynamics::dynamic_gain_db(
+                            static_gain,
+                            level,
+                            bp.dyn_threshold.value(),
+                            bp.dyn_range.value(),
+                        )
+                    } else {
+                        static_gain
+                    };
                     self.band_sections[band_idx] = dsp::BiquadCoeffs::update_cascade(
                         &mut self.band_coeffs[band_idx],
                         baked_freq,

@@ -9,7 +9,9 @@
 //! (e) the fully static case: no smoother work, no coefficient updates at all,
 //!     which is what an untouched EQ costs, and
 //! (f) the spectrum analyzer, which now runs twice (input and post-EQ taps)
-//!     while the editor is open.
+//!     while the editor is open, and
+//! (g) one dynamic band's level detector — the per-sample cost a band pays for
+//!     following the signal instead of a knob.
 //!
 //! Run with: cargo bench --bench hotpath_bench
 
@@ -17,6 +19,7 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
+use filter::dsp::dynamics::{dynamic_gain_db, Detector};
 use filter::dsp::spectrum::{SpectrumAnalyzer, SpectrumRing};
 use filter::dsp::BiquadFilter;
 use filter::FilterType;
@@ -155,6 +158,22 @@ fn main() {
         per_sample_static * 1e9,
         cpu(per_sample_static)
     );
+    // (g) one dynamic band: the band-pass detector plus envelope, per sample.
+    // A dynamic band also rebakes its coefficients every 16 samples even when
+    // nothing is automated, which costs one `update_coefficients` (line (b)) per
+    // 16 samples — added below rather than measured twice.
+    let mut detector = Detector::new(SR);
+    let t3 = Instant::now();
+    let mut n3 = 0usize;
+    for chunk in input.chunks(BLOCK) {
+        for sub in chunk.chunks(SUB) {
+            let level = detector.update(sub, 1000.0, 1.0, 10.0, 150.0);
+            black_box(dynamic_gain_db(-6.0, level, -30.0, 12.0));
+            n3 += sub.len();
+        }
+    }
+    let per_sample_detector = t3.elapsed().as_secs_f64() / n3 as f64;
+
     // (f) analyzer cost per sample. This is the price of the spectrum display —
     // paid twice now (input and output taps), and only while the editor is open.
     let ring = SpectrumRing::new();
@@ -177,5 +196,15 @@ fn main() {
         "(f) one analyzer, per sample:           {:>7.2} ns/sample   {:>6.2}% CPU",
         per_sample_analyzer * 1e9,
         cpu(per_sample_analyzer)
+    );
+    println!(
+        "(g) one dynamic band's detector:        {:>7.2} ns/sample   {:>6.2}% CPU",
+        per_sample_detector * 1e9,
+        cpu(per_sample_detector)
+    );
+    println!(
+        "    plus one rebake per {SUB} samples:      {:>7.2} ns/sample   -> {:>6.2} ns/sample total",
+        per_update / SUB as f64 * 1e9,
+        (per_sample_detector + per_update / SUB as f64) * 1e9
     );
 }

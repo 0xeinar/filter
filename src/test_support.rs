@@ -126,6 +126,56 @@ pub fn band_with_slope(
             },
         ),
         enable: BoolParam::new("Enable", enabled),
+        // Dynamics are off unless a test asks for them via `dynamic`.
+        ..BandParams::default()
+    }
+}
+
+/// Turn dynamics on for `band`, with explicit threshold/range/timing.
+pub fn dynamic(
+    band: BandParams,
+    threshold_db: f32,
+    range_db: f32,
+    attack_ms: f32,
+    release_ms: f32,
+) -> BandParams {
+    BandParams {
+        dyn_enable: BoolParam::new("Dynamics", true),
+        dyn_threshold: FloatParam::new(
+            "Threshold",
+            threshold_db,
+            FloatRange::Linear {
+                min: -60.0,
+                max: 0.0,
+            },
+        ),
+        dyn_range: FloatParam::new(
+            "Range",
+            range_db,
+            FloatRange::Linear {
+                min: 1.0,
+                max: 30.0,
+            },
+        ),
+        dyn_attack: FloatParam::new(
+            "Attack",
+            attack_ms,
+            FloatRange::Skewed {
+                min: 0.1,
+                max: 200.0,
+                factor: FloatRange::skew_factor(-1.5),
+            },
+        ),
+        dyn_release: FloatParam::new(
+            "Release",
+            release_ms,
+            FloatRange::Skewed {
+                min: 5.0,
+                max: 2000.0,
+                factor: FloatRange::skew_factor(-1.5),
+            },
+        ),
+        ..band
     }
 }
 
@@ -157,6 +207,27 @@ pub fn test_params_with_post_spectrum(
         ),
         band_params,
         spectrum_post: BoolParam::new("Output Spectrum", post_spectrum),
+        ..FilterParams::default()
+    })
+}
+
+/// Params with `bands`, every one of them dynamic. Used by the editor tests,
+/// which need a band whose control row is populated.
+pub fn test_params_with_dynamics(bands: &[(f32, f32, f32, FilterType)]) -> Arc<FilterParams> {
+    let mut band_params: [BandParams; MAX_BANDS] = core::array::from_fn(|_| BandParams::default());
+    for (i, &(freq, gain, q, ftype)) in bands.iter().enumerate() {
+        band_params[i] = dynamic(band(freq, gain, q, ftype, true), -30.0, 12.0, 10.0, 150.0);
+    }
+    Arc::new(FilterParams {
+        num_bands: IntParam::new(
+            "Bands",
+            bands.len() as i32,
+            IntRange::Linear {
+                min: 0,
+                max: MAX_BANDS as i32,
+            },
+        ),
+        band_params,
         ..FilterParams::default()
     })
 }

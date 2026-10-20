@@ -27,7 +27,7 @@ pub const EDITOR_HEIGHT: u16 = 500;
 // (each row ~24 px, so past five bands the list ran off the bottom).
 const HEADER_H: u16 = 28;
 const STRIP_H: u16 = 24;
-const PANEL_H: u16 = 66;
+const PANEL_H: u16 = 92;
 const FOOTER_H: u16 = 14;
 /// Vertical gap between the column's children.
 const GAP: u16 = 6;
@@ -185,6 +185,11 @@ struct FilterEditor {
     freq_slider_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
     gain_slider_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
     q_slider_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
+    // Dynamics: four sliders per band, one row of state each.
+    dyn_threshold_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
+    dyn_range_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
+    dyn_attack_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
+    dyn_release_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
     type_pick_states: [std::cell::UnsafeCell<pick_list::State<FilterType>>; MAX_BANDS],
     slope_pick_states: [std::cell::UnsafeCell<pick_list::State<Slope>>; MAX_BANDS],
     chip_states: [std::cell::UnsafeCell<button::State>; MAX_BANDS],
@@ -270,6 +275,8 @@ pub enum Message {
     AutoGainToggled(bool),
     /// Show/hide the post-EQ spectrum overlay.
     PostSpectrumToggled(bool),
+    /// Band `index` enabled/disabled its dynamics.
+    DynamicsToggled(usize, bool),
 }
 
 impl FilterEditor {
@@ -289,6 +296,17 @@ impl FilterEditor {
         let setter = ParamSetter::new(self.context.as_ref());
         setter.begin_set_parameter(param);
         setter.set_parameter(param, slope as i32);
+        setter.end_set_parameter(param);
+        Command::none()
+    }
+
+    /// Enable/disable a band's dynamics as a single automation gesture, so the
+    /// host records one undo step rather than one per parameter touched.
+    fn set_band_dynamics(&self, index: usize, on: bool) -> Command<Message> {
+        let param = &self.params.band_params[index].dyn_enable;
+        let setter = ParamSetter::new(self.context.as_ref());
+        setter.begin_set_parameter(param);
+        setter.set_parameter(param, on);
         setter.end_set_parameter(param);
         Command::none()
     }
@@ -338,6 +356,18 @@ impl IcedEditor for FilterEditor {
             q_slider_states: core::array::from_fn(|_| {
                 std::cell::UnsafeCell::new(Default::default())
             }),
+            dyn_threshold_states: core::array::from_fn(|_| {
+                std::cell::UnsafeCell::new(Default::default())
+            }),
+            dyn_range_states: core::array::from_fn(|_| {
+                std::cell::UnsafeCell::new(Default::default())
+            }),
+            dyn_attack_states: core::array::from_fn(|_| {
+                std::cell::UnsafeCell::new(Default::default())
+            }),
+            dyn_release_states: core::array::from_fn(|_| {
+                std::cell::UnsafeCell::new(Default::default())
+            }),
             type_pick_states: core::array::from_fn(|_| {
                 std::cell::UnsafeCell::new(pick_list::State::default())
             }),
@@ -384,6 +414,9 @@ impl IcedEditor for FilterEditor {
                 let param = &self.params.auto_gain;
                 let setter = ParamSetter::new(self.context.as_ref());
                 setter.set_parameter(param, on);
+            }
+            Message::DynamicsToggled(index, on) => {
+                let _ = self.set_band_dynamics(index, on);
             }
             Message::PostSpectrumToggled(on) => {
                 let param = &self.params.spectrum_post;
@@ -574,6 +607,11 @@ impl IcedEditor for FilterEditor {
                         .color(colors::TEXT),
                 );
             }
+            if bp.dyn_enable.value() && ftype.has_gain() {
+                // The gain above is the *maximum* this band can apply; without
+                // saying so the panel reads as if that gain were always on.
+                readouts = readouts.push(Text::new("DYN").size(11).color(colors::band_color(i)));
+            }
 
             let top = Row::new()
                 .spacing(10)
@@ -634,11 +672,93 @@ impl IcedEditor for FilterEditor {
                 controls = controls.push(q_slider);
             }
 
+            // Dynamics row. Only a type with a gain can be dynamic: a cut
+            // passes 0 dB at every level, so there is nothing for a detector to
+            // modulate. Say that rather than showing controls that do nothing.
+            // The row keeps its height either way, so the panel's height is the
+            // same constant for every band type.
+            let dynamics_row: Element<'_, Message> = if ftype.has_gain() {
+                let dyn_on = bp.dyn_enable.value();
+                let mut row = Row::new()
+                    .spacing(8)
+                    .align_items(Alignment::Center)
+                    .push(
+                        Toggler::new(dyn_on, String::new(), move |on| {
+                            Message::DynamicsToggled(i, on)
+                        })
+                        .size(14),
+                    )
+                    .push(Text::new("Dyn").size(11).color(colors::TEXT_DIM));
+                if dyn_on {
+                    // Safety: each index i is visited once per frame
+                    let threshold = unsafe {
+                        nih_widgets::ParamSlider::new(
+                            Self::slider_state(&self.dyn_threshold_states, i),
+                            &self.params.band_params[i].dyn_threshold,
+                        )
+                        .width(Length::Fill)
+                        .map(Message::ParamUpdate)
+                    };
+                    let range = unsafe {
+                        nih_widgets::ParamSlider::new(
+                            Self::slider_state(&self.dyn_range_states, i),
+                            &self.params.band_params[i].dyn_range,
+                        )
+                        .width(Length::Fill)
+                        .map(Message::ParamUpdate)
+                    };
+                    let attack = unsafe {
+                        nih_widgets::ParamSlider::new(
+                            Self::slider_state(&self.dyn_attack_states, i),
+                            &self.params.band_params[i].dyn_attack,
+                        )
+                        .width(Length::Fill)
+                        .map(Message::ParamUpdate)
+                    };
+                    let release = unsafe {
+                        nih_widgets::ParamSlider::new(
+                            Self::slider_state(&self.dyn_release_states, i),
+                            &self.params.band_params[i].dyn_release,
+                        )
+                        .width(Length::Fill)
+                        .map(Message::ParamUpdate)
+                    };
+                    row = row
+                        .push(Text::new("Thr").size(11).color(colors::TEXT_DIM))
+                        .push(threshold)
+                        .push(Text::new("Range").size(11).color(colors::TEXT_DIM))
+                        .push(range)
+                        .push(Text::new("Atk").size(11).color(colors::TEXT_DIM))
+                        .push(attack)
+                        .push(Text::new("Rel").size(11).color(colors::TEXT_DIM))
+                        .push(release);
+                } else {
+                    row = row.push(
+                        Text::new(
+                            "gain becomes the maximum change; the band is inert below the threshold",
+                        )
+                        .size(11)
+                        .color(colors::TEXT_FAINT),
+                    );
+                }
+                row.into()
+            } else {
+                Row::new()
+                    .align_items(Alignment::Center)
+                    .push(
+                        Text::new("Dynamics need a type with a gain")
+                            .size(11)
+                            .color(colors::TEXT_FAINT),
+                    )
+                    .into()
+            };
+
             Column::new()
                 .height(Length::Units(PANEL_H))
                 .spacing(4)
                 .push(top)
                 .push(controls)
+                .push(dynamics_row)
                 .into()
         };
 
@@ -672,7 +792,9 @@ impl IcedEditor for FilterEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{test_params, NullGuiContext, RecordingGuiContext};
+    use crate::test_support::{
+        test_params, test_params_with_dynamics, NullGuiContext, RecordingGuiContext,
+    };
     use nih_plug::prelude::Param;
 
     /// An editor over explicit bands, plus the context that records its writes.
@@ -690,6 +812,51 @@ mod tests {
         let ctx: Arc<dyn GuiContext> = context.clone();
         let (editor, _) = <FilterEditor as IcedEditor>::new(flags, ctx);
         (editor, context)
+    }
+
+    /// An editor over params the caller built, with band 0 selected.
+    fn editor_over(params: Arc<FilterParams>) -> FilterEditor {
+        let context = Arc::new(RecordingGuiContext::default());
+        let flags = (
+            params,
+            Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
+            Arc::new(SpectrumTaps::new()),
+        );
+        #[allow(clippy::arc_with_non_send_sync)]
+        let ctx: Arc<dyn GuiContext> = context;
+        let (editor, _) = <FilterEditor as IcedEditor>::new(flags, ctx);
+        editor.select(0);
+        editor
+    }
+
+    #[test]
+    fn the_panel_builds_for_every_type_with_and_without_dynamics() {
+        // The dynamics row changes shape by band type (gain types get controls,
+        // cuts get an explanation). Twelve sliders' worth of state indexed by
+        // band is exactly where an out-of-range index would hide.
+        for ftype in FilterType::ALL {
+            for params in [
+                test_params(&[(1_000.0, -6.0, 1.0, ftype)]),
+                test_params_with_dynamics(&[(1_000.0, -6.0, 1.0, ftype)]),
+            ] {
+                let mut editor = editor_over(params);
+                let _ = editor.view();
+            }
+        }
+    }
+
+    #[test]
+    fn dynamics_are_written_as_one_gesture() {
+        // `update()` needs a `&mut WindowQueue`, which nih-plug does not let a
+        // test construct, so the decision lives in a plain method and is tested
+        // there — the same split the selection handler uses.
+        let (editor, ctx) = editor_with_bands(&[(1_000.0, -6.0, 1.0, FilterType::Bell)]);
+        let _ = editor.set_band_dynamics(0, true);
+        assert_eq!(
+            ctx.writes().len(),
+            1,
+            "enabling dynamics should be a single set-parameter gesture"
+        );
     }
 
     fn editor_with(num_bands: usize) -> FilterEditor {
