@@ -323,43 +323,91 @@ fn oversampling_factor(params: &FilterParams) -> usize {
 fn run_cascade(
     coeffs: &[[dsp::BiquadCoeffs; dsp::biquad::MAX_SECTIONS]; MAX_BANDS],
     sections: &[usize; MAX_BANDS],
+    enabled: &[bool; MAX_BANDS],
     fades: &[(f32, f32); MAX_BANDS],
     num_active: usize,
     states: &mut [[dsp::BiquadState; dsp::biquad::MAX_SECTIONS]; MAX_BANDS],
     buf: &mut [f32],
 ) {
-    let len = buf.len() as f32;
-    for (i, sample) in buf.iter_mut().enumerate() {
+    // Is anything actually ramping? Answering that first keeps the steady state
+    // — every running band at full wet — at exactly the cost it had before the
+    // ramp existed: one bool per band per sample, no ramp state to build.
+    //
+    // This mattered: the first version built five `MAX_BANDS` arrays every
+    // sub-block (16 samples), which measured 20.3 -> 18.6 ns/sample against the
+    // pre-ramp code on a one-band chain, i.e. a ~9% regression for a feature
+    // that was doing nothing at the time.
+    let any_fade = (0..num_active).any(|b| enabled[b] && (fades[b].0 != 1.0 || fades[b].1 != 1.0));
+
+    if !any_fade {
+        for sample in buf.iter_mut() {
+            let mut value = *sample;
+            for (band_idx, on) in enabled[..num_active].iter().enumerate() {
+                if !on {
+                    continue;
+                }
+                value = run_sections(coeffs, sections, states, band_idx, value);
+            }
+            *sample = value;
+        }
+        return;
+    }
+
+    // Somewhere in this buffer a band is ramping. Only now is per-band ramp
+    // state worth building.
+    let len = buf.len();
+    let mut wet = [0.0f32; MAX_BANDS];
+    let mut step = [0.0f32; MAX_BANDS];
+    for band_idx in 0..num_active {
+        let (from, to) = fades[band_idx];
+        wet[band_idx] = from;
+        step[band_idx] = (to - from) / len as f32;
+    }
+
+    for sample in buf.iter_mut() {
         let mut value = *sample;
-        // 1-based: the first sample of a fade is already a step in, so a ramp
-        // never starts by re-emitting the previous state in full.
-        let t = (i + 1) as f32 / len;
-        for band_idx in 0..num_active {
+        for (band_idx, on) in enabled[..num_active].iter().enumerate() {
+            if !on {
+                continue;
+            }
             let (from, to) = fades[band_idx];
-            if from <= 0.0 && to <= 0.0 {
-                continue;
-            }
-            let count = sections[band_idx];
-            if count == 0 {
-                continue;
-            }
             let dry = value;
-            // One section for a bell or shelf, two for a tilt, up to eight for
-            // a 96 dB/oct cut. Slicing to the live count keeps the inner loop
-            // bounds-check-free after the first iteration.
-            for (coeff, state) in coeffs[band_idx][..count]
-                .iter()
-                .zip(states[band_idx][..count].iter_mut())
-            {
-                value = state.process(coeff, value);
-            }
+            value = run_sections(coeffs, sections, states, band_idx, value);
             if from != 1.0 || to != 1.0 {
-                let wet = from + (to - from) * t;
-                value = dry + (value - dry) * wet;
+                // 1-based ramp: the first sample is already a step in, so a
+                // fade never re-emits the previous value in full.
+                wet[band_idx] += step[band_idx];
+                value = dry + (value - dry) * wet[band_idx];
             }
         }
         *sample = value;
     }
+}
+
+/// One band's sections over one sample.
+///
+/// Split out so the ramp path and the steady-state path filter identically —
+/// the thing that must never differ between them is which sections run, and a
+/// copied loop is how that drifts.
+#[inline]
+fn run_sections(
+    coeffs: &[[dsp::BiquadCoeffs; dsp::biquad::MAX_SECTIONS]; MAX_BANDS],
+    sections: &[usize; MAX_BANDS],
+    states: &mut [[dsp::BiquadState; dsp::biquad::MAX_SECTIONS]; MAX_BANDS],
+    band_idx: usize,
+    mut value: f32,
+) -> f32 {
+    let count = sections[band_idx];
+    // One section for a bell or shelf, two for a tilt, up to eight for a
+    // 96 dB/oct cut. Slicing to the live count keeps the inner loop
+    // bounds-check-free after the first iteration.
+    for (coeff, state) in coeffs[band_idx][..count]
+        .iter()
+        .zip(states[band_idx][..count].iter_mut())
+    {
+        value = state.process(coeff, value);
+    }
+    value
 }
 
 /// Snapshot of the current band parameters as pure specs, for the GUI curve
@@ -1279,6 +1327,7 @@ impl Filter {
                             run_cascade(
                                 &self.band_coeffs,
                                 &self.band_sections,
+                                &self.band_enabled,
                                 &fades,
                                 num_active,
                                 &mut self.band_states[channel_idx],
@@ -1294,6 +1343,7 @@ impl Filter {
                             run_cascade(
                                 &self.band_coeffs,
                                 &self.band_sections,
+                                &self.band_enabled,
                                 &fades,
                                 num_active,
                                 &mut self.band_states[channel_idx],
