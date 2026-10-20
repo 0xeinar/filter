@@ -63,6 +63,8 @@ pub struct Filter {
     detectors: [dsp::dynamics::Detector; MAX_BANDS],
     /// Snapshot of "this band is running dynamically" for the current block.
     band_dyn: [bool; MAX_BANDS],
+    /// Live dynamic gain per band, for the GUI readout.
+    dyn_meters: Arc<dsp::dynamics::BandMeters>,
 }
 
 /// Maximum audio channels the plugin processes (stereo layout + mono).
@@ -489,6 +491,7 @@ impl Default for Filter {
             comp_samples: 0,
             detectors: core::array::from_fn(|_| dsp::dynamics::Detector::default()),
             band_dyn: [false; MAX_BANDS],
+            dyn_meters: Arc::new(dsp::dynamics::BandMeters::new()),
         }
     }
 }
@@ -560,6 +563,7 @@ impl Plugin for Filter {
             self.params.clone(),
             self.peak_meter.clone(),
             self.spectrum_taps.clone(),
+            self.dyn_meters.clone(),
             self.params.editor_state.clone(),
         )
     }
@@ -828,6 +832,12 @@ impl Plugin for Filter {
                         baked_slope,
                         self.sample_rate,
                     );
+                    // Publish what the band is actually applying. Only while
+                    // someone can see it, and only for dynamic bands — a
+                    // static band's gain is already on screen as its knob.
+                    if self.band_dyn[band_idx] && editor_open {
+                        self.dyn_meters.publish(band_idx, baked_gain);
+                    }
                     self.last_baked_freq[band_idx] = baked_freq;
                     self.last_baked_gain[band_idx] = baked_gain;
                     self.last_baked_q[band_idx] = baked_q;

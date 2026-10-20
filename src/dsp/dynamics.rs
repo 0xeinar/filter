@@ -16,6 +16,10 @@
 //! detector feeds every channel, so the stereo image cannot shift: a reduction
 //! that applied to L but not R would move the phantom centre.
 
+use std::sync::atomic::Ordering;
+
+use atomic_float::AtomicF32;
+
 use crate::dsp::BiquadFilter;
 use crate::FilterType;
 
@@ -178,6 +182,48 @@ impl Default for Detector {
 /// cuts). Roughly one octave, which is what a corner needs to be judged by ear.
 pub const SHELF_DETECT_Q: f32 = 0.7;
 
+/// Live per-band gain, published by the audio thread for the GUI to draw.
+///
+/// A dynamic band's applied gain is the one number that tells you whether the
+/// thing is working, and it exists only on the audio thread. One relaxed store
+/// per sub-block per dynamic band is the whole cost; the GUI reads it once per
+/// frame. Values are only meaningful for bands whose dynamics are enabled — the
+/// GUI checks that before reading, so a stale entry after switching dynamics
+/// off can never be drawn.
+pub struct BandMeters {
+    db: [AtomicF32; crate::MAX_BANDS],
+}
+
+impl BandMeters {
+    pub fn new() -> Self {
+        Self {
+            db: core::array::from_fn(|_| AtomicF32::new(0.0)),
+        }
+    }
+
+    /// Audio thread: publish the gain currently baked for `band`.
+    #[inline]
+    pub fn publish(&self, band: usize, db: f32) {
+        if let Some(slot) = self.db.get(band) {
+            slot.store(db, Ordering::Relaxed);
+        }
+    }
+
+    /// GUI thread: the gain last baked for `band`.
+    pub fn read(&self, band: usize) -> f32 {
+        self.db
+            .get(band)
+            .map(|slot| slot.load(Ordering::Relaxed))
+            .unwrap_or(0.0)
+    }
+}
+
+impl Default for BandMeters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +368,20 @@ mod tests {
             assert!(level.is_finite(), "level went non-finite: {level}");
             assert!(det.envelope().is_finite());
         }
+    }
+
+    #[test]
+    fn meters_are_per_band_and_default_to_zero() {
+        let meters = BandMeters::new();
+        assert_eq!(meters.read(0), 0.0);
+        meters.publish(3, -7.5);
+        assert_eq!(meters.read(3), -7.5);
+        // Neighbouring bands must not see it: one array indexed by band, or
+        // every dynamic band would show the last one drawn.
+        assert_eq!(meters.read(2), 0.0);
+        assert_eq!(meters.read(4), 0.0);
+        // Out of range reads are harmless rather than a panic on the GUI thread.
+        assert_eq!(meters.read(crate::MAX_BANDS + 5), 0.0);
     }
 
     #[test]

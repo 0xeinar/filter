@@ -64,12 +64,16 @@ not open it. Detection runs on the linked signal (the louder channel) and one
 gain feeds both channels, so a reduction cannot move the phantom centre.
 
 Because the gain depends on the signal, the drawn curve shows the *static*
-maximum; the panel marks a dynamic band with `DYN` so the difference is not
-silent. `tests/dynamic_eq.rs` drives the detector, the gain law and a biquad in
-the same 16-sample shape the audio loop uses, and measures real levels: a
-−10 dBFS tone through a −12 dB band at −30 dB threshold comes out at −22 dBFS,
-the same band passes a −45 dBFS tone untouched, and an 8 kHz tone does not open
-a 1 kHz band at all.
+maximum — but the band's node readout and the panel's `DYN` row both show the
+gain it is applying **right now**, published from the audio thread through a
+lock-free atomic per band. Without that you can hear a dynamic band working and
+not see it.
+
+`tests/dynamic_eq.rs` drives the detector, the gain law and a biquad in the same
+16-sample shape the audio loop uses, and measures real levels: a −10 dBFS tone
+through a −12 dB band at −30 dB threshold comes out at −22 dBFS, the same band
+passes a −45 dBFS tone untouched, and an 8 kHz tone does not open a 1 kHz band
+at all.
 
 ## Layout
 
@@ -141,8 +145,8 @@ Rescan plugins in your DAW after copying.
 # Run all tests
 cargo test
 
-# 180 tests:
-#  145 unit tests — biquad coefficients, frequency response, stability,
+# 183 tests:
+#  148 unit tests — biquad coefficients, frequency response, stability,
 #                   dynamic-EQ detector (ballistics, selectivity, threshold
 #                   law, stability),
 #                   response-curve math (log mapping, combined EQ response),

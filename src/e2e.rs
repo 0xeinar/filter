@@ -51,6 +51,7 @@ impl Harness {
             context.clone(),
             Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             Arc::new(SpectrumTaps::new()),
+            Arc::new(crate::dsp::dynamics::BandMeters::new()),
             Arc::new(AtomicUsize::new(selection::NONE)),
         );
         Self {
@@ -270,6 +271,7 @@ fn dragging_a_cut_changes_frequency_and_leaves_gain_alone() {
         context.clone(),
         Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
         Arc::new(SpectrumTaps::new()),
+        Arc::new(crate::dsp::dynamics::BandMeters::new()),
         Arc::new(AtomicUsize::new(selection::NONE)),
     );
     let h = Harness {
