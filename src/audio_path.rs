@@ -19,7 +19,9 @@ use std::sync::Arc;
 
 use nih_plug::prelude::Buffer;
 
-use crate::test_support::{test_params, test_params_with_dynamics};
+use crate::test_support::{
+    test_params, test_params_oversampled, test_params_with_dynamics, test_params_with_modes,
+};
 use crate::{Filter, FilterParams};
 
 const SR: f32 = 48_000.0;
@@ -328,4 +330,233 @@ fn solo_leaves_only_the_soloed_band_running() {
         (cleared - 12.0).abs() < 0.5,
         "clearing solo should restore the full chain, got {cleared:+.2}"
     );
+}
+
+/// Run the production path with independent channels.
+///
+/// `run` asserts the two channels come out identical, which is the right check
+/// for a stereo chain and the wrong one for anything mid/side: those tests are
+/// about the channels *differing*.
+fn run_pair(filter: &mut Filter, left_in: &[f32], right_in: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    let mut left = left_in.to_vec();
+    let mut right = right_in.to_vec();
+    let mut out_left = Vec::new();
+    let mut out_right = Vec::new();
+    for start in (0..left_in.len()).step_by(128) {
+        let end = (start + 128).min(left_in.len());
+        let mut buffer = Buffer::default();
+        {
+            let l = &mut left[start..end];
+            let r = &mut right[start..end];
+            let n = l.len();
+            unsafe {
+                buffer.set_slices(n, |slices| {
+                    slices.push(l);
+                    slices.push(r);
+                });
+            }
+            filter.process_buffer(&mut buffer, false);
+        }
+        out_left.extend_from_slice(&left[start..end]);
+        out_right.extend_from_slice(&right[start..end]);
+    }
+    (out_left, out_right)
+}
+
+/// A mid band must not touch hard-panned material.
+///
+/// `L = -R` is pure side: the mid is identically zero, so a band that only
+/// filters the mid has nothing to filter. This is the acceptance criterion for
+/// #26, measured through the real path rather than asserted about a mask.
+#[test]
+fn a_mid_band_leaves_a_hard_panned_signal_untouched() {
+    use crate::ChannelMode;
+    let params = test_params_with_modes(&[(
+        1_000.0,
+        12.0,
+        4.0,
+        crate::FilterType::Bell,
+        ChannelMode::Mid,
+    )]);
+    let mut filter = plugin(params);
+
+    let tone_l = tone(1_000.0, -18.0, 0.4);
+    let tone_r: Vec<f32> = tone_l.iter().map(|s| -s).collect();
+    let (out_l, out_r) = run_pair(&mut filter, &tone_l, &tone_r);
+
+    for (a, b) in tone_l.iter().zip(&out_l) {
+        assert!(
+            (a - b).abs() < 1e-6,
+            "a mid band altered the left channel of a pure side signal: {a} -> {b}"
+        );
+    }
+    for (a, b) in tone_r.iter().zip(&out_r) {
+        assert!(
+            (a - b).abs() < 1e-6,
+            "a mid band altered the right channel of a pure side signal: {a} -> {b}"
+        );
+    }
+}
+
+/// The mirror image: a side band must not touch the centre.
+#[test]
+fn a_side_band_leaves_the_centre_untouched() {
+    use crate::ChannelMode;
+    let params = test_params_with_modes(&[(
+        1_000.0,
+        12.0,
+        4.0,
+        crate::FilterType::Bell,
+        ChannelMode::Side,
+    )]);
+    let mut filter = plugin(params);
+
+    // L == R is pure mid: the side is identically zero.
+    let tone = tone(1_000.0, -18.0, 0.4);
+    let (out_l, out_r) = run_pair(&mut filter, &tone, &tone);
+    for (a, b) in tone.iter().zip(&out_l) {
+        assert!(
+            (a - b).abs() < 1e-6,
+            "a side band altered the centre: {a} -> {b}"
+        );
+    }
+    for (a, b) in tone.iter().zip(&out_r) {
+        assert!(
+            (a - b).abs() < 1e-6,
+            "a side band altered the centre: {a} -> {b}"
+        );
+    }
+}
+
+/// A side band does reach hard-panned material — the other half of the first
+/// test, so a band that simply did nothing could not pass both.
+#[test]
+fn a_side_band_boosts_a_hard_panned_signal() {
+    use crate::ChannelMode;
+    let params = test_params_with_modes(&[(
+        1_000.0,
+        12.0,
+        4.0,
+        crate::FilterType::Bell,
+        ChannelMode::Side,
+    )]);
+    let mut filter = plugin(params);
+
+    let tone_l = tone(1_000.0, -18.0, 0.4);
+    let tone_r: Vec<f32> = tone_l.iter().map(|s| -s).collect();
+    let (out_l, _out_r) = run_pair(&mut filter, &tone_l, &tone_r);
+
+    let gain = rms_db(&out_l) - rms_db(&tone_l);
+    assert!(
+        (gain - 12.0).abs() < 0.5,
+        "a side band should boost hard-panned material by 12 dB, got {gain:+.2}"
+    );
+}
+
+/// Mid and side at the same settings must equal one stereo band.
+///
+/// The filters are linear and the mid/side transform is linear, so
+/// `H(m) + H(s) = H(m + s) = H(L)`. That is the energy-preserving acceptance
+/// criterion, and it fails loudly if either transform has the wrong sign or
+/// scale.
+#[test]
+fn mid_and_side_together_equal_stereo() {
+    use crate::ChannelMode;
+
+    let stereo = test_params_with_modes(&[(
+        1_000.0,
+        9.0,
+        2.0,
+        crate::FilterType::Bell,
+        ChannelMode::Stereo,
+    )]);
+    let split = test_params_with_modes(&[
+        (1_000.0, 9.0, 2.0, crate::FilterType::Bell, ChannelMode::Mid),
+        (
+            1_000.0,
+            9.0,
+            2.0,
+            crate::FilterType::Bell,
+            ChannelMode::Side,
+        ),
+    ]);
+
+    let tone_l = tone(1_000.0, -18.0, 0.4);
+    // Equal parts mid and side: not the same signal in both channels, and not
+    // a pure side either.
+    let tone_r: Vec<f32> = tone_l.iter().map(|s| 0.4 * s).collect();
+
+    let (l_a, r_a) = run_pair(&mut plugin(stereo), &tone_l, &tone_r);
+    let (l_b, r_b) = run_pair(&mut plugin(split), &tone_l, &tone_r);
+
+    for (i, (a, b)) in l_a.iter().zip(&l_b).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-4,
+            "left diverged at sample {i}: stereo {a} vs mid+side {b}"
+        );
+    }
+    for (i, (a, b)) in r_a.iter().zip(&r_b).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-4,
+            "right diverged at sample {i}: stereo {a} vs mid+side {b}"
+        );
+    }
+}
+
+/// The same equality has to hold inside the oversampled domain.
+///
+/// The transform must happen *after* the resampler, on the oversampled pair:
+/// summing two band-limited signals and then band-limiting the sum is the same
+/// thing, but band-limiting only after the filter would put the mid/side sum
+/// outside the band-limiting the factor exists to provide. This test runs the
+/// 2x path so a future "do the matrix once per block on the way in" shortcut
+/// cannot quietly pass.
+#[test]
+fn mid_plus_side_equals_stereo_when_oversampled() {
+    use crate::ChannelMode;
+
+    let stereo = test_params_oversampled(
+        1,
+        &[(
+            1_000.0,
+            9.0,
+            2.0,
+            crate::FilterType::Bell,
+            ChannelMode::Stereo,
+        )],
+    );
+    let split = test_params_oversampled(
+        1,
+        &[
+            (1_000.0, 9.0, 2.0, crate::FilterType::Bell, ChannelMode::Mid),
+            (
+                1_000.0,
+                9.0,
+                2.0,
+                crate::FilterType::Bell,
+                ChannelMode::Side,
+            ),
+        ],
+    );
+
+    let tone_l = tone(1_000.0, -18.0, 0.4);
+    let tone_r: Vec<f32> = tone_l.iter().map(|s| 0.4 * s).collect();
+
+    // The same parameters, twice: the errors this catches are chain-shape
+    // errors, so both sides must be built the same way.
+    let (l_a, r_a) = run_pair(&mut plugin(stereo), &tone_l, &tone_r);
+    let (l_b, r_b) = run_pair(&mut plugin(split), &tone_l, &tone_r);
+
+    for (i, (a, b)) in l_a.iter().zip(&l_b).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-4,
+            "oversampled left diverged at sample {i}: stereo {a} vs mid+side {b}"
+        );
+    }
+    for (i, (a, b)) in r_a.iter().zip(&r_b).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-4,
+            "oversampled right diverged at sample {i}: stereo {a} vs mid+side {b}"
+        );
+    }
 }

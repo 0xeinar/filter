@@ -97,6 +97,11 @@ pub struct Filter {
     detectors: [dsp::dynamics::Detector; MAX_BANDS],
     /// Snapshot of "this band is running dynamically" for the current block.
     band_dyn: [bool; MAX_BANDS],
+    /// Each band's basis for this block, and what it was last block — a mode
+    /// change moves the filter's input from a channel to the mid or the side,
+    /// so its delay memory describes a different signal and must be cleared.
+    band_modes: [ChannelMode; MAX_BANDS],
+    last_mode: [ChannelMode; MAX_BANDS],
     /// Soloed band, shared with the GUI. `NO_SOLO` means nothing is soloed.
     ///
     /// Deliberately not a host parameter: solo is a monitoring state, not part
@@ -173,6 +178,11 @@ pub struct BandParams {
     /// type — a bell has a Q, not a slope.
     #[id = "slope"]
     pub slope: IntParam,
+
+    /// Which signal the band filters: the stereo pair, the mid (centre) or the
+    /// side (everything hard-panned). Stored as a `ChannelMode` index.
+    #[id = "channel"]
+    pub channel_mode: IntParam,
 
     #[id = "enable"]
     pub enable: BoolParam,
@@ -307,6 +317,19 @@ fn oversampling_factor(params: &FilterParams) -> usize {
     }
 }
 
+/// The per-band data a cascade needs, bundled.
+///
+/// Five parallel arrays indexed by band became a nine-argument function once
+/// channel modes arrived; naming the group is the honest fix rather than an
+/// `allow`. Everything here is per sub-block and borrowed, so the bundle costs
+/// nothing at run time.
+struct Chain<'a> {
+    coeffs: &'a [[dsp::BiquadCoeffs; dsp::biquad::MAX_SECTIONS]; MAX_BANDS],
+    sections: &'a [usize; MAX_BANDS],
+    enabled: &'a [bool; MAX_BANDS],
+    fades: &'a [(f32, f32); MAX_BANDS],
+}
+
 /// Run every running band's cascade over `buf`, in place.
 ///
 /// A band is not simply on or off: it carries a wet ramp `(from, to)` that is
@@ -321,14 +344,17 @@ fn oversampling_factor(params: &FilterParams) -> usize {
 /// implementation to keep in sync, which is the failure mode this codebase
 /// already hit once.
 fn run_cascade(
-    coeffs: &[[dsp::BiquadCoeffs; dsp::biquad::MAX_SECTIONS]; MAX_BANDS],
-    sections: &[usize; MAX_BANDS],
-    enabled: &[bool; MAX_BANDS],
-    fades: &[(f32, f32); MAX_BANDS],
+    chain: &Chain,
     num_active: usize,
     states: &mut [[dsp::BiquadState; dsp::biquad::MAX_SECTIONS]; MAX_BANDS],
     buf: &mut [f32],
 ) {
+    let Chain {
+        coeffs,
+        sections,
+        enabled,
+        fades,
+    } = *chain;
     // Is anything actually ramping? Answering that first keeps the steady state
     // — every running band at full wet — at exactly the cost it had before the
     // ramp existed: one bool per band per sample, no ramp state to build.
@@ -381,6 +407,82 @@ fn run_cascade(
             }
         }
         *sample = value;
+    }
+}
+
+/// Run the whole chain over a channel pair, honouring each band's basis.
+///
+/// Only used when at least one band is not `Stereo`: a chain of stereo bands is
+/// still processed per channel, which is the cheaper shape and the one every
+/// existing test pins.
+///
+/// A `Mid` band filters `(L+R)/2` and adds the *difference* back to both
+/// channels; a `Side` band filters `(L-R)/2` and adds it back with opposite
+/// signs. So no mid/side buffer is ever materialised, and a stereo band in the
+/// same chain costs exactly what it did before.
+fn run_cascade_stereo(
+    chain: &Chain,
+    modes: &[ChannelMode; MAX_BANDS],
+    num_active: usize,
+    states: &mut [[[dsp::BiquadState; dsp::biquad::MAX_SECTIONS]; MAX_BANDS]; MAX_CHANNELS],
+    left: &mut [f32],
+    right: &mut [f32],
+) {
+    let Chain {
+        coeffs,
+        sections,
+        enabled,
+        fades,
+    } = *chain;
+    let len = left.len();
+    let mut wet = [0.0f32; MAX_BANDS];
+    let mut step = [0.0f32; MAX_BANDS];
+    let mut fading = [false; MAX_BANDS];
+    for band_idx in 0..num_active {
+        let (from, to) = fades[band_idx];
+        wet[band_idx] = from;
+        step[band_idx] = (to - from) / len as f32;
+        fading[band_idx] = from != 1.0 || to != 1.0;
+    }
+
+    for i in 0..len {
+        let mut l = left[i];
+        let mut r = right[i];
+        for (band_idx, on) in enabled[..num_active].iter().enumerate() {
+            if !on {
+                continue;
+            }
+            let (dry_l, dry_r) = (l, r);
+            match modes[band_idx] {
+                ChannelMode::Stereo => {
+                    l = run_sections(coeffs, sections, &mut states[0], band_idx, l);
+                    r = run_sections(coeffs, sections, &mut states[1], band_idx, r);
+                }
+                ChannelMode::Mid => {
+                    let mid = 0.5 * (l + r);
+                    let filtered = run_sections(coeffs, sections, &mut states[0], band_idx, mid);
+                    // Common-mode delta: the side component is untouched by
+                    // construction, which is the acceptance criterion.
+                    let delta = filtered - mid;
+                    l += delta;
+                    r += delta;
+                }
+                ChannelMode::Side => {
+                    let side = 0.5 * (l - r);
+                    let filtered = run_sections(coeffs, sections, &mut states[0], band_idx, side);
+                    let delta = filtered - side;
+                    l += delta;
+                    r -= delta;
+                }
+            }
+            if fading[band_idx] {
+                wet[band_idx] += step[band_idx];
+                l = dry_l + (l - dry_l) * wet[band_idx];
+                r = dry_r + (r - dry_r) * wet[band_idx];
+            }
+        }
+        left[i] = l;
+        right[i] = r;
     }
 }
 
@@ -515,6 +617,54 @@ impl FilterType {
     }
 }
 
+/// Which signal a band filters.
+///
+/// The transform is per band, not global: a chain can be "cut the centre at
+/// 300 Hz, then shelf both channels at 8 kHz", and that is a different result
+/// from doing both in one basis. So each band is applied in its own basis, in
+/// series, which is what Pro-Q's per-band channel modes do.
+///
+/// `Mid` and `Side` derive their transform from the pair every sample:
+/// mid is `(L+R)/2`, side is `(L-R)/2`, and the filtered result is applied back
+/// as a common-mode (mid) or differential (side) *delta*. That avoids ever
+/// materialising a mid/side buffer, so a band that does not use them costs
+/// exactly what it cost before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelMode {
+    /// Both channels, independently. What every band did before this existed.
+    Stereo = 0,
+    /// The centre only: hard-panned material passes untouched.
+    Mid = 1,
+    /// The sides only: everything panned to the centre passes untouched.
+    Side = 2,
+}
+
+impl ChannelMode {
+    pub const ALL: [ChannelMode; 3] = [Self::Stereo, Self::Mid, Self::Side];
+    pub const DEFAULT: ChannelMode = Self::Stereo;
+
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            1 => Self::Mid,
+            2 => Self::Side,
+            _ => Self::Stereo,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stereo => "Stereo",
+            Self::Mid => "Mid",
+            Self::Side => "Side",
+        }
+    }
+
+    /// Whether this band needs the channel pair rather than one channel alone.
+    pub fn is_ms(self) -> bool {
+        matches!(self, Self::Mid | Self::Side)
+    }
+}
+
 /// Slope of a cut filter, in dB per octave.
 ///
 /// Stored as a parameter index rather than a raw value so the pick list and
@@ -579,6 +729,12 @@ impl Slope {
             Self::Db72 => "72 dB/oct",
             Self::Db96 => "96 dB/oct",
         }
+    }
+}
+
+impl std::fmt::Display for ChannelMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
     }
 }
 
@@ -648,6 +804,14 @@ impl Default for BandParams {
                 IntRange::Linear {
                     min: 0,
                     max: Slope::ALL.len() as i32 - 1,
+                },
+            ),
+            channel_mode: IntParam::new(
+                "Channel",
+                ChannelMode::DEFAULT as i32,
+                IntRange::Linear {
+                    min: 0,
+                    max: ChannelMode::ALL.len() as i32 - 1,
                 },
             ),
 
@@ -768,6 +932,8 @@ impl Default for Filter {
             comp_samples: 0,
             detectors: core::array::from_fn(|_| dsp::dynamics::Detector::default()),
             band_dyn: [false; MAX_BANDS],
+            band_modes: [ChannelMode::Stereo; MAX_BANDS],
+            last_mode: [ChannelMode::Stereo; MAX_BANDS],
             solo: Arc::new(AtomicUsize::new(NO_SOLO)),
             band_fade: [0.0; MAX_BANDS],
             fade_primed: false,
@@ -1061,6 +1227,8 @@ impl Filter {
 
                 // --- 1. Advance smoothers once per sub-block, per band ---
                 let mut any_band_active = false;
+                // Whether any running band needs the channel pair as a pair.
+                let mut any_ms_band = false;
                 let solo = self.solo.load(Ordering::Relaxed);
                 // The ramp state for this sub-block, handed to the cascade.
                 let mut fades = [(0.0f32, 0.0f32); MAX_BANDS];
@@ -1084,7 +1252,13 @@ impl Filter {
                     // state, rather than in the cascade: a soloed band then runs
                     // exactly the code it runs unsoloed — dynamics included —
                     // and the static-band short-circuit below is untouched.
-                    let wanted = bp.enable.value() && (solo == NO_SOLO || solo == band_idx);
+                    let mode = ChannelMode::from_i32(bp.channel_mode.value());
+                    // Mono has no side: a Side band would be filtering silence,
+                    // and a Mid band is the signal. Saying so beats running a
+                    // filter over material it cannot separate.
+                    let wanted = bp.enable.value()
+                        && (solo == NO_SOLO || solo == band_idx)
+                        && !(num_channels < 2 && mode == ChannelMode::Side);
                     let target = if wanted { 1.0 } else { 0.0 };
                     let fade_from = if prime {
                         target
@@ -1115,6 +1289,18 @@ impl Filter {
                         }
                     }
                     fades[band_idx] = (fade_from, fade_to);
+
+                    // A mode change re-points the filter at a different signal:
+                    // the delay memory now describes the channel, not the mid.
+                    if mode != self.last_mode[band_idx] {
+                        self.last_mode[band_idx] = mode;
+                        for slot in 0..MAX_CHANNELS {
+                            self.band_states[slot][band_idx] =
+                                [dsp::BiquadState::default(); dsp::biquad::MAX_SECTIONS];
+                        }
+                    }
+                    self.band_modes[band_idx] = mode;
+                    any_ms_band |= mode.is_ms();
 
                     // A band that is fading is still running: the blend needs
                     // something to blend.
@@ -1278,12 +1464,39 @@ impl Filter {
                     self.comp_dirty = true;
                 }
 
-                // --- 3. Process every channel with the SAME coefficients ---
-                // Each channel owns its own filter state (z1/z2); sharing one
-                // state between L and R made the right channel continue the left
-                // channel's filter memory. The sub-block-smoothed parameter
-                // values interpolate over the samples: sample-accurate glide
-                // without per-sample coefficient math.
+                // A band that is fading in starts from silence. Its biquad
+                // memory still holds the last audio it heard, and the fade would
+                // otherwise begin with that tail — audible exactly at the moment
+                // the fade exists to prevent it.
+                #[allow(clippy::needless_range_loop)]
+                for band_idx in 0..num_active {
+                    if self.band_needs_reset[band_idx] {
+                        for slot in 0..MAX_CHANNELS {
+                            self.band_states[slot][band_idx] =
+                                [dsp::BiquadState::default(); dsp::biquad::MAX_SECTIONS];
+                        }
+                    }
+                }
+
+                // --- 3. Process the audio ---
+                //
+                // Two shapes. With every band in the stereo basis, each channel
+                // runs the cascade alone — the cheaper path, and the one every
+                // band used before channel modes existed. As soon as one band
+                // works on the mid or the side, the chain needs the pair, and
+                // the whole chain is run jointly: a per-band basis cannot be
+                // expressed by filtering the two channels independently,
+                // because `mid` is a function of both.
+                let ms_chain = any_ms_band && num_channels >= 2;
+                if ms_chain {
+                    self.run_ms_chain(
+                        &mut block, sub_offset, block_len, factor, &fades, num_active,
+                    );
+                }
+
+                // --- 3b. Output stage and metering, per channel ---
+                // If the chain ran jointly above, the samples are already
+                // filtered and this loop only applies the output stage.
                 for channel_idx in 0..num_channels {
                     let Some(full_channel) = block.get_mut(channel_idx) else {
                         continue;
@@ -1294,17 +1507,6 @@ impl Filter {
                     // panic is far worse than a skipped channel.
                     if channel_idx >= MAX_CHANNELS {
                         continue;
-                    }
-                    // A band that is fading in starts from silence. Its biquad
-                    // memory still holds the last audio it heard, and the fade
-                    // would otherwise begin with that tail — audible exactly at
-                    // the moment the fade exists to prevent it.
-                    #[allow(clippy::needless_range_loop)]
-                    for band_idx in 0..num_active {
-                        if self.band_needs_reset[band_idx] {
-                            self.band_states[channel_idx][band_idx] =
-                                [dsp::BiquadState::default(); dsp::biquad::MAX_SECTIONS];
-                        }
                     }
                     let Some(channel_samples) =
                         full_channel.get_mut(sub_offset..sub_offset + block_len)
@@ -1322,13 +1524,15 @@ impl Filter {
                     // factor is above 1: the host has been told to compensate
                     // `latency`, so a path that skipped the resampler would
                     // come out early by exactly that much.
-                    if any_band_active || factor > 1 {
+                    if !ms_chain && (any_band_active || factor > 1) {
                         if factor == 1 {
                             run_cascade(
-                                &self.band_coeffs,
-                                &self.band_sections,
-                                &self.band_enabled,
-                                &fades,
+                                &Chain {
+                                    coeffs: &self.band_coeffs,
+                                    sections: &self.band_sections,
+                                    enabled: &self.band_enabled,
+                                    fades: &fades,
+                                },
                                 num_active,
                                 &mut self.band_states[channel_idx],
                                 channel_samples,
@@ -1341,10 +1545,12 @@ impl Filter {
                                 &mut self.os_buf[channel_idx][..os_len],
                             );
                             run_cascade(
-                                &self.band_coeffs,
-                                &self.band_sections,
-                                &self.band_enabled,
-                                &fades,
+                                &Chain {
+                                    coeffs: &self.band_coeffs,
+                                    sections: &self.band_sections,
+                                    enabled: &self.band_enabled,
+                                    fades: &fades,
+                                },
                                 num_active,
                                 &mut self.band_states[channel_idx],
                                 &mut self.os_buf[channel_idx][..os_len],
@@ -1425,6 +1631,97 @@ impl Filter {
         }
 
         latency
+    }
+}
+
+impl Filter {
+    /// Run the chain over both channels at once, in each band's own basis.
+    ///
+    /// Split out of `process_buffer` because it needs the channels together,
+    /// which the per-channel loop deliberately does not. The oversampled path
+    /// resamples both channels first and filters them as a pair inside the
+    /// oversampled domain — transforming after the resampler would put the
+    /// mid/side sum outside the band-limiting the oversampler exists to give.
+    fn run_ms_chain(
+        &mut self,
+        block: &mut nih_plug::buffer::Block<'_, '_>,
+        sub_offset: usize,
+        block_len: usize,
+        factor: usize,
+        fades: &[(f32, f32); MAX_BANDS],
+        num_active: usize,
+    ) {
+        let os_len = block_len * factor;
+        // The two channel slices have to be alive at the same time, which two
+        // `get_mut` calls cannot give (each borrows the block). `iter_mut`
+        // yields disjoint borrows, so both fit.
+        fn pair<'a>(
+            block: &'a mut nih_plug::buffer::Block<'_, '_>,
+            sub_offset: usize,
+            len: usize,
+        ) -> Option<(&'a mut [f32], &'a mut [f32])> {
+            let mut channels = block.iter_mut();
+            let left = channels.next()?;
+            let right = channels.next()?;
+            Some((
+                &mut left[sub_offset..sub_offset + len],
+                &mut right[sub_offset..sub_offset + len],
+            ))
+        }
+
+        if factor == 1 {
+            let Some((left, right)) = pair(block, sub_offset, block_len) else {
+                return;
+            };
+            run_cascade_stereo(
+                &Chain {
+                    coeffs: &self.band_coeffs,
+                    sections: &self.band_sections,
+                    enabled: &self.band_enabled,
+                    fades,
+                },
+                &self.band_modes,
+                num_active,
+                &mut self.band_states,
+                left,
+                right,
+            );
+        } else {
+            {
+                let Some((left, right)) = pair(block, sub_offset, block_len) else {
+                    return;
+                };
+                self.oversampler
+                    .upsample(0, left, &mut self.os_buf[0][..os_len]);
+                self.oversampler
+                    .upsample(1, right, &mut self.os_buf[1][..os_len]);
+            }
+            {
+                let (first, rest) = self.os_buf.split_at_mut(1);
+                run_cascade_stereo(
+                    &Chain {
+                        coeffs: &self.band_coeffs,
+                        sections: &self.band_sections,
+                        enabled: &self.band_enabled,
+                        fades,
+                    },
+                    &self.band_modes,
+                    num_active,
+                    &mut self.band_states,
+                    &mut first[0][..os_len],
+                    &mut rest[0][..os_len],
+                );
+            }
+            {
+                let Some((left, right)) = pair(block, sub_offset, block_len) else {
+                    return;
+                };
+                self.oversampler
+                    .downsample(0, &self.os_buf[0][..os_len], left);
+                self.oversampler
+                    .downsample(1, &self.os_buf[1][..os_len], right);
+            }
+        }
     }
 }
 

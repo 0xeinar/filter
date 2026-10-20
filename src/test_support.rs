@@ -131,6 +131,72 @@ pub fn band_with_slope(
     }
 }
 
+/// Set a band's channel basis (stereo, mid, side) for tests.
+pub fn with_channel_mode(mut bp: BandParams, mode: crate::ChannelMode) -> BandParams {
+    bp.channel_mode = IntParam::new(
+        "Channel",
+        mode as i32,
+        IntRange::Linear {
+            min: 0,
+            max: crate::ChannelMode::ALL.len() as i32 - 1,
+        },
+    );
+    bp
+}
+
+/// Params whose bands carry an explicit channel basis, so a test can build a
+/// mid-only or side-only band without going through the GUI.
+pub fn test_params_with_modes(
+    bands: &[(f32, f32, f32, FilterType, crate::ChannelMode)],
+) -> Arc<FilterParams> {
+    let mut band_params: [BandParams; MAX_BANDS] = core::array::from_fn(|_| BandParams::default());
+    for (i, &(freq, gain, q, ftype, mode)) in bands.iter().enumerate() {
+        band_params[i] = with_channel_mode(band(freq, gain, q, ftype, true), mode);
+    }
+    Arc::new(FilterParams {
+        num_bands: IntParam::new(
+            "Bands",
+            bands.len() as i32,
+            IntRange::Linear {
+                min: 0,
+                max: MAX_BANDS as i32,
+            },
+        ),
+        band_params,
+        ..FilterParams::default()
+    })
+}
+
+/// As `test_params_with_modes`, with an explicit oversampling factor index
+/// (0 = off, 1 = 2x, 2 = 4x), so the mid/side path can be exercised inside the
+/// oversampled domain — where the transform has to happen, not outside it.
+pub fn test_params_oversampled(
+    oversampling: i32,
+    bands: &[(f32, f32, f32, FilterType, crate::ChannelMode)],
+) -> Arc<FilterParams> {
+    let mut band_params: [BandParams; MAX_BANDS] = core::array::from_fn(|_| BandParams::default());
+    for (i, &(freq, gain, q, ftype, mode)) in bands.iter().enumerate() {
+        band_params[i] = with_channel_mode(band(freq, gain, q, ftype, true), mode);
+    }
+    Arc::new(FilterParams {
+        num_bands: IntParam::new(
+            "Bands",
+            bands.len() as i32,
+            IntRange::Linear {
+                min: 0,
+                max: MAX_BANDS as i32,
+            },
+        ),
+        oversampling: IntParam::new(
+            "Oversampling",
+            oversampling,
+            IntRange::Linear { min: 0, max: 2 },
+        ),
+        band_params,
+        ..FilterParams::default()
+    })
+}
+
 /// Turn dynamics on for `band`, with explicit threshold/range/timing.
 pub fn dynamic(
     band: BandParams,
