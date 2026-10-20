@@ -131,15 +131,6 @@ struct ChipStyle {
     enabled: bool,
 }
 
-/// The mode after `current`, wrapping. Kept as a free function so the wrap can
-/// be tested without a host to write the parameter back.
-fn next_dyn_mode(current: i32) -> i32 {
-    match crate::dsp::dynamics::DynMode::from_i32(current) {
-        crate::dsp::dynamics::DynMode::Down => 1,
-        crate::dsp::dynamics::DynMode::Up => 0,
-    }
-}
-
 /// The A/B slot buttons: filled when live, outlined when not.
 struct SlotStyle {
     active: bool,
@@ -248,8 +239,8 @@ struct FilterEditor {
     params: Arc<FilterParams>,
     context: Arc<dyn GuiContext>,
     peak_meter: Arc<AtomicF32>,
-    /// Live dynamic gain per band, so the DYN row can show what the band is
-    /// applying right now rather than only its ceiling.
+    /// Live dynamic offset per band, so the DYN row can show how far the band
+    /// has moved from its static gain right now.
     dyn_meters: Arc<BandMeters>,
     /// Undo/redo history and the A/B pair. Shared with the canvas, which owns
     /// the keyboard and therefore the shortcut.
@@ -259,8 +250,6 @@ struct FilterEditor {
     slot_copy_state: std::cell::UnsafeCell<button::State>,
     /// Button cache for the oversampling cycle control.
     os_state: std::cell::UnsafeCell<button::State>,
-    /// Button cache for each band's dynamic-mode cycle control.
-    dyn_mode_states: [std::cell::UnsafeCell<button::State>; MAX_BANDS],
     graph: ui::Graph,
     /// Shared with the graph: one of the editor's few pieces of state that
     /// is not a host parameter.
@@ -367,8 +356,6 @@ pub enum Message {
     OversamplingCycled,
     /// Band `index` enabled/disabled its dynamics.
     DynamicsToggled(usize, bool),
-    /// Band `index` switched between downward and upward dynamics.
-    DynModeCycled(usize),
     /// Band `index` enabled/disabled its sidechain filter.
     SidechainToggled(usize, bool),
     /// Step back one edit.
@@ -412,25 +399,27 @@ impl FilterEditor {
     /// Enable/disable a band's dynamics as a single automation gesture, so the
     /// host records one undo step rather than one per parameter touched.
     fn set_band_dynamics(&self, index: usize, on: bool) -> Command<Message> {
-        let param = &self.params.band_params[index].dyn_enable;
+        let bp = &self.params.band_params[index];
         let setter = ParamSetter::new(self.context.as_ref());
-        setter.begin_set_parameter(param);
-        setter.set_parameter(param, on);
-        setter.end_set_parameter(param);
-        Command::none()
-    }
+        setter.begin_set_parameter(&bp.dyn_enable);
+        setter.set_parameter(&bp.dyn_enable, on);
+        setter.end_set_parameter(&bp.dyn_enable);
 
-    /// Switch a band between downward and upward dynamics as one gesture.
-    ///
-    /// Same split as [`Self::set_band_dynamics`]: the decision lives in a plain
-    /// method because `update()` needs a `WindowQueue` a test cannot build.
-    fn cycle_dyn_mode(&self, index: usize) -> Command<Message> {
-        let param = &self.params.band_params[index].dyn_mode;
-        let next = next_dyn_mode(param.value());
-        let setter = ParamSetter::new(self.context.as_ref());
-        setter.begin_set_parameter(param);
-        setter.set_parameter(param, next);
-        setter.end_set_parameter(param);
+        // Turning dynamics on for a band that has a gain but no range yet moves
+        // the gain into the range, which is Pro-Q's "make dynamic" (its
+        // Alt-drag trades one for the other). Without it the switch would look
+        // broken: the band would go on being static because the range is 0.
+        if on && bp.dyn_range.value().abs() < crate::dsp::dynamics::MIN_RANGE_DB {
+            let gain = bp.gain.value();
+            if gain.abs() >= crate::dsp::dynamics::MIN_RANGE_DB {
+                setter.begin_set_parameter(&bp.dyn_range);
+                setter.set_parameter(&bp.dyn_range, gain);
+                setter.end_set_parameter(&bp.dyn_range);
+                setter.begin_set_parameter(&bp.gain);
+                setter.set_parameter(&bp.gain, 0.0);
+                setter.end_set_parameter(&bp.gain);
+            }
+        }
         Command::none()
     }
 
@@ -490,9 +479,6 @@ impl IcedEditor for FilterEditor {
             slot_b_state: std::cell::UnsafeCell::new(button::State::new()),
             slot_copy_state: std::cell::UnsafeCell::new(button::State::new()),
             os_state: std::cell::UnsafeCell::new(button::State::new()),
-            dyn_mode_states: core::array::from_fn(|_| {
-                std::cell::UnsafeCell::new(button::State::new())
-            }),
             graph,
             selection,
             num_bands_slider_state: Default::default(),
@@ -600,9 +586,6 @@ impl IcedEditor for FilterEditor {
                 let param = &self.params.spectrum_post;
                 let setter = ParamSetter::new(self.context.as_ref());
                 setter.set_parameter(param, on);
-            }
-            Message::DynModeCycled(index) => {
-                let _ = self.cycle_dyn_mode(index);
             }
             Message::SidechainToggled(index, on) => {
                 let _ = self.set_band_sidechain(index, on);
@@ -978,24 +961,6 @@ impl IcedEditor for FilterEditor {
                     .push(Text::new("Dyn").size(11).color(colors::TEXT_DIM));
                 let mut second: Option<Row<'_, Message>> = None;
                 if dyn_on {
-                    // Which side of the threshold the band reacts to. A button
-                    // that cycles and shows the current mode, like the
-                    // oversampling control: two states, and the label is the
-                    // state.
-                    let mode = crate::dsp::dynamics::DynMode::from_i32(bp.dyn_mode.value());
-                    // Safety: each index i is visited once per frame
-                    let mode_button = button::Button::new(
-                        unsafe { &mut *self.dyn_mode_states[i].get() },
-                        Text::new(mode.name()).size(10),
-                    )
-                    .width(Length::Units(38))
-                    .height(Length::Units(20))
-                    .padding(0)
-                    .style(SlotStyle {
-                        active: mode != crate::dsp::dynamics::DynMode::Down,
-                    })
-                    .on_press(Message::DynModeCycled(i));
-
                     // Safety: each index i is visited once per frame
                     let threshold = unsafe {
                         nih_widgets::ParamSlider::new(
@@ -1037,8 +1002,7 @@ impl IcedEditor for FilterEditor {
                         .push(Text::new("Atk").size(11).color(colors::TEXT_DIM))
                         .push(attack)
                         .push(Text::new("Rel").size(11).color(colors::TEXT_DIM))
-                        .push(release)
-                        .push(mode_button);
+                        .push(release);
 
                     // Second row: the knee, and where the detector listens.
                     // Both only mean something while dynamics are on, so they
@@ -1089,7 +1053,7 @@ impl IcedEditor for FilterEditor {
                 } else {
                     row = row.push(
                         Text::new(
-                            "gain becomes the maximum change; the band is inert below the threshold",
+                            "the range moves the band when the level is past the threshold; the gain stays static",
                         )
                         .size(11)
                         .color(colors::TEXT_FAINT),
@@ -1229,9 +1193,6 @@ mod tests {
                 setter.begin_set_parameter(&bp.dyn_sc_freq);
                 setter.set_parameter(&bp.dyn_sc_freq, 80.0);
                 setter.end_set_parameter(&bp.dyn_sc_freq);
-                setter.begin_set_parameter(&bp.dyn_mode);
-                setter.set_parameter(&bp.dyn_mode, 1);
-                setter.end_set_parameter(&bp.dyn_mode);
             }
         }
         let mut editor = editor_over(params);
@@ -1239,48 +1200,56 @@ mod tests {
     }
 
     #[test]
-    fn the_dynamic_mode_cycle_wraps_over_two_modes() {
-        assert_eq!(next_dyn_mode(0), 1);
-        assert_eq!(next_dyn_mode(1), 0);
-        // A value from an older session or a host that sent something odd is
-        // read as Down (the default), so the cycle still lands on a real mode
-        // rather than on an index nothing reads.
-        assert_eq!(next_dyn_mode(7), 1);
-    }
-
-    #[test]
-    fn the_mode_and_sidechain_controls_are_single_gestures() {
-        // The recording context counts gestures and the normalized value they
-        // carry but does not apply them (that is the host's job), so the
-        // assertions are about *what was asked for*, not about state that a
-        // null host never writes back.
+    fn the_sidechain_toggle_is_its_own_gesture() {
         let (editor, ctx) = editor_with_bands(&[(1_000.0, -6.0, 1.0, FilterType::Bell)]);
-        let mode = &editor.params.band_params[0].dyn_mode;
-        assert_eq!(mode.value(), 0, "bands start in downward mode");
-
-        let _ = editor.cycle_dyn_mode(0);
-        assert_eq!(ctx.writes(), vec![1.0], "cycling Down must ask for Up");
         let _ = editor.set_band_sidechain(0, true);
-        assert_eq!(
-            ctx.writes(),
-            vec![1.0, 1.0],
-            "the sidechain toggle is its own gesture"
-        );
-
-        // The wrap itself is unit-tested in `the_dynamic_mode_cycle_wraps`.
+        assert_eq!(ctx.writes(), vec![1.0], "one write, normalized true");
     }
 
     #[test]
-    fn dynamics_are_written_as_one_gesture() {
-        // `update()` needs a `&mut WindowQueue`, which nih-plug does not let a
-        // test construct, so the decision lives in a plain method and is tested
-        // there — the same split the selection handler uses.
+    fn enabling_dynamics_moves_the_gain_into_the_range() {
+        // Pro-Q's "make dynamic": the band's gain becomes its dynamic range, so
+        // the switch does something on a band that was static a moment ago. Its
+        // three writes are enable + range + gain, each its own gesture so the
+        // host records them contiguously.
         let (editor, ctx) = editor_with_bands(&[(1_000.0, -6.0, 1.0, FilterType::Bell)]);
+        let _ = editor.set_band_dynamics(0, true);
+        let writes = ctx.writes();
+        assert_eq!(writes.len(), 3, "enable, range, gain: got {writes:?}");
+        // -6 dB of gain over a -30..+30 range normalizes to 0.4.
+        let range_write = writes[1];
+        assert!(
+            (range_write - 0.4).abs() < 0.01,
+            "expected the -6 dB gain to land in the range, normalized {range_write}"
+        );
+        // 0 dB over the gain's range is its centre.
+        assert!(
+            (writes[2] - 0.5).abs() < 0.01,
+            "expected the gain to go to 0 dB, normalized {}",
+            writes[2]
+        );
+    }
+
+    #[test]
+    fn enabling_dynamics_leaves_an_existing_range_alone() {
+        let params = test_params_with_dynamics(&[(1_000.0, -6.0, 1.0, FilterType::Bell)]);
+        let patch_state = Arc::new(std::sync::Mutex::new(PatchState::new(&params)));
+        let ctx = Arc::new(RecordingGuiContext::default());
+        let flags = (
+            params,
+            Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
+            Arc::new(SpectrumTaps::new()),
+            Arc::new(BandMeters::new()),
+            patch_state,
+        );
+        #[allow(clippy::arc_with_non_send_sync)]
+        let ctx_dyn: Arc<dyn GuiContext> = ctx.clone();
+        let (editor, _) = <FilterEditor as IcedEditor>::new(flags, ctx_dyn);
         let _ = editor.set_band_dynamics(0, true);
         assert_eq!(
             ctx.writes().len(),
             1,
-            "enabling dynamics should be a single set-parameter gesture"
+            "a band that already has a range must only be switched on"
         );
     }
 

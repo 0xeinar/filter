@@ -153,7 +153,7 @@ pub fn dynamic(
             "Range",
             range_db,
             FloatRange::Linear {
-                min: 1.0,
+                min: -30.0,
                 max: 30.0,
             },
         ),
@@ -216,7 +216,11 @@ pub fn test_params_with_post_spectrum(
 pub fn test_params_with_dynamics(bands: &[(f32, f32, f32, FilterType)]) -> Arc<FilterParams> {
     let mut band_params: [BandParams; MAX_BANDS] = core::array::from_fn(|_| BandParams::default());
     for (i, &(freq, gain, q, ftype)) in bands.iter().enumerate() {
-        band_params[i] = dynamic(band(freq, gain, q, ftype, true), -30.0, 12.0, 10.0, 150.0);
+        // The band's gain becomes its dynamic range and the static gain goes to
+        // 0, which is what enabling dynamics in the editor does ("make
+        // dynamic"). A fixture that left the gain in place would describe a
+        // band nobody creates: static -12 plus a -12 dynamic range.
+        band_params[i] = dynamic(band(freq, 0.0, q, ftype, true), -30.0, gain, 10.0, 150.0);
     }
     Arc::new(FilterParams {
         num_bands: IntParam::new(

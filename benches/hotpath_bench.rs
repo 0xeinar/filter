@@ -19,7 +19,7 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
-use filter::dsp::dynamics::{dynamic_gain_db, Detector};
+use filter::dsp::dynamics::{Detector, DynLaw};
 use filter::dsp::oversample::Oversampler;
 use filter::dsp::spectrum::{SpectrumAnalyzer, SpectrumRing};
 use filter::dsp::BiquadFilter;
@@ -169,7 +169,7 @@ fn main() {
     for chunk in input.chunks(BLOCK) {
         for sub in chunk.chunks(SUB) {
             let level = detector.update(sub, 1000.0, 1.0, 10.0, 150.0);
-            black_box(dynamic_gain_db(-6.0, level, -30.0, 12.0));
+            black_box(DynLaw::new(-30.0, -12.0, 3.0).applied_gain_db(-6.0, level));
             n3 += sub.len();
         }
     }

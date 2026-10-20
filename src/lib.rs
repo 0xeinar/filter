@@ -162,7 +162,11 @@ pub struct BandParams {
     #[id = "dyn-threshold"]
     pub dyn_threshold: FloatParam,
 
-    /// How many dB above the threshold it takes to reach the full gain.
+    /// How many dB the band moves when the trigger is above the threshold.
+    ///
+    /// The sign is the direction: negative ducks loud material, positive
+    /// boosts it. Independent of `gain`, which stays the band's static gain —
+    /// so a band can lift always and duck when it gets loud.
     #[id = "dyn-range"]
     pub dyn_range: FloatParam,
 
@@ -173,10 +177,6 @@ pub struct BandParams {
     /// How fast the detector falls back when the level drops.
     #[id = "dyn-release"]
     pub dyn_release: FloatParam,
-
-    /// React above the threshold (Down) or below it (Up).
-    #[id = "dyn-mode"]
-    pub dyn_mode: IntParam,
 
     /// Transition width in dB, eased quadratically instead of a hard corner.
     /// Zero is the hard corner; while it is set, `range` is not the transition
@@ -575,9 +575,9 @@ impl Default for BandParams {
             .with_value_to_string(formatters::v2s_f32_rounded(1)),
             dyn_range: FloatParam::new(
                 "Range",
-                12.0,
+                0.0,
                 FloatRange::Linear {
-                    min: 1.0,
+                    min: -30.0,
                     max: 30.0,
                 },
             )
@@ -606,16 +606,9 @@ impl Default for BandParams {
             )
             .with_unit(" ms")
             .with_value_to_string(formatters::v2s_f32_rounded(0)),
-            dyn_mode: IntParam::new("Mode", 0, IntRange::Linear { min: 0, max: 1 })
-                // The host shows this in its automation list, where "0"/"1"
-                // says nothing. `from_string` is not wired up: nih-plug falls
-                // back to parsing the integer, which is what the host sends.
-                .with_value_to_string(Arc::new(|v: i32| {
-                    dsp::dynamics::DynMode::from_i32(v).name().to_string()
-                })),
             dyn_knee: FloatParam::new(
                 "Knee",
-                0.0,
+                dsp::dynamics::DEFAULT_KNEE_DB,
                 FloatRange::Linear {
                     min: 0.0,
                     max: 12.0,
@@ -992,7 +985,13 @@ impl Filter {
                     // Dynamics only mean anything for a type that has a gain.
                     // A cut passes 0 dB at every level, so its "gain" is not a
                     // parameter the detector could modulate.
-                    let dyn_on = enabled && ftype.has_gain() && bp.dyn_enable.value();
+                    // A range of zero is not a dynamic band — it is Pro-Q's
+                    // "clear dynamics", and treating it as one would run a
+                    // detector and rebake coefficients for nothing.
+                    let dyn_on = enabled
+                        && ftype.has_gain()
+                        && bp.dyn_enable.value()
+                        && bp.dyn_range.value().abs() >= dsp::dynamics::MIN_RANGE_DB;
                     self.band_dyn[band_idx] = dyn_on;
 
                     self.band_types[band_idx] = ftype;
@@ -1106,13 +1105,20 @@ impl Filter {
                             bp.dyn_attack.value(),
                             bp.dyn_release.value(),
                         );
-                        dsp::dynamics::DynLaw::new(
+                        let law = dsp::dynamics::DynLaw::new(
                             bp.dyn_threshold.value(),
                             bp.dyn_range.value(),
                             bp.dyn_knee.value(),
-                            dsp::dynamics::DynMode::from_i32(bp.dyn_mode.value()),
-                        )
-                        .gain_db(static_gain, level)
+                        );
+                        // The meter carries the *dynamic* part only: the static
+                        // gain is already on screen as the knob, and the whole
+                        // question the readout answers is how far the band has
+                        // moved from it.
+                        if editor_open {
+                            self.dyn_meters
+                                .publish(band_idx, law.dynamic_gain_db(level));
+                        }
+                        law.applied_gain_db(static_gain, level)
                     } else {
                         static_gain
                     };
@@ -1125,12 +1131,6 @@ impl Filter {
                         baked_slope,
                         os_rate,
                     );
-                    // Publish what the band is actually applying. Only while
-                    // someone can see it, and only for dynamic bands — a
-                    // static band's gain is already on screen as its knob.
-                    if self.band_dyn[band_idx] && editor_open {
-                        self.dyn_meters.publish(band_idx, baked_gain);
-                    }
                     self.last_baked_freq[band_idx] = baked_freq;
                     self.last_baked_gain[band_idx] = baked_gain;
                     self.last_baked_q[band_idx] = baked_q;
