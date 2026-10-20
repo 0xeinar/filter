@@ -217,6 +217,34 @@ fn node_gain_db(bp: &crate::BandParams) -> f32 {
     }
 }
 
+/// The live-move bar on a dynamic band's node, as a `(static, live)` pair of
+/// gains in dB.
+///
+/// The range curve already draws where the band *can* go; this is where it
+/// *is*. Length is proportional by construction — the gain axis is linear in
+/// dB, so a bar ending at `gain + meter` is `|meter| / |range|` of the full
+/// span in pixels without any extra arithmetic.
+///
+/// The meter is clamped to the range it belongs to. It is a relaxed atomic
+/// read, so on the frame after a parameter edit it can still describe the
+/// previous range — without the clamp the bar would briefly draw longer than
+/// the curve it is supposed to be filling.
+///
+/// Returns `None` for a static band (`range` 0) and for a band that is not
+/// currently moving: a zero-length bar is not a bar, and drawing nothing is
+/// the honest picture of "this band is not doing anything right now".
+fn dyn_bar_span(gain_db: f32, range_db: f32, meter_db: f32) -> Option<(f32, f32)> {
+    use crate::dsp::dynamics::MIN_RANGE_DB;
+    if range_db.abs() < MIN_RANGE_DB {
+        return None;
+    }
+    let live = meter_db.clamp(-range_db.abs(), range_db.abs());
+    if live.abs() < MIN_RANGE_DB {
+        return None;
+    }
+    Some((gain_db, gain_db + live))
+}
+
 /// Node positions in canvas-local pixel coordinates `(band_index, x, y)`
 /// for all enabled, active bands.
 fn node_positions(
@@ -763,6 +791,40 @@ impl GraphProgram {
                 0.25
             };
             let inner_radius = if is_drag { 4.5 } else { 3.5 };
+
+            // The live part of a dynamic band, where it is happening: a bar
+            // from the static-gain dot toward the band's current position.
+            // The range curve says where the band can go, the readout says how
+            // far in numbers, and this says how far at a glance — while both
+            // hands are on the mouse.
+            //
+            // Drawn before the dot so the dot reads as the bar's origin, and
+            // along the gain axis rather than on the node's radius because
+            // this graph's scale is the dB axis: a radial bar would imply a
+            // length that means nothing here.
+            if dyn_is_active(bp) {
+                if let Some((from_db, to_db)) = dyn_bar_span(
+                    bp.gain.value(),
+                    bp.dyn_range.value(),
+                    self.dyn_meters.read(i),
+                ) {
+                    let from = to_px(bounds, bp.freq.value(), from_db);
+                    let to = to_px(bounds, bp.freq.value(), to_db);
+                    frame.stroke(
+                        &Path::line(from, to),
+                        Stroke::default()
+                            .with_color(Color { a: 0.9, ..color })
+                            .with_width(3.0),
+                    );
+                    // A cap on the moving end: a fraction of a dB is a couple
+                    // of pixels, and a bare stub reads as anti-aliasing noise
+                    // rather than as "this band is working".
+                    frame.fill(
+                        &Path::circle(to, 2.0),
+                        Fill::from(Color { a: 0.95, ..color }),
+                    );
+                }
+            }
 
             // Outer ring
             frame.fill(
@@ -1718,6 +1780,77 @@ mod tests {
         assert!(
             !layer_vertices(&layers, INPUT_SPECTRUM).is_empty(),
             "the input spectrum must keep drawing when the overlay is off"
+        );
+    }
+
+    /// The bar's length is a fraction of the range, and its direction is the
+    /// range's sign.
+    ///
+    /// This is the acceptance criterion in #21 stated as arithmetic: full
+    /// engagement spans the whole range, half spans half, a static band draws
+    /// nothing. Pixels come from `to_px`, which is linear in dB — so pinning
+    /// the dB endpoint pins the pixel length.
+    #[test]
+    fn the_dynamic_bar_spans_a_fraction_of_the_range() {
+        assert_eq!(dyn_bar_span(0.0, -12.0, -12.0), Some((0.0, -12.0)));
+        assert_eq!(dyn_bar_span(0.0, -12.0, -6.0), Some((0.0, -6.0)));
+        assert_eq!(dyn_bar_span(0.0, -12.0, -3.0), Some((0.0, -3.0)));
+
+        // Not moving: no bar. A zero-length stroke is invisible anyway, and
+        // saying `None` keeps the node layer identical frame to frame.
+        assert_eq!(dyn_bar_span(0.0, -12.0, 0.0), None);
+        // Range 0 is Pro-Q's "dynamics off": static however the switch is set.
+        assert_eq!(dyn_bar_span(0.0, 0.0, -12.0), None);
+    }
+
+    #[test]
+    fn the_dynamic_bar_follows_the_sign_of_the_range() {
+        // Positive range expands upward; the bar must not assume "reduction".
+        let (from, up) = dyn_bar_span(6.0, 12.0, 12.0).expect("expanding band draws a bar");
+        assert!(up > from, "a +12 range drew downward: {from} -> {up}");
+
+        let (from, down) = dyn_bar_span(6.0, -12.0, -12.0).expect("cutting band draws a bar");
+        assert!(down < from, "a -12 range drew upward: {from} -> {down}");
+
+        // Same magnitude either way — the sign is the only difference.
+        assert!(((up - 6.0) + (down - 6.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_meter_left_over_from_a_wider_range_is_clamped() {
+        // The meter is a relaxed atomic: on the frame after a range edit it can
+        // still hold the old law's value. Unclamped, the bar would draw past
+        // the range curve that promises where the band can go.
+        let (from, to) = dyn_bar_span(0.0, -3.0, -12.0).expect("still engaged");
+        assert_eq!(to - from, -3.0, "the bar overshot the current range");
+    }
+
+    /// The bar has to reach the canvas, not just the arithmetic: a dynamic band
+    /// that is moving draws more node-layer geometry than the same band idle.
+    #[test]
+    fn the_node_layer_grows_a_bar_only_while_the_band_moves() {
+        let params = test_params_with_dynamics(&[(1_000.0, -12.0, 1.0, FilterType::Bell)]);
+        let program = test_program_with(params, Arc::new(NullGuiContext));
+
+        program.dyn_meters.publish(0, 0.0);
+        let idle = layer_vertices(&program.draw(bounds(), None, None), NODES).len();
+
+        program.dyn_meters.publish(0, -6.0);
+        let half = layer_vertices(&program.draw(bounds(), None, None), NODES).len();
+
+        program.dyn_meters.publish(0, -12.0);
+        let full = layer_vertices(&program.draw(bounds(), None, None), NODES).len();
+
+        // A stroke tessellates to the same vertex count whatever its length,
+        // so half and full must match: the bar is a stroke, not a per-frame
+        // rebuild whose cost depends on how far the band has moved.
+        assert_eq!(
+            half, full,
+            "the bar's geometry must not depend on its length"
+        );
+        assert!(
+            half > idle,
+            "an engaged band drew no bar ({idle} vertices idle vs {half} engaged)"
         );
     }
 
