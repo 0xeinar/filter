@@ -238,6 +238,11 @@ fn push_analyzer_block(
     channels: &mut [&mut [f32]],
 ) {
     let ring = if is_output { &taps.output } else { &taps.input };
+    // Tilt is display state, but it is applied to the measured dB values so the
+    // pre and post taps and the drawn curve share one reference. Publishing it
+    // here rather than in the GUI means the audio thread pays it once per
+    // frame instead of the canvas paying it once per redraw.
+    analyzer.set_tilt(taps.view.tilted());
     match channels {
         [left, right, ..] => analyzer.push_stereo_block(ring, left, right),
         [only] => analyzer.push_block(ring, only),

@@ -22,13 +22,15 @@ use nih_plug_iced::backend::widget::canvas::{
     self, Canvas as IcedCanvas, Cursor, Fill, Frame, Geometry, Path, Program, Stroke,
     Text as CanvasText,
 };
-use nih_plug_iced::{keyboard, mouse, Color, Length, Point, Rectangle};
+use nih_plug_iced::{keyboard, mouse, Color, Length, Point, Rectangle, Size};
 
 use crate::dsp::curve::{
     band_response_db, db_to_y, freq_to_x, nearest_grabbable_node, px_to_freq, scroll_q_step,
     y_to_db, BandSpec, DB_MAX, FREQ_MAX, FREQ_MIN, GRID_DBS, GRID_FREQS,
 };
-use crate::dsp::spectrum::{SpectrumFrame, SpectrumRing, BINS};
+use crate::dsp::spectrum::{
+    tilt_db, SpectrumFrame, SpectrumRing, SpectrumView, TraceBallistics, BINS, TILT_DB_PER_OCT,
+};
 use crate::ui::selection;
 use crate::{editor, FilterParams, FilterType, MAX_BANDS};
 
@@ -65,15 +67,15 @@ fn spectrum_bin_x(sample_rate: f32) -> Vec<f32> {
         .collect()
 }
 
-/// dB floor of the spectrum display. Analyser output spans -96..12 dB; the
-/// graph maps -90 dB to the bottom edge and 0 dB to three quarters height,
-/// clamped outside that so a clipped or silent signal cannot draw off-canvas.
-const SPECTRUM_FLOOR_DB: f32 = -90.0;
-
-/// Map an analyzer dB value to a canvas y coordinate (shared by both taps so
-/// the two curves stay directly comparable).
-fn spectrum_y(bounds: Rectangle, db: f32) -> f32 {
-    let y01 = ((db - SPECTRUM_FLOOR_DB) / -SPECTRUM_FLOOR_DB).clamp(0.0, 1.0) * 0.75;
+/// Maps an analyzer dB value to a canvas y coordinate.
+///
+/// Shared by both taps so the two curves stay directly comparable. `floor_db`
+/// comes from the display range selector (0 to -60 / -90 / -120); the top of
+/// the display is always 0 dB at three quarters height, so changing the range
+/// deepens the floor rather than rescaling the signal.
+fn spectrum_y(bounds: Rectangle, db: f32, floor_db: f32) -> f32 {
+    let span = (-floor_db).max(1.0);
+    let y01 = ((db - floor_db) / span).clamp(0.0, 1.0) * 0.75;
     bounds.y + bounds.height * (1.0 - y01)
 }
 
@@ -83,6 +85,113 @@ fn to_px(bounds: Rectangle, freq: f32, db: f32) -> Point {
         x: bounds.x + freq_to_x(freq) * bounds.width,
         y: bounds.y + db_to_y(db) * bounds.height,
     }
+}
+
+/// The spectrum display controls, drawn as chips in the graph's top-right
+/// corner.
+///
+/// They live in the canvas rather than the header because the header is
+/// already at the window's width budget (`chrome_fits_in_the_window`), and
+/// because they are about the picture the cursor is sitting on. Every one of
+/// them is display state, not audio state: they are deliberately not host
+/// parameters, so they are not automated and not saved with the project.
+const CHIP_H: f32 = 16.0;
+const CHIP_GAP: f32 = 4.0;
+const CHIP_PAD: f32 = 6.0;
+/// Rough advance width of the 9 px font used for the chip labels.
+const CHIP_CHAR_W: f32 = 5.4;
+const CHIP_MARGIN: f32 = 6.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Chip {
+    Freeze,
+    Tilt,
+    Range,
+    PreGain,
+}
+
+impl Chip {
+    /// Right-to-left on screen.
+    const ALL: [Chip; 4] = [Chip::Freeze, Chip::Tilt, Chip::Range, Chip::PreGain];
+
+    fn label(self, view: &SpectrumView) -> String {
+        match self {
+            Chip::Freeze => if view.frozen() { "Frozen" } else { "Freeze" }.to_string(),
+            Chip::Tilt => if view.tilted() { "Tilt on" } else { "Tilt" }.to_string(),
+            Chip::Range => format!("{:.0} dB", view.floor_db()),
+            Chip::PreGain => format!("Pre {:+.0}", view.pre_gain_db()),
+        }
+    }
+
+    /// Whether the chip should read as engaged. `Range` and `Pre` cycle
+    /// through values instead of toggling, so they are "engaged" whenever they
+    /// are off their default — a chip that looked dead while the display was
+    /// in its default range would be indistinguishable from a disabled one.
+    fn active(self, view: &SpectrumView) -> bool {
+        match self {
+            Chip::Freeze => view.frozen(),
+            Chip::Tilt => view.tilted(),
+            Chip::Range => {
+                view.floor_db()
+                    != crate::dsp::spectrum::DB_RANGES[crate::dsp::spectrum::DEFAULT_DB_RANGE]
+            }
+            Chip::PreGain => view.pre_gain_db() != 0.0,
+        }
+    }
+
+    /// What a click does: toggles for the two switches, a cycle for the two
+    /// selectors.
+    fn activate(self, view: &SpectrumView) {
+        match self {
+            Chip::Freeze => view.set_frozen(!view.frozen()),
+            Chip::Tilt => view.set_tilted(!view.tilted()),
+            Chip::Range => {
+                view.cycle_range();
+            }
+            Chip::PreGain => {
+                view.cycle_pre_gain();
+            }
+        }
+    }
+}
+
+/// Screen rectangles for the chips, laid out right-to-left from the top-right
+/// corner. Widths follow the label, so "Frozen" does not overlap "Tilt on".
+fn chip_rects(view: &SpectrumView, bounds: Rectangle) -> [(Chip, Rectangle); 4] {
+    let mut right = bounds.x + bounds.width - CHIP_MARGIN;
+    let y = bounds.y + CHIP_MARGIN;
+    let mut out = [(
+        Chip::Freeze,
+        Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+        },
+    ); 4];
+    for (slot, chip) in out.iter_mut().zip(Chip::ALL.iter().rev()) {
+        let width = chip.label(view).chars().count() as f32 * CHIP_CHAR_W + CHIP_PAD * 2.0;
+        *slot = (
+            *chip,
+            Rectangle {
+                x: right - width,
+                y,
+                width,
+                height: CHIP_H,
+            },
+        );
+        right -= width + CHIP_GAP;
+    }
+    out
+}
+
+/// The chip under `pos`, if any. Checked before the nodes so a chip is never
+/// shadowed by a band handle sitting underneath it.
+fn chip_at(pos: Point, view: &SpectrumView, bounds: Rectangle) -> Option<Chip> {
+    chip_rects(view, bounds)
+        .into_iter()
+        .find(|(_, rect)| rect.contains(pos))
+        .map(|(chip, _)| chip)
 }
 
 /// The gain a band's node is drawn and grabbed at.
@@ -137,11 +246,12 @@ struct GraphProgram {
     /// Undo history and A/B slots. The canvas owns the keyboard, so the undo
     /// shortcut lands here and is forwarded to the editor as a message.
     patch_state: Arc<std::sync::Mutex<crate::patch::PatchState>>,
-    /// Visually-smoothed spectrum bars, one vector per tap, shared lock-free
-    /// (GUI thread writes, same thread reads; atomic to satisfy Send+Sync on
-    /// the Arc).
-    smoothed_in: Vec<AtomicF32>,
-    smoothed_out: Vec<AtomicF32>,
+    /// Display ballistics + frozen frame, one per tap. GUI-thread only: the
+    /// audio thread publishes raw measurements and never holds display state.
+    /// `RefCell` because `GraphView` (and thus every `&self` method here) is
+    /// rebuilt each frame, so an `&mut self` field would not survive.
+    ballistics_in: RefCell<TraceBallistics>,
+    ballistics_out: RefCell<TraceBallistics>,
     /// Precomputed x position (0..1 across the graph) for every spectrum bin.
     /// The bin → frequency mapping never changes, so this saves a `powf` and a
     /// `log10` per bin per frame — 192 of them at 60 fps.
@@ -182,10 +292,12 @@ impl CachedLayers {
     /// Hash everything the cached layers are drawn from: the active bands'
     /// plain values, plus the canvas bounds (pixel mapping depends on both
     /// size and origin).
-    fn key_for(params: &FilterParams, bounds: Rectangle) -> u64 {
+    fn key_for(params: &FilterParams, bounds: Rectangle, tilted: bool) -> u64 {
         let mut h = DefaultHasher::new();
         let num_active = params.num_bands.value() as usize;
         num_active.hash(&mut h);
+        // The curve itself is tilted, so toggling the tilt invalidates it.
+        tilted.hash(&mut h);
         for i in 0..num_active {
             let bp = &params.band_params[i];
             bp.freq.value().to_bits().hash(&mut h);
@@ -388,16 +500,21 @@ impl GraphProgram {
 
     /// Update the smoothed spectrum from the ring and draw it as a filled
     /// area along the bottom of the graph (the INPUT signal).
+    ///
+    /// The input trace also carries the per-trace offset, so it can be lifted
+    /// or dropped out from under the post trace instead of disappearing beneath
+    /// it.
     fn draw_input_spectrum(&self, frame: &mut Frame, bounds: Rectangle) {
-        let mut db = [0.0f32; BINS];
-        self.smooth_spectrum(&self.taps.input, &self.smoothed_in, &mut db);
+        let offset = self.taps.view.pre_gain_db();
+        let db = self.shown_spectrum(&self.taps.input, &self.ballistics_in, offset);
+        let floor = self.taps.view.floor_db();
         let spec_x = self.spec_x.borrow();
 
         let mut path_pts: Vec<Point> = Vec::with_capacity(BINS + 2);
         path_pts.push(Point::new(bounds.x, bounds.y + bounds.height));
         for (i, &value) in db.iter().enumerate() {
             let x = bounds.x + spec_x[i] * bounds.width;
-            path_pts.push(Point::new(x, spectrum_y(bounds, value)));
+            path_pts.push(Point::new(x, spectrum_y(bounds, value, floor)));
         }
         // Close down to the bottom-right corner; the bottom-left corner is the
         // first point.
@@ -437,15 +554,15 @@ impl GraphProgram {
     /// information is the *gap* between them. A green fill plus an amber line
     /// answers "what did the EQ do" at a glance.
     fn draw_output_spectrum(&self, frame: &mut Frame, bounds: Rectangle) {
-        let mut db = [0.0f32; BINS];
-        self.smooth_spectrum(&self.taps.output, &self.smoothed_out, &mut db);
+        let db = self.shown_spectrum(&self.taps.output, &self.ballistics_out, 0.0);
+        let floor = self.taps.view.floor_db();
         let spec_x = self.spec_x.borrow();
 
         let line = Path::new(|p| {
             for (i, &value) in db.iter().enumerate() {
                 let pt = Point::new(
                     bounds.x + spec_x[i] * bounds.width,
-                    spectrum_y(bounds, value),
+                    spectrum_y(bounds, value, floor),
                 );
                 if i == 0 {
                     p.move_to(pt);
@@ -462,23 +579,29 @@ impl GraphProgram {
         );
     }
 
-    /// Advance one analyzer's ballistics and return the smoothed dB values.
+    /// Advance one trace's ballistics and return the dB values to draw.
     ///
-    /// Rise fast, fall slow — the classic analyzer response. Smoothing lives
-    /// here rather than in the analyzer so the audio thread never holds display
-    /// state and the two taps can decay independently.
-    fn smooth_spectrum(&self, ring: &SpectrumRing, smoothed: &[AtomicF32], out: &mut [f32; BINS]) {
-        const RISE: f32 = 0.55;
-        const FALL: f32 = 0.08;
+    /// Smoothing lives on the GUI side rather than in the analyzer so the audio
+    /// thread never holds display state and the two taps can decay
+    /// independently. `offset` shifts the trace in dB after smoothing: the
+    /// per-trace offset is a display preference and must not leak back into the
+    /// measurement.
+    fn shown_spectrum(
+        &self,
+        ring: &SpectrumRing,
+        ballistics: &RefCell<TraceBallistics>,
+        offset: f32,
+    ) -> [f32; BINS] {
         let latest: SpectrumFrame = ring.read_newest();
-        for (i, slot) in smoothed.iter().enumerate() {
-            let cur = slot.load(std::sync::atomic::Ordering::Relaxed);
-            let target = latest.db[i];
-            let k = if target > cur { RISE } else { FALL };
-            let next = cur + (target - cur) * k;
-            slot.store(next, std::sync::atomic::Ordering::Relaxed);
-            out[i] = next;
+        let frozen = self.taps.view.frozen();
+        let mut ballistics = ballistics.borrow_mut();
+        let mut db = ballistics.update(&latest.db, frozen);
+        if offset != 0.0 {
+            for value in db.iter_mut() {
+                *value += offset;
+            }
         }
+        db
     }
 
     fn draw_curve(&self, frame: &mut Frame, bounds: Rectangle) {
@@ -495,6 +618,12 @@ impl GraphProgram {
                 if spec.enabled {
                     db += band_response_db(spec, freq);
                 }
+            }
+            // The curve shares the spectrum's tilted reference, so a flat EQ
+            // still reads as "the post trace sits on the pre trace" at every
+            // frequency. Tilt here is the same `tilt_db` the analyzer applies.
+            if self.taps.view.tilted() {
+                db += tilt_db(freq, TILT_DB_PER_OCT);
             }
             combined.push(to_px(bounds, freq, db.clamp(-DB_MAX - 6.0, DB_MAX + 6.0)));
         }
@@ -646,6 +775,38 @@ impl GraphProgram {
         }
     }
 
+    /// Draw the display controls: freeze, tilt, range, pre-trace offset.
+    fn draw_spectrum_chips(&self, frame: &mut Frame, bounds: Rectangle) {
+        let view = &self.taps.view;
+        for (chip, rect) in chip_rects(view, bounds) {
+            let (bg, fg) = if chip.active(view) {
+                (
+                    Color::from_rgba(0.55, 0.75, 1.0, 0.85),
+                    Color::from_rgba(0.06, 0.06, 0.08, 1.0),
+                )
+            } else {
+                (
+                    Color::from_rgba(1.0, 1.0, 1.0, 0.08),
+                    Color::from_rgba(1.0, 1.0, 1.0, 0.55),
+                )
+            };
+            frame.fill(
+                &Path::rectangle(
+                    Point::new(rect.x, rect.y),
+                    Size::new(rect.width, rect.height),
+                ),
+                Fill::from(bg),
+            );
+            frame.fill_text(CanvasText {
+                content: chip.label(view),
+                position: Point::new(rect.x + CHIP_PAD, rect.y + 2.0),
+                color: fg,
+                size: 9.0,
+                ..CanvasText::default()
+            });
+        }
+    }
+
     fn draw(
         &self,
         bounds: Rectangle,
@@ -662,7 +823,7 @@ impl GraphProgram {
         // usually static — so keep those layers and rebuild them on change
         // only. Rebuilding cost the trig-heavy `band_response_db` up to 24 ×
         // 120 times per frame.
-        let key = CachedLayers::key_for(&self.params, bounds);
+        let key = CachedLayers::key_for(&self.params, bounds, self.taps.view.tilted());
         let mut cache = self.cache.borrow_mut();
         if !matches!(&*cache, Some(c) if c.key == key) {
             let mut grid_frame = Frame::new(bounds.size());
@@ -686,6 +847,10 @@ impl GraphProgram {
         }
         let mut nodes_frame = Frame::new(bounds.size());
         self.draw_nodes(&mut nodes_frame, bounds, hover, dragging, self.selected());
+        // On top of everything: a chip you cannot see is a chip you cannot
+        // click, and a band node sitting over it would make both unusable.
+        let mut chips_frame = Frame::new(bounds.size());
+        self.draw_spectrum_chips(&mut chips_frame, bounds);
 
         let cached = cache
             .as_ref()
@@ -696,6 +861,7 @@ impl GraphProgram {
             output_frame.into_geometry(),
             cached.curves.clone(),
             nodes_frame.into_geometry(),
+            chips_frame.into_geometry(),
         ]
     }
 }
@@ -747,8 +913,8 @@ impl Graph {
                     taps,
                     dyn_meters,
                     patch_state,
-                    smoothed_in: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
-                    smoothed_out: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
+                    ballistics_in: RefCell::new(TraceBallistics::new()),
+                    ballistics_out: RefCell::new(TraceBallistics::new()),
                     spec_x,
                     spec_rate,
                     cache: RefCell::new(None),
@@ -815,6 +981,11 @@ impl GraphView {
                 let Some(pos) = cursor.position_in(&bounds) else {
                     return (canvas::event::Status::Ignored, None);
                 };
+                // A chip wins over whatever is underneath it.
+                if let Some(chip) = chip_at(pos, &program.taps.view, bounds) {
+                    chip.activate(&program.taps.view);
+                    return (canvas::event::Status::Captured, None);
+                }
                 let num_active = program.params.num_bands.value() as usize;
                 let nodes = node_positions(&program.params, num_active, bounds);
                 match nearest_grabbable_node(pos.x, pos.y, &nodes) {
@@ -905,7 +1076,16 @@ impl GraphView {
                     let num_active = program.params.num_bands.value() as usize;
                     let nodes = node_positions(&program.params, num_active, bounds);
                     let new_hover =
-                        nearest_grabbable_node(local_x, local_y, &nodes).map(|hit| hit.band_index);
+                        if chip_at(Point::new(local_x, local_y), &program.taps.view, bounds)
+                            .is_some()
+                        {
+                            // No band highlight under a chip: it would suggest a
+                            // node is grabbable where the click goes to the chip.
+                            None
+                        } else {
+                            nearest_grabbable_node(local_x, local_y, &nodes)
+                                .map(|hit| hit.band_index)
+                        };
                     if new_hover != program.hover.get() {
                         program.hover.set(new_hover);
                     }
@@ -1120,6 +1300,12 @@ impl Program<Message> for GraphView {
             return nih_plug_iced::mouse::Interaction::Grabbing;
         }
 
+        // A chip is a button, not empty graph: a crosshair over it would say
+        // "a click here creates a band", which is exactly what it does not do.
+        if chip_at(pos, &self.program.taps.view, bounds).is_some() {
+            return nih_plug_iced::mouse::Interaction::Pointer;
+        }
+
         let num_active = self.program.params.num_bands.value() as usize;
         let nodes = node_positions(&self.program.params, num_active, bounds);
         match nearest_grabbable_node(pos.x, pos.y, &nodes) {
@@ -1160,6 +1346,10 @@ mod tests {
     const OUTPUT_SPECTRUM: usize = 2;
     const CURVES: usize = 3;
     const NODES: usize = 4;
+    const CHIPS: usize = 5;
+
+    /// The default display floor, as the range selector starts on it.
+    const FLOOR: f32 = crate::dsp::spectrum::DB_RANGES[crate::dsp::spectrum::DEFAULT_DB_RANGE];
 
     fn bounds() -> Rectangle {
         Rectangle {
@@ -1202,8 +1392,8 @@ mod tests {
             taps,
             dyn_meters: Arc::new(crate::dsp::dynamics::BandMeters::new()),
             patch_state,
-            smoothed_in: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
-            smoothed_out: (0..BINS).map(|_| AtomicF32::new(-90.0)).collect(),
+            ballistics_in: RefCell::new(TraceBallistics::new()),
+            ballistics_out: RefCell::new(TraceBallistics::new()),
             spec_x: RefCell::new(spectrum_bin_x(rate)),
             spec_rate: Cell::new(rate),
             cache: RefCell::new(None),
@@ -1349,7 +1539,7 @@ mod tests {
 
         // Grid | input spectrum | output spectrum | curves | nodes — the order
         // the renderer composites.
-        assert_eq!(layers.len(), 5, "expected five canvas layers");
+        assert_eq!(layers.len(), 6, "expected six canvas layers");
 
         let mut labels = Vec::new();
         texts(&layers[0].clone().into_primitive(), &mut labels);
@@ -1447,14 +1637,14 @@ mod tests {
         // And each must land where the dB→y mapping says, not merely in the
         // right order — this catches both curves being drawn from one tap.
         assert!(
-            (input_y - spectrum_y(b, 0.0)).abs() < 2.0,
+            (input_y - spectrum_y(b, 0.0, FLOOR)).abs() < 2.0,
             "input overlay is at y {input_y:.1}, expected {:.1}",
-            spectrum_y(b, 0.0)
+            spectrum_y(b, 0.0, FLOOR)
         );
         assert!(
-            (output_y - spectrum_y(b, -20.0)).abs() < 2.0,
+            (output_y - spectrum_y(b, -20.0, FLOOR)).abs() < 2.0,
             "output overlay is at y {output_y:.1}, expected {:.1}",
-            spectrum_y(b, -20.0)
+            spectrum_y(b, -20.0, FLOOR)
         );
     }
 
@@ -1470,7 +1660,7 @@ mod tests {
 
         // The layer stays in the list (indices are a render order contract)
         // but must be empty when the overlay is off.
-        assert_eq!(layers.len(), 5);
+        assert_eq!(layers.len(), 6);
         assert!(
             layer_vertices(&layers, OUTPUT_SPECTRUM).is_empty(),
             "output overlay was drawn although the parameter is off"
@@ -1666,26 +1856,29 @@ mod tests {
     #[test]
     fn cache_key_tracks_params_and_bounds() {
         let b = bounds();
-        let base =
-            CachedLayers::key_for(&test_params(&[(1_000.0, 12.0, 1.0, FilterType::Bell)]), b);
+        // The curve is tilted along with the spectrum, so the tilt is part of
+        // what the cached geometry depends on.
+        let key = |params: &FilterParams, b: Rectangle| CachedLayers::key_for(params, b, false);
+
+        let base = key(&test_params(&[(1_000.0, 12.0, 1.0, FilterType::Bell)]), b);
         assert_eq!(
             base,
-            CachedLayers::key_for(&test_params(&[(1_000.0, 12.0, 1.0, FilterType::Bell)]), b),
+            key(&test_params(&[(1_000.0, 12.0, 1.0, FilterType::Bell)]), b),
             "identical params must produce the same key"
         );
         assert_ne!(
             base,
-            CachedLayers::key_for(&test_params(&[(2_000.0, 12.0, 1.0, FilterType::Bell)]), b),
+            key(&test_params(&[(2_000.0, 12.0, 1.0, FilterType::Bell)]), b),
             "freq not tracked"
         );
         assert_ne!(
             base,
-            CachedLayers::key_for(&test_params(&[(1_000.0, 12.0, 3.0, FilterType::Bell)]), b),
+            key(&test_params(&[(1_000.0, 12.0, 3.0, FilterType::Bell)]), b),
             "q not tracked"
         );
         assert_ne!(
             base,
-            CachedLayers::key_for(
+            key(
                 &test_params(&[(1_000.0, 12.0, 1.0, FilterType::LowShelf)]),
                 b
             ),
@@ -1700,7 +1893,8 @@ mod tests {
                     FilterType::LowCut,
                     crate::Slope::Db12
                 )]),
-                b
+                b,
+                false
             ),
             CachedLayers::key_for(
                 &crate::test_support::test_params_with_slopes(&[(
@@ -1710,21 +1904,27 @@ mod tests {
                     FilterType::LowCut,
                     crate::Slope::Db48
                 )]),
-                b
+                b,
+                false
             ),
             "cut slope not tracked — the drawn curve would go stale"
         );
+        assert_ne!(base, key(&test_params(&[]), b), "band count not tracked");
         assert_ne!(
             base,
-            CachedLayers::key_for(&test_params(&[]), b),
-            "band count not tracked"
+            CachedLayers::key_for(
+                &test_params(&[(1_000.0, 12.0, 1.0, FilterType::Bell)]),
+                b,
+                true
+            ),
+            "tilt not tracked — the tilted curve would be drawn from a cached flat one"
         );
 
         let mut resized = b;
         resized.width += 1.0;
         assert_ne!(
             base,
-            CachedLayers::key_for(
+            key(
                 &test_params(&[(1_000.0, 12.0, 1.0, FilterType::Bell)]),
                 resized
             ),
@@ -2413,6 +2613,290 @@ mod tests {
             crate::Slope::from_i32(program.params.band_params[0].slope.value()),
             crate::Slope::DEFAULT,
             "scrolling a bell must not change the slope"
+        );
+    }
+
+    // ==== spectrum display controls =====================================
+
+    /// Centre of a chip, laid out exactly as the canvas lays it out.
+    fn chip_center(view: &SpectrumView, chip: Chip) -> (f32, f32) {
+        let (_, rect) = chip_rects(view, bounds())
+            .into_iter()
+            .find(|(c, _)| *c == chip)
+            .expect("every chip has a rectangle");
+        (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+    }
+
+    #[test]
+    fn the_chips_are_drawn_with_their_labels() {
+        let program = test_program(&[]);
+        let layers = program.draw(bounds(), None, None);
+        let mut labels = Vec::new();
+        texts(&layers[CHIPS].clone().into_primitive(), &mut labels);
+
+        for expected in ["Freeze", "Tilt", "-90 dB", "Pre +0"] {
+            assert!(
+                labels.iter().any(|l| l == expected),
+                "chip {expected} is not drawn; got {labels:?}"
+            );
+        }
+        assert!(
+            !layer_vertices(&layers, CHIPS).is_empty(),
+            "chips drew text but no background geometry"
+        );
+    }
+
+    #[test]
+    fn the_chips_fit_in_the_corner_without_overlapping() {
+        // The chip widths follow their labels, which change as the state does
+        // ("Tilt" -> "Tilt on", "-90 dB" -> "-120 dB"), so this has to hold for
+        // every combination of states rather than for the default one.
+        let view = SpectrumView::new();
+        let b = bounds();
+        for frozen in [false, true] {
+            for tilted in [false, true] {
+                for _ in crate::dsp::spectrum::DB_RANGES {
+                    view.set_frozen(frozen);
+                    view.set_tilted(tilted);
+                    let rects = chip_rects(&view, b);
+                    for (chip, rect) in rects {
+                        assert!(
+                            rect.x >= b.x && rect.x + rect.width <= b.x + b.width,
+                            "{chip:?} ({}) leaves the canvas: {rect:?}",
+                            chip.label(&view)
+                        );
+                        assert!(
+                            rect.y >= b.y && rect.y + rect.height <= b.y + b.height,
+                            "{chip:?} leaves the canvas vertically: {rect:?}"
+                        );
+                    }
+                    // Right-to-left layout: each chip must end before the next
+                    // one starts, leaving the gap between them.
+                    let mut left_of = f32::INFINITY;
+                    for (chip, rect) in rects {
+                        assert!(
+                            rect.x + rect.width <= left_of,
+                            "{chip:?} overlaps its neighbour ({rect:?})"
+                        );
+                        left_of = rect.x;
+                    }
+                    view.cycle_range();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_the_freeze_chip_holds_the_frame() {
+        let taps = Arc::new(SpectrumTaps::new());
+        taps.input.publish(frame(-20.0, 1));
+        #[allow(clippy::arc_with_non_send_sync)]
+        let program = Arc::new(test_program_with_taps(
+            test_params(&[]),
+            Arc::new(NullGuiContext),
+            taps.clone(),
+        ));
+        let view = GraphView {
+            program: program.clone(),
+        };
+        let b = bounds();
+        let (x, y) = chip_center(&taps.view, Chip::Freeze);
+
+        assert!(!taps.view.frozen());
+        assert_eq!(
+            click_at(&view, b, x, y, mouse::Button::Left),
+            canvas::event::Status::Captured,
+            "the chip must consume the click"
+        );
+        assert!(taps.view.frozen());
+
+        // A click on the chip must not also create a band behind it.
+        assert_eq!(
+            program.params.num_bands.value(),
+            0,
+            "clicking a chip created a band"
+        );
+
+        // Freeze the picture at -20 dB, then let audio drop away: the drawn
+        // trace must stay where it was.
+        let frozen_y = top_y(&program.draw(b, None, None), INPUT_SPECTRUM);
+        taps.input.publish(frame(-80.0, 2));
+        for _ in 0..10 {
+            program.draw(b, None, None);
+        }
+        let held_y = top_y(&program.draw(b, None, None), INPUT_SPECTRUM);
+        assert!(
+            (held_y - frozen_y).abs() < 0.5,
+            "frozen trace moved from {frozen_y:.1} to {held_y:.1}"
+        );
+
+        // Clicking again releases it, and the trace follows the new level.
+        click_at(&view, b, x, y, mouse::Button::Left);
+        assert!(!taps.view.frozen());
+        let mut after = held_y;
+        for _ in 0..20 {
+            after = top_y(&program.draw(b, None, None), INPUT_SPECTRUM);
+        }
+        assert!(
+            after > held_y + 5.0,
+            "-80 dB should draw lower than -20 dB ({held_y:.1} -> {after:.1})"
+        );
+    }
+
+    #[test]
+    fn clicking_the_range_chip_walks_the_floors() {
+        let taps = Arc::new(SpectrumTaps::new());
+        #[allow(clippy::arc_with_non_send_sync)]
+        let program = Arc::new(test_program_with_taps(
+            test_params(&[]),
+            Arc::new(NullGuiContext),
+            taps.clone(),
+        ));
+        let view = GraphView { program };
+        let b = bounds();
+
+        let start = taps.view.floor_db();
+        let (x, y) = chip_center(&taps.view, Chip::Range);
+        click_at(&view, b, x, y, mouse::Button::Left);
+        let next = taps.view.floor_db();
+        assert_ne!(next, start, "the range chip did not change the floor");
+        assert!(
+            crate::dsp::spectrum::DB_RANGES.contains(&next),
+            "{next} is not one of the offered ranges"
+        );
+
+        // The label follows the state, so the button says what it will do.
+        let mut labels = Vec::new();
+        texts(
+            &view.program.draw(b, None, None)[CHIPS]
+                .clone()
+                .into_primitive(),
+            &mut labels,
+        );
+        assert!(
+            labels.iter().any(|l| l == &format!("{next:.0} dB")),
+            "chip still shows the old range: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_deeper_range_maps_the_same_level_higher() {
+        // The top of the display is pinned at 0 dB, so widening the range to
+        // -120 dB pushes the floor down rather than rescaling the signal: a
+        // given level ends up higher up the canvas, with more room beneath it.
+        let b = bounds();
+        let quiet = -80.0;
+        let shallow = spectrum_y(b, quiet, -60.0);
+        let deep = spectrum_y(b, quiet, -120.0);
+        assert!(
+            deep < shallow,
+            "-80 dB should sit higher on a -120 dB scale ({deep:.1}) than on a \
+             -60 dB one, where it is already below the floor ({shallow:.1})"
+        );
+        assert!(
+            (spectrum_y(b, 0.0, -120.0) - spectrum_y(b, 0.0, -60.0)).abs() < 0.01,
+            "0 dB must not move when the range changes"
+        );
+        // The floor always lands exactly on the bottom edge, for every range.
+        for floor in crate::dsp::spectrum::DB_RANGES {
+            assert!((spectrum_y(b, floor, floor) - (b.y + b.height)).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn the_pre_offset_moves_the_input_trace_only() {
+        let taps = Arc::new(SpectrumTaps::new());
+        taps.input.publish(frame(0.0, 1));
+        taps.output.publish(frame(-20.0, 1));
+        let taps_for_program = taps.clone();
+        #[allow(clippy::arc_with_non_send_sync)]
+        let program = Arc::new(test_program_with_taps(
+            test_params(&[]),
+            Arc::new(NullGuiContext),
+            taps_for_program,
+        ));
+        let view = GraphView {
+            program: program.clone(),
+        };
+        let b = bounds();
+
+        let before = program.draw(b, None, None);
+        let input_before = top_y(&before, INPUT_SPECTRUM);
+        let output_before = top_y(&before, OUTPUT_SPECTRUM);
+
+        // Two steps: 0 -> -6 -> -12 dB.
+        let (x, y) = chip_center(&taps.view, Chip::PreGain);
+        click_at(&view, b, x, y, mouse::Button::Left);
+        click_at(&view, b, x, y, mouse::Button::Left);
+        assert_eq!(taps.view.pre_gain_db(), -12.0);
+
+        let after = program.draw(b, None, None);
+        let input_after = top_y(&after, INPUT_SPECTRUM);
+        let output_after = top_y(&after, OUTPUT_SPECTRUM);
+
+        let expected = spectrum_y(b, -12.0, taps.view.floor_db());
+        assert!(
+            (input_after - expected).abs() < 1.0,
+            "input trace should be drawn at -12 dB (y {expected:.1}), got {input_after:.1}"
+        );
+        assert!(
+            input_after > input_before,
+            "a negative offset must move the input trace down"
+        );
+        assert!(
+            (output_after - output_before).abs() < 0.5,
+            "the pre-gain offset must not move the post trace"
+        );
+    }
+
+    #[test]
+    fn tilt_tilts_the_drawn_curve_with_the_spectrum() {
+        // A flat EQ under tilt is no longer a flat line: the curve shares the
+        // spectrum's reference, so it rises with it. If it did not, a flat EQ
+        // would appear to be cutting the top end by 19 dB.
+        let taps = Arc::new(SpectrumTaps::new());
+        #[allow(clippy::arc_with_non_send_sync)]
+        let program = Arc::new(test_program_with_taps(
+            test_params(&[]),
+            Arc::new(NullGuiContext),
+            taps.clone(),
+        ));
+        let view = GraphView {
+            program: program.clone(),
+        };
+        let b = bounds();
+
+        let y_at = |program: &GraphProgram, hz: f32| {
+            let layers = program.draw(b, None, None);
+            let want_x = b.x + freq_to_x(hz) * b.width;
+            layer_vertices(&layers, CURVES)
+                .iter()
+                .filter(|v| (v[0] - want_x).abs() < 3.0)
+                .map(|v| v[1])
+                .fold(f32::INFINITY, f32::min)
+        };
+
+        let flat_low = y_at(&program, 1_000.0);
+        let flat_high = y_at(&program, 10_000.0);
+        assert!(
+            (flat_low - flat_high).abs() < 2.0,
+            "a flat EQ should draw flat before tilt ({flat_low:.1} vs {flat_high:.1})"
+        );
+
+        let (x, y) = chip_center(&taps.view, Chip::Tilt);
+        click_at(&view, b, x, y, mouse::Button::Left);
+        assert!(taps.view.tilted());
+
+        let tilted_low = y_at(&program, 1_000.0);
+        let tilted_high = y_at(&program, 10_000.0);
+        // The tilt pivots at 1 kHz: that point must not move.
+        assert!(
+            (tilted_low - flat_low).abs() < 2.0,
+            "the tilt pivot moved from {flat_low:.1} to {tilted_low:.1}"
+        );
+        assert!(
+            tilted_high < flat_high - 10.0,
+            "10 kHz should rise under tilt: {flat_high:.1} -> {tilted_high:.1}"
         );
     }
 }
