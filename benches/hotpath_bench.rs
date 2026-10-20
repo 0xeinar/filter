@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use filter::dsp::dynamics::{dynamic_gain_db, Detector};
+use filter::dsp::oversample::Oversampler;
 use filter::dsp::spectrum::{SpectrumAnalyzer, SpectrumRing};
 use filter::dsp::BiquadFilter;
 use filter::FilterType;
@@ -207,4 +208,31 @@ fn main() {
         per_update / SUB as f64 * 1e9,
         (per_sample_detector + per_update / SUB as f64) * 1e9
     );
+
+    // (h) the resampler pair, per host sample, both channels. This is the whole
+    // price of oversampling: the cascade inside it costs the same per
+    // oversampled sample as it does at 1x, so the factor multiplies lines (c)-(e).
+    for factor in [2usize, 4] {
+        let mut os = Oversampler::new();
+        os.set_factor(factor);
+        let mut up_buf = vec![0.0f32; SUB * 4];
+        let mut down_buf = vec![0.0f32; SUB];
+        let t = Instant::now();
+        let mut n = 0usize;
+        for chunk in input.chunks(SUB) {
+            let os_len = chunk.len() * factor;
+            for channel in 0..2 {
+                os.upsample(channel, chunk, &mut up_buf[..os_len]);
+                os.downsample(channel, &up_buf[..os_len], &mut down_buf[..chunk.len()]);
+            }
+            black_box(&down_buf);
+            n += chunk.len();
+        }
+        let per_sample = t.elapsed().as_secs_f64() / n as f64;
+        println!(
+            "(h) resampler, 2 channels at {factor}x:        {:>7.2} ns/sample   {:>6.2}% CPU",
+            per_sample * 1e9,
+            cpu(per_sample)
+        );
+    }
 }
