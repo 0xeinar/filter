@@ -195,6 +195,27 @@ pub struct FilterParams {
     pub band_params: [BandParams; MAX_BANDS],
 }
 
+/// Feed one analyzer tap from a host buffer.
+///
+/// Stereo goes through `push_stereo_block`, which averages the two channels'
+/// **power** spectra; a mono layout is pushed as-is. Both taps share this so
+/// the pre- and post-EQ pictures are computed the same way — the earlier code
+/// took channel 0 for both, so a boost on the right channel was invisible and a
+/// hard-panned sound read as silence.
+fn push_analyzer_block(
+    analyzer: &mut dsp::spectrum::SpectrumAnalyzer,
+    taps: &dsp::spectrum::SpectrumTaps,
+    is_output: bool,
+    channels: &mut [&mut [f32]],
+) {
+    let ring = if is_output { &taps.output } else { &taps.input };
+    match channels {
+        [left, right, ..] => analyzer.push_stereo_block(ring, left, right),
+        [only] => analyzer.push_block(ring, only),
+        [] => {}
+    }
+}
+
 /// Map the param (0/1/2) to a factor (1/2/4).
 fn oversampling_factor(params: &FilterParams) -> usize {
     match params.oversampling.value() {
@@ -674,6 +695,9 @@ impl Plugin for Filter {
         self.bypass_mix
             .reset(if self.params.bypass.value() { 1.0 } else { 0.0 });
         self.comp_dirty = true;
+        // The GUI labels its frequency axis from this; a stale rate would put
+        // every label at the wrong frequency.
+        self.spectrum_taps.set_sample_rate(self.sample_rate);
         self.spectrum_analyzer_in = Some(dsp::spectrum::SpectrumAnalyzer::new(self.sample_rate));
         self.spectrum_analyzer_out = Some(dsp::spectrum::SpectrumAnalyzer::new(self.sample_rate));
 
@@ -733,15 +757,8 @@ impl Plugin for Filter {
         // Editor-open check: skip the FFT entirely when the GUI is closed.
         let editor_open = self.params.editor_state.is_open();
         if editor_open {
-            if let (Some(analyzer), Some(first_channel)) = (
-                self.spectrum_analyzer_in.as_mut(),
-                buffer.as_slice().first(),
-            ) {
-                // Safety: nih-plug guarantees the buffer callback runs on the
-                // audio thread with no allocator use in our code below.
-                // as_slice borrows for this block only.
-                let samples: &[f32] = first_channel;
-                analyzer.push_block(&self.spectrum_taps.input, samples);
+            if let Some(analyzer) = self.spectrum_analyzer_in.as_mut() {
+                push_analyzer_block(analyzer, &self.spectrum_taps, false, buffer.as_slice());
             }
         }
 
@@ -1091,12 +1108,8 @@ impl Plugin for Filter {
         // second analyzer measures 0.22% of a core (benches/hotpath_bench.rs),
         // which is not worth a visible artifact.
         if editor_open {
-            if let (Some(analyzer), Some(first_channel)) = (
-                self.spectrum_analyzer_out.as_mut(),
-                buffer.as_slice().first(),
-            ) {
-                let samples: &[f32] = first_channel;
-                analyzer.push_block(&self.spectrum_taps.output, samples);
+            if let Some(analyzer) = self.spectrum_analyzer_out.as_mut() {
+                push_analyzer_block(analyzer, &self.spectrum_taps, true, buffer.as_slice());
             }
         }
 

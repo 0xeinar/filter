@@ -188,6 +188,19 @@ fn main() {
     black_box(&analyzer);
     let per_sample_analyzer = t2.elapsed().as_secs_f64() / n2 as f64;
 
+    // (f2) stereo analysis: two transforms and a power sum per frame, which is
+    // what the taps now do. Paid only while the editor is open.
+    let ring2 = SpectrumRing::new();
+    let mut stereo_analyzer = SpectrumAnalyzer::new(SR);
+    let t4 = Instant::now();
+    let mut n4 = 0usize;
+    for chunk in input.chunks(BLOCK) {
+        stereo_analyzer.push_stereo_block(&ring2, chunk, chunk);
+        n4 += chunk.len();
+    }
+    black_box(&stereo_analyzer);
+    let per_sample_stereo = t4.elapsed().as_secs_f64() / n4 as f64;
+
     println!(
         "    -> (a) -> (d): {:.1}x   (a) -> (e): {:.1}x",
         per_sample_prefix / per_sample_sub,
@@ -197,6 +210,11 @@ fn main() {
         "(f) one analyzer, per sample:           {:>7.2} ns/sample   {:>6.2}% CPU",
         per_sample_analyzer * 1e9,
         cpu(per_sample_analyzer)
+    );
+    println!(
+        "(f2) one analyzer, stereo per sample:   {:>7.2} ns/sample   {:>6.2}% CPU",
+        per_sample_stereo * 1e9,
+        cpu(per_sample_stereo)
     );
     println!(
         "(g) one dynamic band's detector:        {:>7.2} ns/sample   {:>6.2}% CPU",
