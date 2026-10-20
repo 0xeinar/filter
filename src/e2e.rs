@@ -52,6 +52,9 @@ impl Harness {
             Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             Arc::new(SpectrumTaps::new()),
             Arc::new(crate::dsp::dynamics::BandMeters::new()),
+            Arc::new(std::sync::Mutex::new(crate::patch::PatchState::new(
+                &params,
+            ))),
             Arc::new(AtomicUsize::new(selection::NONE)),
         );
         Self {
@@ -272,6 +275,9 @@ fn dragging_a_cut_changes_frequency_and_leaves_gain_alone() {
         Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
         Arc::new(SpectrumTaps::new()),
         Arc::new(crate::dsp::dynamics::BandMeters::new()),
+        Arc::new(std::sync::Mutex::new(crate::patch::PatchState::new(
+            &params,
+        ))),
         Arc::new(AtomicUsize::new(selection::NONE)),
     );
     let h = Harness {

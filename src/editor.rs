@@ -3,10 +3,12 @@ use nih_plug::prelude::{util, Editor, GuiContext, ParamSetter};
 use nih_plug_iced::widgets as nih_widgets;
 use nih_plug_iced::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::dsp::dynamics::BandMeters;
 use crate::dsp::spectrum::SpectrumTaps;
+use crate::patch::PatchState;
 use crate::ui;
 use crate::ui::selection;
 use crate::FilterParams;
@@ -58,11 +60,12 @@ pub fn create(
     peak_meter: Arc<AtomicF32>,
     spectrum_taps: Arc<SpectrumTaps>,
     dyn_meters: Arc<BandMeters>,
+    patch_state: Arc<Mutex<PatchState>>,
     editor_state: Arc<IcedState>,
 ) -> Option<Box<dyn Editor>> {
     create_iced_editor::<FilterEditor>(
         editor_state,
-        (params, peak_meter, spectrum_taps, dyn_meters),
+        (params, peak_meter, spectrum_taps, dyn_meters, patch_state),
     )
 }
 
@@ -128,6 +131,62 @@ struct ChipStyle {
     enabled: bool,
 }
 
+/// The A/B slot buttons: filled when live, outlined when not.
+struct SlotStyle {
+    active: bool,
+}
+
+impl button::StyleSheet for SlotStyle {
+    fn active(&self) -> button::Style {
+        let (bg_alpha, border_alpha, text_alpha) = if self.active {
+            (0.85, 1.0, 1.0)
+        } else {
+            (0.10, 0.25, 0.75)
+        };
+        button::Style {
+            shadow_offset: Vector::default(),
+            background: Some(Background::Color(Color {
+                r: 0.55,
+                g: 0.75,
+                b: 1.0,
+                a: bg_alpha,
+            })),
+            border_radius: 3.0,
+            border_width: 1.0,
+            border_color: Color {
+                r: 0.55,
+                g: 0.75,
+                b: 1.0,
+                a: border_alpha,
+            },
+            // A filled slot needs a dark digit to stay readable.
+            text_color: if self.active {
+                Color {
+                    r: 0.06,
+                    g: 0.06,
+                    b: 0.08,
+                    a: 1.0,
+                }
+            } else {
+                Color {
+                    r: 0.75,
+                    g: 0.85,
+                    b: 1.0,
+                    a: text_alpha,
+                }
+            },
+        }
+    }
+
+    fn hovered(&self) -> button::Style {
+        let active = self.active();
+        button::Style {
+            border_width: 1.5,
+            ..active
+        }
+    }
+}
+
 impl button::StyleSheet for ChipStyle {
     fn active(&self) -> button::Style {
         let (bg_alpha, border_alpha, text_alpha) = if self.selected {
@@ -183,6 +242,12 @@ struct FilterEditor {
     /// Live dynamic gain per band, so the DYN row can show what the band is
     /// applying right now rather than only its ceiling.
     dyn_meters: Arc<BandMeters>,
+    /// Undo/redo history and the A/B pair. Shared with the canvas, which owns
+    /// the keyboard and therefore the shortcut.
+    patch_state: Arc<Mutex<PatchState>>,
+    slot_a_state: std::cell::UnsafeCell<button::State>,
+    slot_b_state: std::cell::UnsafeCell<button::State>,
+    slot_copy_state: std::cell::UnsafeCell<button::State>,
     graph: ui::Graph,
     /// Shared with the graph: one of the editor's few pieces of state that
     /// is not a host parameter.
@@ -285,6 +350,14 @@ pub enum Message {
     PostSpectrumToggled(bool),
     /// Band `index` enabled/disabled its dynamics.
     DynamicsToggled(usize, bool),
+    /// Step back one edit.
+    Undo,
+    /// Step forward again.
+    Redo,
+    /// Switch to A/B slot `index`.
+    SwitchSlot(usize),
+    /// Copy the live state into the other slot.
+    CopySlot,
 }
 
 impl FilterEditor {
@@ -306,6 +379,13 @@ impl FilterEditor {
         setter.set_parameter(param, slope as i32);
         setter.end_set_parameter(param);
         Command::none()
+    }
+
+    /// Lock the shared history without a poisoned-lock panic bricking the GUI.
+    fn patch_state_mut(&self) -> std::sync::MutexGuard<'_, PatchState> {
+        self.patch_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Enable/disable a band's dynamics as a single automation gesture, so the
@@ -338,10 +418,11 @@ impl IcedEditor for FilterEditor {
         Arc<AtomicF32>,
         Arc<SpectrumTaps>,
         Arc<BandMeters>,
+        Arc<Mutex<PatchState>>,
     );
 
     fn new(
-        (params, peak_meter, spectrum_taps, dyn_meters): Self::InitializationFlags,
+        (params, peak_meter, spectrum_taps, dyn_meters, patch_state): Self::InitializationFlags,
         context: Arc<dyn GuiContext>,
     ) -> (Self, Command<Self::Message>) {
         let selection = Arc::new(AtomicUsize::new(selection::NONE));
@@ -351,6 +432,7 @@ impl IcedEditor for FilterEditor {
             peak_meter.clone(),
             spectrum_taps,
             dyn_meters.clone(),
+            patch_state.clone(),
             selection.clone(),
         );
         let editor = FilterEditor {
@@ -358,6 +440,10 @@ impl IcedEditor for FilterEditor {
             context,
             peak_meter,
             dyn_meters,
+            patch_state,
+            slot_a_state: std::cell::UnsafeCell::new(button::State::new()),
+            slot_b_state: std::cell::UnsafeCell::new(button::State::new()),
+            slot_copy_state: std::cell::UnsafeCell::new(button::State::new()),
             graph,
             selection,
             num_bands_slider_state: Default::default(),
@@ -433,6 +519,28 @@ impl IcedEditor for FilterEditor {
             Message::DynamicsToggled(index, on) => {
                 let _ = self.set_band_dynamics(index, on);
             }
+            Message::Undo => {
+                self.patch_state_mut()
+                    .undo(&self.params, self.context.as_ref());
+            }
+            Message::Redo => {
+                self.patch_state_mut()
+                    .redo(&self.params, self.context.as_ref());
+            }
+            Message::SwitchSlot(index) => {
+                // Bound the lock to a statement: holding a guard across the
+                // `if` body and then locking again would deadlock the GUI.
+                let active = self.patch_state_mut().ab.active();
+                // Clicking the slot you are already in does nothing: switching
+                // to yourself would just rewrite the same values.
+                if active != index.min(1) {
+                    self.patch_state_mut()
+                        .toggle_slot(&self.params, self.context.as_ref());
+                }
+            }
+            Message::CopySlot => {
+                self.patch_state_mut().copy_slot(&self.params);
+            }
             Message::PostSpectrumToggled(on) => {
                 let param = &self.params.spectrum_post;
                 let setter = ParamSetter::new(self.context.as_ref());
@@ -445,9 +553,16 @@ impl IcedEditor for FilterEditor {
     fn view(&mut self) -> Element<'_, Self::Message> {
         use nih_plug_iced::{Alignment, Column, Length, Row, Text};
 
+        // Undo granularity is decided here: nih-plug redraws every frame, so
+        // watching the parameters once per frame catches edits from every path
+        // — canvas drags, panel sliders, host automation, a second editor — and
+        // a drag settles into a single step once it stops moving.
+        self.patch_state_mut().observe(&self.params, Instant::now());
+
         let num_bands = self.params.num_bands.value() as usize;
         let selected = self.selected(num_bands);
 
+        let slot_active = self.patch_state_mut().ab.active();
         let header = Row::new()
             .height(Length::Units(HEADER_H))
             .spacing(10)
@@ -478,7 +593,51 @@ impl IcedEditor for FilterEditor {
                 .height(Length::Units(22))
                 .map(Message::ParamUpdate),
             )
-            .push(Column::new().width(Length::Fill))
+            .push({
+                // A/B slots. Clicking the inactive letter switches to it; the
+                // arrow copies the live state into the other slot without
+                // switching, which is how you make B from A and then edit it.
+                let copy_label = if slot_active == 0 { "A>B" } else { "B>A" };
+                // Safety: view() is called once per frame and each state is
+                // touched once here.
+                let slot_a = button::Button::new(
+                    unsafe { &mut *self.slot_a_state.get() },
+                    Text::new("A").size(11),
+                )
+                .width(Length::Units(22))
+                .height(Length::Units(20))
+                .padding(0)
+                .style(SlotStyle {
+                    active: slot_active == 0,
+                })
+                .on_press(Message::SwitchSlot(0));
+                let slot_b = button::Button::new(
+                    unsafe { &mut *self.slot_b_state.get() },
+                    Text::new("B").size(11),
+                )
+                .width(Length::Units(22))
+                .height(Length::Units(20))
+                .padding(0)
+                .style(SlotStyle {
+                    active: slot_active == 1,
+                })
+                .on_press(Message::SwitchSlot(1));
+                let slot_copy = button::Button::new(
+                    unsafe { &mut *self.slot_copy_state.get() },
+                    Text::new(copy_label).size(10),
+                )
+                .width(Length::Units(34))
+                .height(Length::Units(20))
+                .padding(0)
+                .style(SlotStyle { active: false })
+                .on_press(Message::CopySlot);
+                Row::new()
+                    .spacing(3)
+                    .align_items(Alignment::Center)
+                    .push(slot_a)
+                    .push(slot_b)
+                    .push(slot_copy)
+            })
             .push(Text::new("Post").size(11).color(colors::TEXT_DIM))
             .push(
                 Toggler::new(
@@ -823,11 +982,13 @@ mod tests {
     ) -> (FilterEditor, Arc<RecordingGuiContext>) {
         let params = test_params(bands);
         let context = Arc::new(RecordingGuiContext::default());
+        let patch_state = Arc::new(std::sync::Mutex::new(PatchState::new(&params)));
         let flags = (
             params,
             Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             Arc::new(SpectrumTaps::new()),
             Arc::new(BandMeters::new()),
+            patch_state,
         );
         #[allow(clippy::arc_with_non_send_sync)]
         let ctx: Arc<dyn GuiContext> = context.clone();
@@ -838,11 +999,13 @@ mod tests {
     /// An editor over params the caller built, with band 0 selected.
     fn editor_over(params: Arc<FilterParams>) -> FilterEditor {
         let context = Arc::new(RecordingGuiContext::default());
+        let patch_state = Arc::new(std::sync::Mutex::new(PatchState::new(&params)));
         let flags = (
             params,
             Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             Arc::new(SpectrumTaps::new()),
             Arc::new(BandMeters::new()),
+            patch_state,
         );
         #[allow(clippy::arc_with_non_send_sync)]
         let ctx: Arc<dyn GuiContext> = context;
@@ -889,11 +1052,13 @@ mod tests {
             })
             .collect();
         let params = test_params(&bands);
+        let patch_state = Arc::new(std::sync::Mutex::new(PatchState::new(&params)));
         let flags = (
             params,
             Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             Arc::new(SpectrumTaps::new()),
             Arc::new(BandMeters::new()),
+            patch_state,
         );
         #[allow(clippy::arc_with_non_send_sync)]
         let ctx: Arc<dyn GuiContext> = Arc::new(NullGuiContext);

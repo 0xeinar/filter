@@ -7,6 +7,7 @@ pub mod dsp;
 #[cfg(test)]
 mod e2e;
 mod editor;
+pub mod patch;
 #[cfg(test)]
 mod test_support;
 pub mod ui;
@@ -65,6 +66,8 @@ pub struct Filter {
     band_dyn: [bool; MAX_BANDS],
     /// Live dynamic gain per band, for the GUI readout.
     dyn_meters: Arc<dsp::dynamics::BandMeters>,
+    /// Undo/redo history and the A/B pair (GUI-thread only).
+    patch_state: Arc<std::sync::Mutex<patch::PatchState>>,
 }
 
 /// Maximum audio channels the plugin processes (stereo layout + mono).
@@ -461,8 +464,11 @@ impl Default for BandParams {
 
 impl Default for Filter {
     fn default() -> Self {
+        // Built first so the patch history can start from the initial state.
+        let params = Arc::new(FilterParams::default());
         Self {
-            params: Arc::new(FilterParams::default()),
+            patch_state: Arc::new(std::sync::Mutex::new(patch::PatchState::new(&params))),
+            params,
             peak_meter_decay_weight: 1.0,
             peak_meter: Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             band_coeffs: core::array::from_fn(|_| {
@@ -564,6 +570,7 @@ impl Plugin for Filter {
             self.peak_meter.clone(),
             self.spectrum_taps.clone(),
             self.dyn_meters.clone(),
+            self.patch_state.clone(),
             self.params.editor_state.clone(),
         )
     }
