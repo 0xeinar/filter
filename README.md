@@ -11,7 +11,9 @@ A surgical parametric EQ plugin built in Rust. Inspired by FabFilter Pro-Q — d
 - **Dark themed GUI** — FabFilter-style aesthetic, colored band labels
 - **CLAP + VST3** — works in Ableton, Bitwig, Reaper, FL Studio
 - **Sample-accurate automation**
+- **Dynamic EQ** — any gain type can follow the level inside its own band
 - **Output stage** — ±24 dB trim, pink-weighted auto-gain, click-free bypass
+- **Spectrum** — input and post-EQ traces overlaid, so the curve is visible in the signal
 
 ### Auto-gain
 
@@ -44,6 +46,30 @@ independently-derived reference.
 Gain and Q are ignored on cuts rather than silently doing nothing: the panel
 shows a slope picker instead of those sliders, the node sits on the 0 dB line
 where the curve starts, and scrolling it steps the slope.
+
+## Dynamics
+
+Any band with a gain can be made dynamic. The gain knob becomes the **maximum**
+change, and the band is inert until the level inside it exceeds the threshold:
+
+| Control | Meaning |
+|---|---|
+| Threshold | level inside the band, dBFS, where the gain starts to apply |
+| Range | how many dB above the threshold it takes to reach the full gain |
+| Attack / Release | how fast the detector follows the signal (63% in the stated time) |
+
+The band listens through a band-pass at **its own frequency and Q**, so a narrow
+bell is triggered by a narrow slice of spectrum and a loud tone elsewhere does
+not open it. Detection runs on the linked signal (the louder channel) and one
+gain feeds both channels, so a reduction cannot move the phantom centre.
+
+Because the gain depends on the signal, the drawn curve shows the *static*
+maximum; the panel marks a dynamic band with `DYN` so the difference is not
+silent. `tests/dynamic_eq.rs` drives the detector, the gain law and a biquad in
+the same 16-sample shape the audio loop uses, and measures real levels: a
+−10 dBFS tone through a −12 dB band at −30 dB threshold comes out at −22 dBFS,
+the same band passes a −45 dBFS tone untouched, and an 8 kHz tone does not open
+a 1 kHz band at all.
 
 ## Layout
 
@@ -115,8 +141,10 @@ Rescan plugins in your DAW after copying.
 # Run all tests
 cargo test
 
-# 156 tests:
-#  129 unit tests — biquad coefficients, frequency response, stability,
+# 180 tests:
+#  145 unit tests — biquad coefficients, frequency response, stability,
+#                   dynamic-EQ detector (ballistics, selectivity, threshold
+#                   law, stability),
 #                   response-curve math (log mapping, combined EQ response),
 #                   per-channel state independence, band selection and
 #                   delete-compaction bookkeeping, the editor's fixed-height
@@ -133,6 +161,9 @@ cargo test
 #                   (every filter type, tilt as two sections, sloped cuts at
 #                   12–96 dB/oct, an 8-band cascade; ~-145 dB), plus measured
 #                   slope accuracy and monotonicity
+#    8 dynamic-EQ tests — detector + gain law + biquad driven in the audio
+#                   loop's 16-sample shape; measured levels for loud, quiet,
+#                   off-band, boost and attack/release cases
 
 # Optional: dump the GUI's canvas geometry for offline rasterization
 FILTER_CANVAS_DUMP=/tmp/layers.json cargo test --lib dump_layers_for_visual_inspection

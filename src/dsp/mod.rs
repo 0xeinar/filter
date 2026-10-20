@@ -1,5 +1,6 @@
 pub mod biquad;
 pub mod curve;
+pub mod dynamics;
 pub mod spectrum;
 
 pub use biquad::{BiquadCoeffs, BiquadFilter, BiquadState};
