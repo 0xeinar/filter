@@ -33,6 +33,7 @@ pub struct BandPatch {
     pub q: f32,
     pub filter_type: i32,
     pub slope: i32,
+    pub channel_mode: i32,
     pub enable: bool,
     pub dyn_enable: bool,
     pub dyn_threshold: f32,
@@ -61,6 +62,7 @@ impl BandPatch {
             q: bp.q.value(),
             filter_type: bp.filter_type.value(),
             slope: bp.slope.value(),
+            channel_mode: bp.channel_mode.value(),
             enable: bp.enable.value(),
             dyn_enable: bp.dyn_enable.value(),
             dyn_threshold: bp.dyn_threshold.value(),
@@ -111,6 +113,7 @@ impl Patch {
             written += set(&setter, &bp.q, band.q);
             written += set(&setter, &bp.filter_type, band.filter_type);
             written += set(&setter, &bp.slope, band.slope);
+            written += set(&setter, &bp.channel_mode, band.channel_mode);
             written += set(&setter, &bp.enable, band.enable);
             written += set(&setter, &bp.dyn_enable, band.dyn_enable);
             written += set(&setter, &bp.dyn_threshold, band.dyn_threshold);
@@ -314,7 +317,7 @@ impl AbSlots {
 /// an older version is ignored rather than deserialized into a plausible but
 /// wrong state: `serde` would happily accept a blob missing the fields added
 /// since, and the band parameters would then silently land on their defaults.
-pub const AB_SCHEMA: u32 = 3;
+pub const AB_SCHEMA: u32 = 4;
 
 /// The A/B pair as it is stored in the session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

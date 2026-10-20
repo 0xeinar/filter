@@ -11,6 +11,7 @@ use crate::dsp::spectrum::SpectrumTaps;
 use crate::patch::PatchState;
 use crate::ui;
 use crate::ui::selection;
+use crate::ChannelMode;
 use crate::FilterParams;
 use crate::FilterType;
 use crate::Slope;
@@ -280,6 +281,7 @@ struct FilterEditor {
     dyn_sc_freq_states: [std::cell::UnsafeCell<nih_widgets::param_slider::State>; MAX_BANDS],
     type_pick_states: [std::cell::UnsafeCell<pick_list::State<FilterType>>; MAX_BANDS],
     slope_pick_states: [std::cell::UnsafeCell<pick_list::State<Slope>>; MAX_BANDS],
+    channel_pick_states: [std::cell::UnsafeCell<pick_list::State<ChannelMode>>; MAX_BANDS],
     chip_states: [std::cell::UnsafeCell<button::State>; MAX_BANDS],
 }
 
@@ -315,6 +317,16 @@ impl FilterEditor {
         states: &[std::cell::UnsafeCell<pick_list::State<Slope>>; MAX_BANDS],
         i: usize,
     ) -> &mut pick_list::State<Slope> {
+        &mut *states[i].get()
+    }
+
+    /// Get a mutable reference to a channel-mode pick list state by index.
+    /// Safety: Caller must ensure no two calls with the same index are active simultaneously.
+    #[allow(clippy::mut_from_ref)] // false positive: UnsafeCell::get() is the intended API
+    unsafe fn channel_pick_state(
+        states: &[std::cell::UnsafeCell<pick_list::State<ChannelMode>>; MAX_BANDS],
+        i: usize,
+    ) -> &mut pick_list::State<ChannelMode> {
         &mut *states[i].get()
     }
 
@@ -355,6 +367,8 @@ pub enum Message {
     TypeChanged(usize, FilterType),
     /// Band `index` changed cut slope.
     SlopeChanged(usize, Slope),
+    /// Band `index` changed its channel basis (stereo / mid / side).
+    ChannelChanged(usize, ChannelMode),
     /// Band `index` enabled/disabled.
     EnableChanged(usize, bool),
     /// Band `index` selected from the band strip.
@@ -388,6 +402,16 @@ impl FilterEditor {
         let setter = ParamSetter::new(self.context.as_ref());
         setter.begin_set_parameter(param);
         setter.set_parameter(param, filter_type as i32);
+        setter.end_set_parameter(param);
+        Command::none()
+    }
+
+    /// Set a band's channel basis as a single automation gesture.
+    fn set_band_channel(&mut self, index: usize, mode: ChannelMode) -> Command<Message> {
+        let param = &self.params.band_params[index].channel_mode;
+        let setter = ParamSetter::new(self.context.as_ref());
+        setter.begin_set_parameter(param);
+        setter.set_parameter(param, mode as i32);
         setter.end_set_parameter(param);
         Command::none()
     }
@@ -531,6 +555,9 @@ impl IcedEditor for FilterEditor {
             slope_pick_states: core::array::from_fn(|_| {
                 std::cell::UnsafeCell::new(pick_list::State::default())
             }),
+            channel_pick_states: core::array::from_fn(|_| {
+                std::cell::UnsafeCell::new(pick_list::State::default())
+            }),
             chip_states: core::array::from_fn(|_| std::cell::UnsafeCell::new(button::State::new())),
         };
         (editor, Command::none())
@@ -552,6 +579,9 @@ impl IcedEditor for FilterEditor {
             }
             Message::SlopeChanged(index, slope) => {
                 let _ = self.set_band_slope(index, slope);
+            }
+            Message::ChannelChanged(index, mode) => {
+                let _ = self.set_band_channel(index, mode);
             }
             Message::EnableChanged(index, enabled) => {
                 let _ = self.set_band_enable(index, enabled);
@@ -862,6 +892,20 @@ impl IcedEditor for FilterEditor {
                 .text_size(11)
                 .width(Length::Units(96))
             };
+            // Which signal this band works on. Next to the type because the
+            // two together describe what the band *is*, and because a mode set
+            // by accident is otherwise silent — a Mid band on a wide source
+            // looks exactly like a band doing nothing.
+            let channel_pick = unsafe {
+                PickList::new(
+                    Self::channel_pick_state(&self.channel_pick_states, i),
+                    &ChannelMode::ALL,
+                    Some(ChannelMode::from_i32(bp.channel_mode.value())),
+                    move |m| Message::ChannelChanged(i, m),
+                )
+                .text_size(11)
+                .width(Length::Units(78))
+            };
             let enable_toggle = Toggler::new(bp.enable.value(), String::new(), move |on| {
                 Message::EnableChanged(i, on)
             })
@@ -919,6 +963,7 @@ impl IcedEditor for FilterEditor {
                 .align_items(Alignment::Center)
                 .push(Text::new(format!("Band {}", i + 1)).size(12).color(color))
                 .push(type_pick)
+                .push(channel_pick)
                 .push(enable_toggle)
                 .push(Text::new("Enable").size(11).color(colors::TEXT_DIM))
                 .push(solo_toggle)
