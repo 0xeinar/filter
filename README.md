@@ -15,6 +15,7 @@ A surgical parametric EQ plugin built in Rust. Inspired by FabFilter Pro-Q — d
 - **Dynamic EQ** — any gain type can follow the level inside its own band
 - **Output stage** — ±24 dB trim, pink-weighted auto-gain, click-free bypass
 - **Spectrum** — input and post-EQ traces overlaid, so the curve is visible in the signal
+- **Oversampling** — the EQ cascade at 1x / 2x / 4x, with latency reported to the host
 
 ### Auto-gain
 
@@ -75,6 +76,37 @@ not see it.
 through a −12 dB band at −30 dB threshold comes out at −22 dBFS, the same band
 passes a −45 dBFS tone untouched, and an 8 kHz tone does not open a 1 kHz band
 at all.
+
+## Oversampling
+
+The EQ cascade can run at 2x or 4x the host rate, chosen with the `OS` button in
+the header. A biquad is designed with the bilinear transform, which maps the
+analog frequency axis onto the digital one non-linearly: near Nyquist a band
+lands somewhere other than where the curve is drawn. Running the cascade faster
+shrinks that error. Measured on a 12 kHz high shelf, +9 dB, at 44.1 kHz:
+
+| Factor | Worst error, 16–20 kHz |
+|---|---|
+| 1x | 1.54 dB |
+| 2x | 0.38 dB |
+| 4x | 0.07 dB |
+
+The price is a pair of halfband FIRs per stage and the delay they add: **54
+samples at 2x, 80 at 4x**, reported to the host through the normal latency
+mechanism so plugin delay compensation stays correct. The dry side of the
+bypass crossfade is held back by the same amount, so toggling bypass mixes two
+signals from the same instant instead of combing.
+
+The filter is 109 taps because a shorter one is not transparent where it
+matters: a 61-tap design cost **0.78 dB at 20 kHz** — worse than the warping it
+was meant to fix. At 109 taps a flat EQ is flat to within 0.003 dB up to 20 kHz
+at 44.1 kHz, at both 2x and 4x.
+
+Cost, measured (`cargo bench --bench hotpath_bench`): the resampler alone is
+~420 ns per host sample for both channels at 2x and ~1.4 µs at 4x (4% and 13% of
+one core at 48 kHz). It runs only when oversampling is on.
+
+---
 
 ## Undo, redo and A/B
 

@@ -31,6 +31,21 @@ pub struct Filter {
     /// continue the other's filter memory.
     band_states: [[[dsp::BiquadState; dsp::biquad::MAX_SECTIONS]; MAX_BANDS]; MAX_CHANNELS],
     sample_rate: f32,
+    /// Polyphase halfband resampler, one FIR chain per channel. Runs at 1x
+    /// (pure copy), 2x or 4x. Only the EQ cascade is oversampled — parameter
+    /// smoothing, the output trim, the bypass crossfade and the analyzers all
+    /// stay at the host rate, so nothing else has to learn about the factor.
+    oversampler: dsp::oversample::Oversampler,
+    /// Scratch for one oversampled sub-block. `COEFF_BLOCK * MAX_FACTOR` is the
+    /// largest conversion the audio path ever asks for.
+    os_buf: [[f32; COEFF_BLOCK * dsp::oversample::MAX_FACTOR]; MAX_CHANNELS],
+    /// Dry signal held back by the oversampler's latency. The bypass crossfade
+    /// mixes dry against wet, so the two must occupy the same instant or the
+    /// transition combs.
+    dry_delay: [[f32; MAX_LATENCY]; MAX_CHANNELS],
+    dry_pos: [usize; MAX_CHANNELS],
+    /// Last latency handed to the host; re-reported only when it changes.
+    reported_latency: u32,
     /// Shared with the GUI: the pre-EQ and post-EQ analyzer rings.
     spectrum_taps: Arc<dsp::spectrum::SpectrumTaps>,
     /// Audio-thread-only FFT analyzers (None until initialize). One per tap —
@@ -85,6 +100,9 @@ const COEFF_BLOCK: usize = 16;
 
 /// How often auto-gain may recompute while a band is moving.
 const AUTO_GAIN_INTERVAL_MS: f64 = 30.0;
+
+/// Longest dry delay line the bypass crossfade ever needs.
+const MAX_LATENCY: usize = dsp::oversample::LATENCY_4X as usize + 1;
 
 /// Per-band parameters
 #[derive(Params)]
@@ -158,6 +176,15 @@ pub struct FilterParams {
     #[id = "bypass"]
     pub bypass: BoolParam,
 
+    /// Run the EQ cascade at 2x or 4x the host rate.
+    ///
+    /// A biquad's response is warped near Nyquist by the bilinear transform, so
+    /// a shelf at 18 kHz is measurably off the drawn curve at 44.1 kHz.
+    /// Oversampling moves that error down. Costs a pair of FIRs and the latency
+    /// they add, which is reported to the host.
+    #[id = "oversampling"]
+    pub oversampling: IntParam,
+
     /// Draw the post-EQ spectrum over the input one. Off is the "did I change
     /// anything?" question answered by eyes instead of memory, so it defaults
     /// on; the cost is one extra analyzer, and only while the editor is open.
@@ -166,6 +193,53 @@ pub struct FilterParams {
 
     #[nested(array, group = "Bands")]
     pub band_params: [BandParams; MAX_BANDS],
+}
+
+/// Map the param (0/1/2) to a factor (1/2/4).
+fn oversampling_factor(params: &FilterParams) -> usize {
+    match params.oversampling.value() {
+        1 => 2,
+        2 => 4,
+        _ => 1,
+    }
+}
+
+/// Run every enabled band's cascade over `buf`, in place.
+///
+/// Split out of `process()` so the same code filters at the host rate and at an
+/// oversampled rate — an oversampled copy of this loop would be a second
+/// implementation to keep in sync, which is the failure mode this codebase
+/// already hit once.
+fn run_cascade(
+    coeffs: &[[dsp::BiquadCoeffs; dsp::biquad::MAX_SECTIONS]; MAX_BANDS],
+    sections: &[usize; MAX_BANDS],
+    enabled: &[bool; MAX_BANDS],
+    num_active: usize,
+    states: &mut [[dsp::BiquadState; dsp::biquad::MAX_SECTIONS]; MAX_BANDS],
+    buf: &mut [f32],
+) {
+    for sample in buf.iter_mut() {
+        let mut value = *sample;
+        for band_idx in 0..num_active {
+            if !enabled[band_idx] {
+                continue;
+            }
+            let count = sections[band_idx];
+            if count == 0 {
+                continue;
+            }
+            // One section for a bell or shelf, two for a tilt, up to eight for
+            // a 96 dB/oct cut. Slicing to the live count keeps the inner loop
+            // bounds-check-free after the first iteration.
+            for (coeff, state) in coeffs[band_idx][..count]
+                .iter()
+                .zip(states[band_idx][..count].iter_mut())
+            {
+                value = state.process(coeff, value);
+            }
+        }
+        *sample = value;
+    }
 }
 
 /// Snapshot of the current band parameters as pure specs, for the GUI curve
@@ -479,6 +553,11 @@ impl Default for Filter {
                 core::array::from_fn(|_| core::array::from_fn(|_| dsp::BiquadState::default()))
             }),
             sample_rate: 44100.0,
+            oversampler: dsp::oversample::Oversampler::new(),
+            os_buf: [[0.0; COEFF_BLOCK * dsp::oversample::MAX_FACTOR]; MAX_CHANNELS],
+            dry_delay: [[0.0; MAX_LATENCY]; MAX_CHANNELS],
+            dry_pos: [0; MAX_CHANNELS],
+            reported_latency: u32::MAX,
             spectrum_taps: Arc::new(dsp::spectrum::SpectrumTaps::new()),
             spectrum_analyzer_in: None,
             spectrum_analyzer_out: None,
@@ -525,6 +604,9 @@ impl Default for FilterParams {
             .with_smoother(SmoothingStyle::Linear(20.0))
             .with_unit(" dB")
             .with_value_to_string(formatters::v2s_f32_rounded(2)),
+
+            oversampling: IntParam::new("Oversampling", 0, IntRange::Linear { min: 0, max: 2 })
+                .with_value_to_string(formatters::v2s_i32_power_of_two()),
 
             auto_gain: BoolParam::new("Auto Gain", false),
             bypass: BoolParam::new("Bypass", false),
@@ -579,7 +661,7 @@ impl Plugin for Filter {
         &mut self,
         _audio_io_layout: &AudioIOLayout,
         buffer_config: &BufferConfig,
-        _context: &mut impl InitContext<Self>,
+        context: &mut impl InitContext<Self>,
     ) -> bool {
         self.peak_meter_decay_weight = 0.25f64
             .powf((buffer_config.sample_rate as f64 * PEAK_METER_DECAY_MS / 1000.0).recip())
@@ -594,10 +676,19 @@ impl Plugin for Filter {
         self.comp_dirty = true;
         self.spectrum_analyzer_in = Some(dsp::spectrum::SpectrumAnalyzer::new(self.sample_rate));
         self.spectrum_analyzer_out = Some(dsp::spectrum::SpectrumAnalyzer::new(self.sample_rate));
+
+        // The detector follows the *filter's* rate, not the host's: its attack
+        // and release are specified in milliseconds, so running it at 1x while
+        // the EQ runs at 4x would make every time constant four times too fast.
+        let factor = oversampling_factor(&self.params);
+        self.oversampler.set_factor(factor);
+        let os_rate = self.sample_rate * factor as f32;
         for detector in &mut self.detectors {
-            detector.set_sample_rate(self.sample_rate);
+            detector.set_sample_rate(os_rate);
             detector.reset();
         }
+        self.reported_latency = dsp::oversample::latency_samples(factor);
+        context.set_latency_samples(self.reported_latency);
         true
     }
 
@@ -605,9 +696,36 @@ impl Plugin for Filter {
         &mut self,
         buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let num_active = self.params.num_bands.value() as usize;
+
+        // --- Oversampling factor for this block ---
+        let factor = oversampling_factor(&self.params);
+        let latency = dsp::oversample::latency_samples(factor);
+        let mut factor_changed = false;
+        if factor != self.oversampler.factor() {
+            self.oversampler.set_factor(factor);
+            // A different factor means different filter history *and* a
+            // different delay: a stale dry ring would splice the tail of the
+            // old configuration into the crossfade.
+            self.dry_delay = [[0.0; MAX_LATENCY]; MAX_CHANNELS];
+            self.dry_pos = [0; MAX_CHANNELS];
+            let os_rate = self.sample_rate * factor as f32;
+            for detector in &mut self.detectors {
+                detector.set_sample_rate(os_rate);
+                detector.reset();
+            }
+            // Coefficients baked for 1x are wrong for 4x (every frequency
+            // maps to a different point on the warped axis). Force a rebake of
+            // every band for this block.
+            factor_changed = true;
+        }
+        if latency != self.reported_latency {
+            context.set_latency_samples(latency);
+            self.reported_latency = latency;
+        }
+        let os_rate = self.sample_rate * factor as f32;
 
         // Spectrum analysis runs on the INPUT signal, before any band touches
         // the buffer. Channel 0 only (the earlier code averaged L/R; for a
@@ -733,7 +851,8 @@ impl Plugin for Filter {
                         // A dynamic band rebakes every sub-block by design: its
                         // gain follows the envelope, which moves even when no
                         // parameter does.
-                        let moving = dyn_on
+                        let moving = factor_changed
+                            || dyn_on
                             || bp.freq.smoothed.is_smoothing()
                             || bp.gain.smoothed.is_smoothing()
                             || bp.q.smoothed.is_smoothing()
@@ -837,7 +956,7 @@ impl Plugin for Filter {
                         baked_q,
                         baked_type,
                         baked_slope,
-                        self.sample_rate,
+                        os_rate,
                     );
                     // Publish what the band is actually applying. Only while
                     // someone can see it, and only for dynamic bands — a
@@ -875,38 +994,66 @@ impl Plugin for Filter {
                     else {
                         continue;
                     };
-                    let is_primary = channel_idx == 0;
-                    let states = &mut self.band_states[channel_idx];
+                    // Hold the dry signal for the bypass crossfade. Captured
+                    // before filtering because the wet path is delayed by the
+                    // oversampler's latency, and a crossfade has to mix two
+                    // signals from the same instant.
+                    let mut dry_block = [0.0f32; COEFF_BLOCK];
+                    dry_block[..block_len].copy_from_slice(channel_samples);
 
-                    let meter_open = is_primary && self.params.editor_state.is_open();
-                    for (sample_idx, sample) in channel_samples.iter_mut().enumerate() {
-                        // Keep the dry signal for the bypass crossfade, and keep
-                        // filtering while bypassed so un-bypassing is seamless.
-                        let dry = *sample;
-                        let mut s = dry;
-
-                        if any_band_active {
-                            // Each band is a cascade: one section for a bell or
-                            // shelf, two for a tilt, up to eight for a 96 dB/oct
-                            // cut. Slicing to the live count keeps the inner
-                            // loops bounds-check-free after the first iteration.
-                            for (band_idx, band_state) in
-                                states.iter_mut().enumerate().take(num_active)
-                            {
-                                if !self.band_enabled[band_idx] {
-                                    continue;
-                                }
-                                let sections = self.band_sections[band_idx];
-                                let coeffs = &self.band_coeffs[band_idx][..sections];
-                                for (coeff, state) in
-                                    coeffs.iter().zip(band_state[..sections].iter_mut())
-                                {
-                                    s = state.process(coeff, s);
-                                }
-                            }
+                    // The FIR pair runs even with no active bands when the
+                    // factor is above 1: the host has been told to compensate
+                    // `latency`, so a path that skipped the resampler would
+                    // come out early by exactly that much.
+                    if any_band_active || factor > 1 {
+                        if factor == 1 {
+                            run_cascade(
+                                &self.band_coeffs,
+                                &self.band_sections,
+                                &self.band_enabled,
+                                num_active,
+                                &mut self.band_states[channel_idx],
+                                channel_samples,
+                            );
+                        } else {
+                            let os_len = block_len * factor;
+                            self.oversampler.upsample(
+                                channel_idx,
+                                channel_samples,
+                                &mut self.os_buf[channel_idx][..os_len],
+                            );
+                            run_cascade(
+                                &self.band_coeffs,
+                                &self.band_sections,
+                                &self.band_enabled,
+                                num_active,
+                                &mut self.band_states[channel_idx],
+                                &mut self.os_buf[channel_idx][..os_len],
+                            );
+                            self.oversampler.downsample(
+                                channel_idx,
+                                &self.os_buf[channel_idx][..os_len],
+                                channel_samples,
+                            );
                         }
+                    }
 
-                        let out = dsp::output_stage(dry, s, out_lin, bypass_block[sample_idx]);
+                    let meter_open = channel_idx == 0 && self.params.editor_state.is_open();
+                    let latency_len = latency as usize;
+                    for (sample_idx, sample) in channel_samples.iter_mut().enumerate() {
+                        let dry = if latency_len == 0 {
+                            dry_block[sample_idx]
+                        } else {
+                            let pos = self.dry_pos[channel_idx];
+                            let delayed = self.dry_delay[channel_idx][pos];
+                            self.dry_delay[channel_idx][pos] = dry_block[sample_idx];
+                            self.dry_pos[channel_idx] =
+                                if pos + 1 == latency_len { 0 } else { pos + 1 };
+                            delayed
+                        };
+
+                        let out =
+                            dsp::output_stage(dry, *sample, out_lin, bypass_block[sample_idx]);
                         *sample = out;
 
                         // Peak meter: updated per sample (same decay rate as

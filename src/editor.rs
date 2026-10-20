@@ -248,6 +248,8 @@ struct FilterEditor {
     slot_a_state: std::cell::UnsafeCell<button::State>,
     slot_b_state: std::cell::UnsafeCell<button::State>,
     slot_copy_state: std::cell::UnsafeCell<button::State>,
+    /// Button cache for the oversampling cycle control.
+    os_state: std::cell::UnsafeCell<button::State>,
     graph: ui::Graph,
     /// Shared with the graph: one of the editor's few pieces of state that
     /// is not a host parameter.
@@ -348,6 +350,8 @@ pub enum Message {
     AutoGainToggled(bool),
     /// Show/hide the post-EQ spectrum overlay.
     PostSpectrumToggled(bool),
+    /// Advance the oversampling factor: off -> 2x -> 4x -> off.
+    OversamplingCycled,
     /// Band `index` enabled/disabled its dynamics.
     DynamicsToggled(usize, bool),
     /// Step back one edit.
@@ -444,6 +448,7 @@ impl IcedEditor for FilterEditor {
             slot_a_state: std::cell::UnsafeCell::new(button::State::new()),
             slot_b_state: std::cell::UnsafeCell::new(button::State::new()),
             slot_copy_state: std::cell::UnsafeCell::new(button::State::new()),
+            os_state: std::cell::UnsafeCell::new(button::State::new()),
             graph,
             selection,
             num_bands_slider_state: Default::default(),
@@ -546,6 +551,12 @@ impl IcedEditor for FilterEditor {
                 let setter = ParamSetter::new(self.context.as_ref());
                 setter.set_parameter(param, on);
             }
+            Message::OversamplingCycled => {
+                let param = &self.params.oversampling;
+                let next = (param.value() + 1) % 3;
+                let setter = ParamSetter::new(self.context.as_ref());
+                setter.set_parameter(param, next);
+            }
         }
         Command::none()
     }
@@ -563,6 +574,16 @@ impl IcedEditor for FilterEditor {
         let selected = self.selected(num_bands);
 
         let slot_active = self.patch_state_mut().ab.active();
+        let os_factor = match self.params.oversampling.value() {
+            1 => 2,
+            2 => 4,
+            _ => 1,
+        };
+        let os_label = if os_factor == 1 {
+            "OS off".to_string()
+        } else {
+            format!("OS {os_factor}x")
+        };
         let header = Row::new()
             .height(Length::Units(HEADER_H))
             .spacing(10)
@@ -638,6 +659,22 @@ impl IcedEditor for FilterEditor {
                     .push(slot_b)
                     .push(slot_copy)
             })
+            // Oversampling is a three-way choice, not a toggle, so it is a
+            // button that cycles and shows where it is. A click is a host
+            // gesture, so it also lands in the undo history.
+            .push(
+                button::Button::new(
+                    unsafe { &mut *self.os_state.get() },
+                    Text::new(os_label).size(10),
+                )
+                .width(Length::Units(34))
+                .height(Length::Units(20))
+                .padding(0)
+                .style(SlotStyle {
+                    active: os_factor > 1,
+                })
+                .on_press(Message::OversamplingCycled),
+            )
             .push(Text::new("Post").size(11).color(colors::TEXT_DIM))
             .push(
                 Toggler::new(

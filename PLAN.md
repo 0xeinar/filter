@@ -43,7 +43,7 @@ A surgical parametric EQ plugin for electronic music production, built in Rust.
 ### Phase 4 — Advanced
 - [ ] Dynamic EQ (envelope follower → gain modulation on bell bands)
 - [ ] Mid/Side processing
-- [ ] Oversampling (2x / 4x)
+- [x] Oversampling (2x / 4x)
 - [ ] Linear phase mode
 - [ ] Match EQ
 - [ ] Preset system (factory + user)
