@@ -33,6 +33,13 @@ pub mod ui;
 pub const MAX_BANDS: usize = 24;
 const PEAK_METER_DECAY_MS: f64 = 150.0;
 
+/// Temporary CI probe: must be refused by branch protection.
+#[allow(dead_code)]
+fn ci_probe_blocked() -> usize {
+    let value = 7;
+    value
+}
+
 pub struct Filter {
     params: Arc<FilterParams>,
     peak_meter_decay_weight: f32,
