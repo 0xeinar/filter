@@ -1,6 +1,7 @@
 pub mod biquad;
 pub mod curve;
 pub mod dynamics;
+pub mod linear;
 pub mod oversample;
 pub mod spectrum;
 
