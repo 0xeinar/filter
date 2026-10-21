@@ -148,3 +148,11 @@ fn auto_gain_is_gentle_on_a_symmetric_mix_curve() {
         "residual {residual:.2} dB (measured {change:+.2}, comp {comp:+.2})"
     );
 }
+
+/// Temporary CI probe: `clippy::bool_assert_comparison` lives only in an
+/// integration-test target, so plain `cargo clippy` does not see it.
+#[test]
+fn ci_probe_test_lint() {
+    let flag = 1 + 1 == 2;
+    assert_eq!(flag, true);
+}
