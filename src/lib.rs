@@ -33,6 +33,14 @@ pub mod ui;
 pub const MAX_BANDS: usize = 24;
 const PEAK_METER_DECAY_MS: f64 = 150.0;
 
+/// Temporary CI probe: `clippy::let_and_return` must be denied by CI.
+/// `dead_code` is silenced so the *only* failure is a clippy lint.
+#[allow(dead_code)]
+fn ci_probe_src_lint() -> usize {
+    let value = 42;
+    value
+}
+
 pub struct Filter {
     params: Arc<FilterParams>,
     peak_meter_decay_weight: f32,
