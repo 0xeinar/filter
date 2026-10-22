@@ -80,19 +80,53 @@ impl FirPhase {
     }
 }
 
-/// Per-band coefficients, baked once so the magnitude sweep does not recompute
-/// them per bin. Bands above `num_active` and disabled bands are dropped here,
-/// so the sweep loop has no branch.
-fn baked_bands(
-    bands: &[BandSpec; MAX_BANDS],
-    num_active: usize,
-    sample_rate: f32,
-) -> Vec<([BiquadCoeffs; MAX_SECTIONS], usize)> {
-    bands
-        .iter()
-        .take(num_active)
-        .filter(|spec| spec.enabled)
-        .map(|spec| {
+/// Reusable design engine: FFT plans, scratch buffers and the baked band
+/// cascade are allocated once and reused.
+///
+/// This exists because the plugin is built with nih-plug's
+/// `assert_process_allocs`: an allocation inside `process` is a panic, not a
+/// performance note. Designing on the audio thread is therefore only legal if
+/// the design path allocates nothing, which means no `vec![]`, no `Vec::new`
+/// and — the easy one to miss — no `FftPlanner::new()` per call, since planning
+/// allocates its twiddle tables.
+pub struct Designer {
+    n: usize,
+    baked: Vec<([BiquadCoeffs; MAX_SECTIONS], usize)>,
+    mags: Vec<f32>,
+    buf: Vec<Complex<f32>>,
+    cepstrum: Vec<f32>,
+    fwd: std::sync::Arc<dyn rustfft::Fft<f32>>,
+    inv: std::sync::Arc<dyn rustfft::Fft<f32>>,
+}
+
+impl Designer {
+    /// `taps` is rounded up to a power of two, once, here.
+    pub fn new(taps: usize) -> Self {
+        let n = taps.max(8).next_power_of_two();
+        let mut planner = FftPlanner::new();
+        Self {
+            n,
+            // `with_capacity(MAX_BANDS)`: `clear` + `push` up to that many
+            // bands never reallocates, so `design_into` stays allocation-free.
+            baked: Vec::with_capacity(MAX_BANDS),
+            mags: vec![0.0; n / 2 + 1],
+            buf: vec![Complex::new(0.0, 0.0); n],
+            cepstrum: vec![0.0; n],
+            fwd: planner.plan_fft_forward(n),
+            inv: planner.plan_fft_inverse(n),
+        }
+    }
+
+    pub fn taps(&self) -> usize {
+        self.n
+    }
+
+    /// Sample the combined cascade magnitude at this design's bin frequencies.
+    /// Disabled bands and bands past `num_active` are dropped here so the
+    /// sweep loop needs no branch.
+    fn fill_magnitudes(&mut self, bands: &[BandSpec; MAX_BANDS], num_active: usize, sr: f32) {
+        self.baked.clear();
+        for spec in bands.iter().take(num_active).filter(|s| s.enabled) {
             let mut sections = [BiquadCoeffs::default(); MAX_SECTIONS];
             let count = BiquadCoeffs::update_cascade(
                 &mut sections,
@@ -101,38 +135,95 @@ fn baked_bands(
                 spec.q,
                 spec.filter_type,
                 spec.slope_db_per_oct,
-                sample_rate,
+                sr,
             );
-            (sections, count)
-        })
-        .collect()
-}
+            self.baked.push((sections, count));
+        }
 
-/// Sample the combined cascade magnitude at the `n/2 + 1` non-negative bin
-/// frequencies of an `n`-point FFT.
-pub fn magnitude_spectrum(
-    bands: &[BandSpec; MAX_BANDS],
-    num_active: usize,
-    sample_rate: f32,
-    n: usize,
-) -> Vec<f32> {
-    let baked = baked_bands(bands, num_active, sample_rate);
-    (0..=n / 2)
-        .map(|k| {
-            let freq = k as f32 * sample_rate / n as f32;
+        let n = self.n;
+        for (k, slot) in self.mags.iter_mut().enumerate() {
+            let freq = k as f32 * sr / n as f32;
             let mut mag = 1.0f32;
-            for (sections, count) in &baked {
+            for (sections, count) in &self.baked {
                 for section in sections.iter().take(*count) {
-                    mag *= section.magnitude_at_freq(freq, sample_rate);
+                    mag *= section.magnitude_at_freq(freq, sr);
                 }
             }
-            mag
-        })
-        .collect()
+            *slot = mag;
+        }
+    }
+
+    /// Design into `out`, which must be exactly [`Self::taps`] long.
+    pub fn design_into(
+        &mut self,
+        bands: &[BandSpec; MAX_BANDS],
+        num_active: usize,
+        sample_rate: f32,
+        phase: FirPhase,
+        out: &mut [f32],
+    ) {
+        debug_assert_eq!(out.len(), self.n);
+        self.fill_magnitudes(bands, num_active, sample_rate);
+        let n = self.n;
+        let scale = 1.0 / n as f32;
+
+        match phase {
+            FirPhase::Linear => {
+                // Real, symmetric spectrum with a delay of exactly n/2: the
+                // exponent exp(-j*pi*k) is (-1)^k, so no complex phase is
+                // needed and the centre cannot drift off sample n/2.
+                for k in 0..=n / 2 {
+                    let m = self.mags[k];
+                    let signed = if k % 2 == 0 { m } else { -m };
+                    self.buf[k] = Complex::new(signed, 0.0);
+                    if k != 0 && k != n / 2 {
+                        self.buf[n - k] = self.buf[k];
+                    }
+                }
+                self.inv.process(&mut self.buf);
+                for (slot, c) in out.iter_mut().zip(&self.buf) {
+                    *slot = c.re * scale;
+                }
+            }
+            FirPhase::Minimum => {
+                // Real cepstrum of the log magnitude, folded onto its causal
+                // half, then exponentiated back into a spectrum. The folding is
+                // what turns the symmetric pair at +D/-D into one causal
+                // response at the front of the buffer.
+                for k in 0..=n / 2 {
+                    let logged = self.mags[k].max(1e-9).ln();
+                    self.buf[k] = Complex::new(logged, 0.0);
+                    if k != 0 && k != n / 2 {
+                        self.buf[n - k] = self.buf[k];
+                    }
+                }
+                self.inv.process(&mut self.buf);
+                for (slot, c) in self.cepstrum.iter_mut().zip(&self.buf) {
+                    *slot = c.re * scale;
+                }
+
+                self.buf.fill(Complex::new(0.0, 0.0));
+                self.buf[0] = Complex::new(self.cepstrum[0], 0.0);
+                for k in 1..n / 2 {
+                    self.buf[k] = Complex::new(2.0 * self.cepstrum[k], 0.0);
+                }
+                self.buf[n / 2] = Complex::new(self.cepstrum[n / 2], 0.0);
+                self.fwd.process(&mut self.buf);
+                for c in self.buf.iter_mut() {
+                    let gain = c.re.exp();
+                    *c = Complex::new(gain * c.im.cos(), gain * c.im.sin());
+                }
+                self.inv.process(&mut self.buf);
+                for (slot, c) in out.iter_mut().zip(&self.buf) {
+                    *slot = c.re * scale;
+                }
+            }
+        }
+    }
 }
 
-/// Design an impulse response of `taps` samples (rounded up to a power of two)
-/// for the given band set.
+/// Convenience wrapper that allocates. Tests and offline tools use this; the
+/// audio path must keep a [`Designer`] instead.
 pub fn design(
     bands: &[BandSpec; MAX_BANDS],
     num_active: usize,
@@ -140,58 +231,11 @@ pub fn design(
     taps: usize,
     phase: FirPhase,
 ) -> Vec<f32> {
-    let n = taps.max(8).next_power_of_two();
-    let mags = magnitude_spectrum(bands, num_active, sample_rate, n);
-    let mut planner = FftPlanner::new();
-    let scale = 1.0 / n as f32;
-
-    match phase {
-        FirPhase::Linear => {
-            // Real, symmetric spectrum with a delay of exactly n/2: the
-            // exponent exp(-j*pi*k) is (-1)^k, so no complex phase is needed
-            // and the result cannot drift off centre.
-            let mut buf = vec![Complex::new(0.0f32, 0.0); n];
-            for (k, &m) in mags.iter().enumerate() {
-                let signed = if k % 2 == 0 { m } else { -m };
-                buf[k] = Complex::new(signed, 0.0);
-                if k != 0 && k != n / 2 {
-                    buf[n - k] = buf[k];
-                }
-            }
-            planner.plan_fft_inverse(n).process(&mut buf);
-            buf.iter().map(|c| c.re * scale).collect()
-        }
-        FirPhase::Minimum => {
-            // Real cepstrum of the log magnitude, folded onto the causal half,
-            // then exponentiated back into a spectrum. Folding is what moves
-            // the energy from a symmetric pair (one at +D, one at -D) to a
-            // single causal one at the front.
-            let mut log_mag = vec![Complex::new(0.0f32, 0.0); n];
-            for (k, &m) in mags.iter().enumerate() {
-                log_mag[k] = Complex::new(m.max(1e-9).ln(), 0.0);
-                if k != 0 && k != n / 2 {
-                    log_mag[n - k] = log_mag[k];
-                }
-            }
-            planner.plan_fft_inverse(n).process(&mut log_mag);
-            let cepstrum: Vec<f32> = log_mag.iter().map(|c| c.re * scale).collect();
-
-            let mut folded = vec![Complex::new(0.0f32, 0.0); n];
-            folded[0] = Complex::new(cepstrum[0], 0.0);
-            for k in 1..n / 2 {
-                folded[k] = Complex::new(2.0 * cepstrum[k], 0.0);
-            }
-            folded[n / 2] = Complex::new(cepstrum[n / 2], 0.0);
-
-            planner.plan_fft_forward(n).process(&mut folded);
-            for c in folded.iter_mut() {
-                let gain = c.re.exp();
-                *c = Complex::new(gain * c.im.cos(), gain * c.im.sin());
-            }
-            planner.plan_fft_inverse(n).process(&mut folded);
-            folded.iter().map(|c| c.re * scale).collect()
-        }
-    }
+    let mut designer = Designer::new(taps);
+    let n = designer.taps();
+    let mut out = vec![0.0; n];
+    designer.design_into(bands, num_active, sample_rate, phase, &mut out);
+    out
 }
 
 /// Uniformly-partitioned overlap-save convolution with a constant `HOP`
@@ -415,6 +459,28 @@ mod tests {
             dphi += 2.0 * std::f64::consts::PI;
         }
         -dphi / (2.0 * std::f64::consts::PI * df) * sample_rate as f64
+    }
+
+    #[test]
+    fn repeated_designs_are_stable() {
+        // The audio thread reuses one Designer for every redesign, so state
+        // must not leak between calls: a stale baked band would show up as a
+        // filter that is still present after its band was disabled.
+        let one = bands(&[spec(1_000.0, 9.0, 1.2, FilterType::Bell)]);
+        let two = bands(&[
+            spec(1_000.0, 9.0, 1.2, FilterType::Bell),
+            spec(5_000.0, -12.0, 2.0, FilterType::Bell),
+        ]);
+
+        let mut designer = Designer::new(DESIGN_TAPS);
+        let mut reused = vec![0.0; designer.taps()];
+        designer.design_into(&two, 2, 48_000.0, FirPhase::Linear, &mut reused);
+        designer.design_into(&one, 1, 48_000.0, FirPhase::Linear, &mut reused);
+
+        let fresh = design(&one, 1, 48_000.0, DESIGN_TAPS, FirPhase::Linear);
+        for (i, (a, b)) in reused.iter().zip(&fresh).enumerate() {
+            assert!((a - b).abs() < 1e-6, "stale state at tap {i}: {a} vs {b}");
+        }
     }
 
     #[test]
