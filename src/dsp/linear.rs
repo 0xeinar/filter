@@ -248,8 +248,13 @@ pub struct Convolver {
     fft: std::sync::Arc<dyn rustfft::Fft<f32>>,
     ifft: std::sync::Arc<dyn rustfft::Fft<f32>>,
     /// Spectrum of each IR partition, `2 * block` bins each.
+    ///
+    /// This is a *pool*: it may hold more partitions than the current IR uses,
+    /// so re-designing a response of the same length allocates nothing.
     partitions: Vec<Vec<Complex<f32>>>,
-    /// Ring of the last `partitions.len()` input spectra.
+    /// How many entries of `partitions` are live.
+    parts: usize,
+    /// Ring of the last `parts` input spectra.
     history: Vec<Vec<Complex<f32>>>,
     history_pos: usize,
     /// Previous hop, held because overlap-save needs the block before this one.
@@ -276,6 +281,7 @@ impl Convolver {
             fft: planner.plan_fft_forward(n),
             ifft: planner.plan_fft_inverse(n),
             partitions: Vec::new(),
+            parts: 0,
             history: Vec::new(),
             history_pos: 0,
             prev: vec![0.0; block],
@@ -299,28 +305,79 @@ impl Convolver {
         self.block
     }
 
+    /// Reserve storage for an IR of `taps` samples, so that installing it later
+    /// allocates nothing.
+    ///
+    /// Called once, off the audio thread. `set_ir` allocates the same storage
+    /// lazily, which is fine for tests and offline tools but not for the
+    /// plugin: it runs under nih-plug's `assert_process_allocs`, where an
+    /// allocation inside `process` is a panic. Reserving first is what makes a
+    /// re-design on the audio thread legal.
+    pub fn reserve_ir(&mut self, taps: usize) {
+        let n = self.block * 2;
+        let count = taps.div_ceil(self.block).max(1);
+        while self.partitions.len() < count {
+            self.partitions.push(vec![Complex::new(0.0, 0.0); n]);
+        }
+        while self.history.len() < count {
+            self.history.push(vec![Complex::new(0.0, 0.0); n]);
+        }
+    }
+
+    /// Fill the partition spectra from `ir`. Touches no other state: the input
+    /// history and the output delay line are left exactly as they were, which
+    /// is what lets [`Self::swap_ir`] change the response mid-stream.
+    fn install(&mut self, ir: &[f32]) {
+        let count = ir.len().div_ceil(self.block).max(1);
+        self.reserve_ir(ir.len());
+        debug_assert!(count <= self.partitions.len());
+        self.parts = count;
+        // The FFT is behind an `Arc`; cloning it is a refcount bump, not an
+        // allocation, and it is what lets `partitions` be borrowed mutably
+        // while the transform runs.
+        let fft = self.fft.clone();
+        for (p, partition) in self.partitions[..count].iter_mut().enumerate() {
+            partition.fill(Complex::new(0.0, 0.0));
+            let chunk = ir.chunks(self.block).nth(p).unwrap_or(&[]);
+            for (slot, &h) in partition.iter_mut().zip(chunk) {
+                *slot = Complex::new(h, 0.0);
+            }
+            fft.process(partition);
+        }
+    }
+
     /// Install a (new) impulse response, discarding any tail in flight: the old
     /// tail describes a filter that no longer exists, and letting it ring out
     /// over the new one would splice two responses together.
     pub fn set_ir(&mut self, ir: &[f32]) {
-        let n = self.block * 2;
-        self.partitions.clear();
-        for chunk in ir.chunks(self.block) {
-            let mut buf = vec![Complex::new(0.0f32, 0.0); n];
-            for (slot, &h) in buf.iter_mut().zip(chunk) {
-                *slot = Complex::new(h, 0.0);
-            }
-            self.fft.process(&mut buf);
-            self.partitions.push(buf);
-        }
-        // A convolver with no IR is a wire, not a filter.
-        if self.partitions.is_empty() {
-            let mut buf = vec![Complex::new(0.0f32, 0.0); n];
-            buf[0] = Complex::new(1.0, 0.0);
-            self.partitions.push(buf);
-        }
-        self.history = vec![vec![Complex::new(0.0, 0.0); n]; self.partitions.len()];
+        self.install(ir);
         self.reset();
+    }
+
+    /// Replace the impulse response *without* restarting the engine.
+    ///
+    /// A re-designed response takes effect on the next hop while the filter
+    /// keeps running: the input history still describes real audio, and the
+    /// output delay line still holds the samples the caller has not heard yet.
+    /// Clearing either — which is what [`Self::set_ir`] must do for a fresh
+    /// start — would blank the output for the length of the IR every time the
+    /// curve moved, which is a click, not a redesign.
+    ///
+    /// Allocates nothing if the caller has [`Self::reserve_ir`]'d enough
+    /// storage, and the partition count must stay the same (the history ring is
+    /// sized for it): both hold for a fixed tap count.
+    pub fn swap_ir(&mut self, ir: &[f32]) {
+        let count = ir.len().div_ceil(self.block).max(1);
+        assert!(
+            count <= self.partitions.len(),
+            "swap_ir needs reserve_ir({}) first",
+            ir.len()
+        );
+        assert_eq!(
+            count, self.parts,
+            "a live redesign must keep the partition count"
+        );
+        self.install(ir);
     }
 
     /// Drop all filter memory and restart the output delay line.
@@ -378,11 +435,11 @@ impl Convolver {
         self.fft.process(&mut self.time);
 
         self.history[self.history_pos].copy_from_slice(&self.time);
-        let parts = self.partitions.len();
+        let parts = self.parts.max(1);
         let newest = self.history_pos;
 
         self.acc.fill(Complex::new(0.0, 0.0));
-        for (p, partition) in self.partitions.iter().enumerate() {
+        for (p, partition) in self.partitions[..parts].iter().enumerate() {
             let idx = (newest + parts - p % parts) % parts;
             let spectrum = &self.history[idx];
             for (a, (x, h)) in self.acc.iter_mut().zip(spectrum.iter().zip(partition)) {
@@ -672,6 +729,50 @@ mod tests {
         conv.process(&mut after);
         for (i, &v) in after.iter().enumerate().skip(conv.latency()) {
             assert!(v.abs() < 1e-6, "old tail survived at {i}: {v}");
+        }
+    }
+
+    /// A redesign while audio is running must not blank the output.
+    ///
+    /// This is the difference between `set_ir` and `swap_ir`, and it is not
+    /// cosmetic: the audio thread re-designs the FIR every time a band moves,
+    /// so a response change that restarted the engine would drop the level to
+    /// zero for the length of the IR on every knob turn. The same signal is
+    /// pushed through both methods; `swap_ir` has to be uninterrupted.
+    #[test]
+    fn a_live_redesign_keeps_the_output_running() {
+        let signal = vec![0.5f32; 400];
+
+        let mut restarted = Convolver::new(HOP);
+        restarted.set_ir(&[1.0]);
+        let mut first = signal.clone();
+        restarted.process(&mut first);
+        restarted.set_ir(&[1.0]);
+        let mut after_restart = signal.clone();
+        restarted.process(&mut after_restart);
+
+        let mut live = Convolver::new(HOP);
+        live.reserve_ir(1);
+        live.set_ir(&[1.0]);
+        let mut first_live = signal.clone();
+        live.process(&mut first_live);
+        live.swap_ir(&[1.0]);
+        let mut after_swap = signal.clone();
+        live.process(&mut after_swap);
+
+        // The cold path (the reference above) loses its history, so the second
+        // half dips to silence; the live one does not.
+        let floor = |v: &[f32]| v.iter().fold(f32::INFINITY, |m, s| m.min(s.abs()));
+        assert!(
+            floor(&after_restart) < 1e-3,
+            "set_ir is expected to blank the engine, got floor {}",
+            floor(&after_restart)
+        );
+        for (i, &v) in after_swap.iter().enumerate() {
+            assert!(
+                (v - 0.5).abs() < 1e-3,
+                "swap_ir interrupted the signal at {i}: {v}"
+            );
         }
     }
 }
